@@ -2,7 +2,8 @@ import { env } from 'cloudflare:workers';
 import { ensureDatabase } from '../db/initialize';
 import { ROLE_PERMISSIONS, type Permission, type Role } from './domain';
 
-const TENANT_ID = 'tenant_yicang_demo';
+const TENANT_ID = 'tenant_yicang_primary';
+const TENANT_NAME = '易仓 ERP 工作区';
 
 type RuntimeEnv = { DB?: D1Database };
 
@@ -58,7 +59,7 @@ export async function requestContext(request: Request) {
     role: member.role,
     permissions: ROLE_PERMISSIONS[member.role],
     tenantId: TENANT_ID,
-    tenantName: '华东事业部',
+    tenantName: TENANT_NAME,
   };
   return { db, user };
 }

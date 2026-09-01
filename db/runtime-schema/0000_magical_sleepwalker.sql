@@ -231,39 +231,35 @@ BEGIN
   );
 END;--> statement-breakpoint
 INSERT OR IGNORE INTO tenants (id, name, created_at)
-VALUES ('tenant_yicang_demo', '华东事业部', '2026-09-01T00:00:00.000Z');--> statement-breakpoint
-INSERT OR IGNORE INTO warehouses (id, tenant_id, code, name, created_at) VALUES
-  ('wh_us_west', 'tenant_yicang_demo', 'US-WEST', '美西仓', '2026-09-01T00:00:00.000Z'),
-  ('wh_us_east', 'tenant_yicang_demo', 'US-EAST', '美东仓', '2026-09-01T00:00:00.000Z'),
-  ('wh_uk', 'tenant_yicang_demo', 'UK-01', '英国仓', '2026-09-01T00:00:00.000Z'),
-  ('wh_de', 'tenant_yicang_demo', 'DE-01', '德国仓', '2026-09-01T00:00:00.000Z'),
-  ('wh_ca', 'tenant_yicang_demo', 'CA-01', '加拿大仓', '2026-09-01T00:00:00.000Z');--> statement-breakpoint
-INSERT OR IGNORE INTO skus (id, tenant_id, code, name, active, created_at) VALUES
-  ('sku_chair', 'tenant_yicang_demo', 'BF-CH-8821', '北欧实木餐椅 · 胡桃色', 1, '2026-09-01T00:00:00.000Z'),
-  ('sku_desk', 'tenant_yicang_demo', 'BF-TB-2046', '可升降电脑桌 120cm', 1, '2026-09-01T00:00:00.000Z'),
-  ('sku_sofa', 'tenant_yicang_demo', 'BF-SF-7135', '模块化三人布艺沙发', 1, '2026-09-01T00:00:00.000Z'),
-  ('sku_cabinet', 'tenant_yicang_demo', 'BF-CB-1092', '藤编双门储物柜', 1, '2026-09-01T00:00:00.000Z'),
-  ('sku_lamp', 'tenant_yicang_demo', 'BF-LT-5520', '极简落地灯 · 米白', 1, '2026-09-01T00:00:00.000Z');--> statement-breakpoint
-INSERT OR IGNORE INTO inventory_balances (
-  id, tenant_id, sku_id, warehouse_id, on_hand_qty, reserved_qty, version, updated_at
-) VALUES
-  ('inv_chair_usw', 'tenant_yicang_demo', 'sku_chair', 'wh_us_west', 18, 0, 1, '2026-09-01T00:00:00.000Z'),
-  ('inv_desk_use', 'tenant_yicang_demo', 'sku_desk', 'wh_us_east', 364, 0, 1, '2026-09-01T00:00:00.000Z'),
-  ('inv_sofa_uk', 'tenant_yicang_demo', 'sku_sofa', 'wh_uk', 8, 2, 1, '2026-09-01T00:00:00.000Z'),
-  ('inv_cabinet_de', 'tenant_yicang_demo', 'sku_cabinet', 'wh_de', 150, 8, 1, '2026-09-01T00:00:00.000Z'),
-  ('inv_lamp_ca', 'tenant_yicang_demo', 'sku_lamp', 'wh_ca', 0, 0, 1, '2026-09-01T00:00:00.000Z');--> statement-breakpoint
-INSERT OR IGNORE INTO orders (
-  id, tenant_id, order_no, idempotency_key, request_hash, channel, destination, customer_name,
-  currency, amount_minor, status, sku_id, warehouse_id, quantity, version, created_by, updated_by,
-  last_action_key, request_id, created_at, updated_at
-) VALUES
-  ('ord_seed_pending', 'tenant_yicang_demo', 'YC260901-3862', 'seed-order-pending', 'seed', 'Amazon US', '美国', 'Olivia Wilson', 'USD', 17899, 'pending_review', 'sku_chair', 'wh_us_west', 2, 1, 'system', 'system', 'seed-order-pending', 'seed-request-1', '2026-09-01T03:42:00.000Z', '2026-09-01T03:42:00.000Z'),
-  ('ord_seed_reserved', 'tenant_yicang_demo', 'YC260901-3859', 'seed-order-reserved', 'seed', 'Shopify', '英国', 'Arthur Hall', 'GBP', 8200, 'reserved', 'sku_sofa', 'wh_uk', 2, 1, 'system', 'system', 'seed-order-reserved', 'seed-request-2', '2026-09-01T03:26:00.000Z', '2026-09-01T03:26:00.000Z'),
-  ('ord_seed_picking', 'tenant_yicang_demo', 'YC260901-3851', 'seed-order-picking', 'seed', 'eBay DE', '德国', 'Lena Weber', 'EUR', 25288, 'reserved', 'sku_cabinet', 'wh_de', 8, 1, 'system', 'system', 'seed-order-picking', 'seed-request-3', '2026-09-01T02:58:00.000Z', '2026-09-01T02:58:00.000Z'),
-  ('ord_seed_shipped', 'tenant_yicang_demo', 'YC260901-3844', 'seed-order-shipped', 'seed', 'TikTok Shop', '加拿大', 'Emma Brown', 'USD', 8350, 'shipped', 'sku_desk', 'wh_us_east', 1, 1, 'system', 'system', 'seed-order-shipped', 'seed-request-4', '2026-09-01T02:31:00.000Z', '2026-09-01T02:31:00.000Z');--> statement-breakpoint
-INSERT OR IGNORE INTO inventory_movements (
-  id, tenant_id, order_id, sku_id, warehouse_id, type, on_hand_delta, reserved_delta, operation_key, created_by, created_at
-) VALUES
-  ('mov_seed_sofa_reserve', 'tenant_yicang_demo', 'ord_seed_reserved', 'sku_sofa', 'wh_uk', 'reserve', 0, 2, 'ord_seed_reserved:reserve', 'system', '2026-09-01T03:26:00.000Z'),
-  ('mov_seed_cabinet_reserve', 'tenant_yicang_demo', 'ord_seed_picking', 'sku_cabinet', 'wh_de', 'reserve', 0, 8, 'ord_seed_picking:reserve', 'system', '2026-09-01T02:58:00.000Z'),
-  ('mov_seed_desk_ship', 'tenant_yicang_demo', 'ord_seed_shipped', 'sku_desk', 'wh_us_east', 'ship', -1, -1, 'ord_seed_shipped:ship', 'system', '2026-09-01T02:31:00.000Z');
+VALUES ('tenant_yicang_primary', '易仓 ERP 工作区', '2026-09-01T00:00:00.000Z');--> statement-breakpoint
+UPDATE members
+SET tenant_id = 'tenant_yicang_primary'
+WHERE tenant_id = 'tenant_yicang_demo';--> statement-breakpoint
+DELETE FROM audit_logs
+WHERE tenant_id = 'tenant_yicang_demo'
+  AND entity_id IN ('ord_seed_pending', 'ord_seed_reserved', 'ord_seed_picking', 'ord_seed_shipped');--> statement-breakpoint
+DELETE FROM inventory_movements
+WHERE tenant_id = 'tenant_yicang_demo'
+  AND id IN ('mov_seed_sofa_reserve', 'mov_seed_cabinet_reserve', 'mov_seed_desk_ship');--> statement-breakpoint
+DELETE FROM orders
+WHERE tenant_id = 'tenant_yicang_demo'
+  AND request_hash = 'seed'
+  AND id IN ('ord_seed_pending', 'ord_seed_reserved', 'ord_seed_picking', 'ord_seed_shipped');--> statement-breakpoint
+DELETE FROM inventory_balances
+WHERE tenant_id = 'tenant_yicang_demo'
+  AND id IN ('inv_chair_usw', 'inv_desk_use', 'inv_sofa_uk', 'inv_cabinet_de', 'inv_lamp_ca');--> statement-breakpoint
+DELETE FROM skus
+WHERE tenant_id = 'tenant_yicang_demo'
+  AND id IN ('sku_chair', 'sku_desk', 'sku_sofa', 'sku_cabinet', 'sku_lamp')
+  AND NOT EXISTS (SELECT 1 FROM orders WHERE orders.sku_id = skus.id);--> statement-breakpoint
+DELETE FROM warehouses
+WHERE tenant_id = 'tenant_yicang_demo'
+  AND id IN ('wh_us_west', 'wh_us_east', 'wh_uk', 'wh_de', 'wh_ca')
+  AND NOT EXISTS (SELECT 1 FROM orders WHERE orders.warehouse_id = warehouses.id);--> statement-breakpoint
+DELETE FROM tenants
+WHERE id = 'tenant_yicang_demo'
+  AND NOT EXISTS (SELECT 1 FROM members WHERE tenant_id = 'tenant_yicang_demo')
+  AND NOT EXISTS (SELECT 1 FROM orders WHERE tenant_id = 'tenant_yicang_demo')
+  AND NOT EXISTS (SELECT 1 FROM inventory_balances WHERE tenant_id = 'tenant_yicang_demo')
+  AND NOT EXISTS (SELECT 1 FROM skus WHERE tenant_id = 'tenant_yicang_demo')
+  AND NOT EXISTS (SELECT 1 FROM warehouses WHERE tenant_id = 'tenant_yicang_demo');

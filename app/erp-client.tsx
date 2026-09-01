@@ -48,14 +48,14 @@ const actionLabel: Record<string, string> = {
   CREATE_ORDER: '创建订单', APPROVE_ORDER: '审核并预占', SHIP_ORDER: '确认发货', CANCEL_ORDER: '取消订单',
 };
 
-const demoModules: Record<Exclude<ModuleKey, 'dashboard' | 'orders' | 'inventory'>, {
-  title: string; desc: string; stats: string[][]; columns: string[]; rows: string[][];
+const plannedModules: Record<Exclude<ModuleKey, 'dashboard' | 'orders' | 'inventory'>, {
+  title: string; desc: string; source: string;
 }> = {
-  purchase: { title: '采购管理', desc: '下一闭环：采购计划、供应商下单与到货入库', stats: [['本月采购额','¥1,862,400','演示口径'],['待审核','14','演示数据'],['在途采购','36','演示数据'],['准时交付率','94.6%','演示数据']], columns: ['采购单号','供应商','数量','预计到货','状态'], rows: [['PO260901-0288','安吉森木家居','240','2026-09-08','待审核'],['PO260831-0279','佛山众创建材','680','2026-09-05','生产中']] },
-  warehouse: { title: '仓库作业', desc: '下一闭环：入库、拣货、复核、装箱与盘点', stats: [['今日出库','1,526 单','演示口径'],['待拣货','286 单','演示数据'],['待入库','8,642 件','演示数据'],['准确率','99.72%','演示数据']], columns: ['作业单号','作业类型','仓库','数量','状态'], rows: [['WH260901-1068','订单出库','美西仓','624 件','拣货中'],['WH260901-1054','采购入库','美东仓','1,860 件','质检中']] },
-  logistics: { title: '物流管理', desc: '下一闭环：面单、承运商、物流轨迹与异常处理', stats: [['在途包裹','4,286','演示口径'],['今日揽收','1,204','演示数据'],['物流异常','38','演示数据'],['平均妥投','4.8 天','演示数据']], columns: ['运单号','承运商','线路','发货仓','状态'], rows: [['YT260901882146','燕文物流','美国专线','深圳仓','运输中'],['DHL-9836254108','DHL','德国特快','德国仓','派送中']] },
-  finance: { title: '财务管理', desc: '下一闭环：平台结算、多币种、费用与对账', stats: [['本月收入','¥8,624,300','演示口径'],['本月支出','¥5,148,600','演示数据'],['预估毛利','¥3,475,700','演示数据'],['待对账','¥286,420','演示数据']], columns: ['流水号','业务类型','关联单号','原币金额','状态'], rows: [['FN260901-6428','平台回款','AMZ-US-0831','USD 25,820.00','已入账'],['FN260901-6412','物流费用','LG-0831-882','CNY 28,640.00','待审核']] },
-  reports: { title: '数据报表', desc: '下一闭环：基于可信业务明细生成统一口径报表', stats: [['销售额','¥8,624,300','演示口径'],['订单量','48,216','演示数据'],['客单价','¥178.86','演示数据'],['净利润率','18.4%','演示数据']], columns: ['报表名称','类型','周期','范围','状态'], rows: [['8 月全渠道经营月报','经营分析','月度','全部渠道','已生成'],['海外仓库存健康度','库存分析','每周','5 个海外仓','已生成']] },
+  purchase: { title: '采购管理', desc: '采购计划、供应商下单与到货入库', source: '采购单或供应商数据' },
+  warehouse: { title: '仓库作业', desc: '入库、拣货、复核、装箱与盘点', source: '仓库或 WMS 数据' },
+  logistics: { title: '物流管理', desc: '面单、承运商、物流轨迹与异常处理', source: '承运商或物流服务商数据' },
+  finance: { title: '财务管理', desc: '平台结算、多币种、费用与对账', source: '平台账单或财务数据' },
+  reports: { title: '数据报表', desc: '基于可信业务明细生成统一口径报表', source: '已入库的真实业务明细' },
 };
 
 export default function ErpClient() {
@@ -163,7 +163,7 @@ export default function ErpClient() {
     <main className="app-shell">
       <aside className="sidebar">
         <button className="brand" onClick={() => switchModule('dashboard')}><span className="brand-mark">易</span><span>易仓 ERP</span></button>
-        <div className="pilot-tag"><span />订单库存闭环 · 试点版</div>
+        <div className="pilot-tag"><span />真实数据模式 · 不生成样例</div>
         <p className="nav-label">业务中心</p>
         <nav>{nav.map((item) => <button className={active === item.key ? 'nav-item active' : 'nav-item'} onClick={() => switchModule(item.key)} key={item.key}><span className="nav-icon">{item.code}</span>{item.label}{item.key === 'orders' && Boolean(payload?.summary.pendingReview) && <b>{payload?.summary.pendingReview}</b>}</button>)}</nav>
         <div className="sidebar-foot"><div className="help-icon">✓</div><div><strong>可信业务底座</strong><small>身份 · 幂等 · 审计 · 库存流水</small></div></div>
@@ -171,10 +171,10 @@ export default function ErpClient() {
 
       <section className="workspace">
         <header className="topbar">
-          <div className="crumb"><span>{payload?.user.tenantName ?? '华东事业部'}</span><i>／</i><strong>{activeLabel}</strong></div>
+          <div className="crumb"><span>{payload?.user.tenantName ?? '易仓 ERP 工作区'}</span><i>／</i><strong>{activeLabel}</strong></div>
           <div className="top-actions">
             <label className="search"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索当前模块" placeholder={active === 'dashboard' ? '切换模块后搜索业务数据' : `搜索${activeLabel}`} /></label>
-            <div className="live-badge"><i />D1 持久化</div>
+            <div className="live-badge"><i />仅真实数据</div>
             <div className="avatar">{initials}</div><div className="user"><strong>{displayName}</strong><small>{payload?.user.role === 'admin' ? '系统管理员' : payload?.user.role === 'operator' ? '业务操作员' : '只读成员'}</small></div>
           </div>
         </header>
@@ -183,9 +183,9 @@ export default function ErpClient() {
           <>
             {error && <div className="inline-alert" role="alert"><span>!</span><p>{error}</p><button onClick={() => { setError(''); void loadData(); }}>重试</button></div>}
             {active === 'dashboard' && <Dashboard payload={payload} openOrder={() => setShowOrder(true)} go={switchModule} />}
-            {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
-            {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} />}
-            {!['dashboard','orders','inventory'].includes(active) && <DemoModule module={demoModules[active as keyof typeof demoModules]} />}
+            {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
+            {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} />}
+            {!['dashboard','orders','inventory'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
           </>
         ) : <LoadingState message={error || '暂时无法加载业务数据'} />}
       </section>
@@ -197,44 +197,52 @@ export default function ErpClient() {
 }
 
 function Dashboard({ payload, openOrder, go }: { payload: ErpPayload; openOrder: () => void; go: (key: ModuleKey) => void }) {
+  const inventoryReady = payload.inventory.length > 0;
+  const hasBusinessData = payload.orders.length > 0 || inventoryReady;
   const metrics = [
-    ['系统订单', String(payload.summary.totalOrders), '已持久化保存', 'green'],
+    ['系统订单', String(payload.summary.totalOrders), '数据库真实记录', 'green'],
     ['待审核', String(payload.summary.pendingReview), '需审核后预占库存', 'orange'],
     ['待发货', String(payload.summary.readyToShip), '库存已锁定', 'blue'],
     ['低库存 SKU', String(payload.summary.lowStock), '可售量 ≤ 10', 'red'],
   ];
-  return <div className="content"><div className="page-head"><div><p>{new Intl.DateTimeFormat('zh-CN', { dateStyle: 'full' }).format(new Date())}</p><h1>早上好，{payload.user.displayName}</h1><span>订单与库存已进入真实持久化闭环，关键动作由服务端校验。</span></div>{payload.user.permissions.includes('orders:create') && <button className="primary-button" onClick={openOrder}><span>＋</span> 新建订单</button>}</div>
+  return <div className="content"><div className="page-head"><div><p>{new Intl.DateTimeFormat('zh-CN', { dateStyle: 'full' }).format(new Date())}</p><h1>早上好，{payload.user.displayName}</h1><span>系统只展示已接入数据库的业务记录，不生成或补齐样例数据。</span></div>{payload.user.permissions.includes('orders:create') && <button className="primary-button" onClick={openOrder} disabled={!inventoryReady} title={inventoryReady ? '新建订单' : '请先接入真实 SKU、仓库和库存'}><span>＋</span> 新建订单</button>}</div>
+    {!hasBusinessData && <DataSourceNotice />}
     <section className="metrics" aria-label="核心业务指标">{metrics.map((metric) => <article className="metric-card" key={metric[0]}><div className={`metric-symbol ${metric[3]}`}>{metric[0].slice(0,1)}</div><p>{metric[0]}</p><h2>{metric[1]}</h2><span className={metric[3] === 'red' ? 'negative' : ''}>{metric[2]}</span></article>)}</section>
     <div className="dashboard-grid"><article className="card workflow-card"><div className="card-head"><div><h3>首个可信业务闭环</h3><p>所有状态变化均经过权限、状态机与数据库约束</p></div><button className="link-button" onClick={() => go('orders')}>进入订单中心 →</button></div><div className="workflow-line"><div className="flow-step active"><b>01</b><span><strong>创建订单</strong><small>幂等保存</small></span></div><i>→</i><div className="flow-step"><b>02</b><span><strong>审核预占</strong><small>校验可售库存</small></span></div><i>→</i><div className="flow-step"><b>03</b><span><strong>确认发货</strong><small>扣减现存与预占</small></span></div><i>→</i><div className="flow-step"><b>04</b><span><strong>审计追溯</strong><small>保留前后状态</small></span></div></div><div className="guardrails"><span>服务端身份</span><span>乐观锁</span><span>库存触发器</span><span>不可变流水</span><span>无物理删除</span></div></article>
-      <article className="card audit-card"><div className="card-head"><div><h3>最近审计</h3><p>创建、审核、发货与取消均自动留痕</p></div><span className="audit-lock">追加写</span></div><div className="audit-list">{payload.audit.slice(0, 4).map((item, index) => <div className="audit-item" key={`${item.entity_id}-${item.created_at}-${index}`}><span className="audit-dot" /><div><strong>{actionLabel[item.action] ?? item.action}</strong><small>{item.actor_email} · {formatTime(item.created_at)}</small></div></div>)}{!payload.audit.length && <p className="empty-note">当前账号无审计查看权限</p>}</div></article></div>
-    <article className="card orders-card"><div className="card-head"><div><h3>最新系统订单</h3><p>来自持久化业务数据库，不再使用浏览器内存</p></div><button className="link-button" onClick={() => go('orders')}>查看全部 →</button></div><OrderTable orders={payload.orders.slice(0, 4)} compact /></article>
+      <article className="card audit-card"><div className="card-head"><div><h3>最近审计</h3><p>创建、审核、发货与取消均自动留痕</p></div><span className="audit-lock">追加写</span></div><div className="audit-list">{payload.audit.slice(0, 4).map((item, index) => <div className="audit-item" key={`${item.entity_id}-${item.created_at}-${index}`}><span className="audit-dot" /><div><strong>{actionLabel[item.action] ?? item.action}</strong><small>{item.actor_email} · {formatTime(item.created_at)}</small></div></div>)}{!payload.audit.length && <p className="empty-note">{payload.user.permissions.includes('audit:read') ? '暂无业务操作记录' : '当前账号无审计查看权限'}</p>}</div></article></div>
+    <article className="card orders-card"><div className="card-head"><div><h3>最新系统订单</h3><p>仅显示数据库中已接入的真实订单</p></div><button className="link-button" onClick={() => go('orders')}>查看全部 →</button></div><OrderTable orders={payload.orders.slice(0, 4)} compact /></article>
   </div>;
 }
 
-function OrdersView({ orders, summary, can, busy, openOrder, runAction }: { orders: ErpOrder[]; summary: ErpPayload['summary']; can: (permission: Permission) => boolean; busy: string; openOrder: () => void; runAction: (order: ErpOrder, action: OrderAction) => void }) {
+function OrdersView({ orders, summary, inventoryReady, hasQuery, can, busy, openOrder, runAction }: { orders: ErpOrder[]; summary: ErpPayload['summary']; inventoryReady: boolean; hasQuery: boolean; can: (permission: Permission) => boolean; busy: string; openOrder: () => void; runAction: (order: ErpOrder, action: OrderAction) => void }) {
   const stats = [['全部订单', String(summary.totalOrders), '持久化记录'],['待审核', String(summary.pendingReview), '审核后锁定库存'],['待发货', String(summary.readyToShip), '已完成库存预占'],['已发货', String(summary.shipped), '已写出库流水']];
-  return <div className="content module-content"><div className="module-head"><div><p>可信业务闭环 / 订单</p><h1>订单管理</h1><span>创建、审核、预占、发货、取消均由服务端状态机控制</span></div>{can('orders:create') && <button className="primary-button" onClick={openOrder}><span>＋</span> 新建订单</button>}</div><StatCards stats={stats} />
-    <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active">全部</button><button>待审核</button><button>待发货</button><button>已完成</button></div><span>共 {orders.length} 条当前权限范围记录</span></div><OrderTable orders={orders} can={can} busy={busy} runAction={runAction} /><div className="pagination"><span>数据刷新后仍会保留</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div></article>
+  return <div className="content module-content"><div className="module-head"><div><p>可信业务闭环 / 订单</p><h1>订单管理</h1><span>创建、审核、预占、发货、取消均由服务端状态机控制</span></div>{can('orders:create') && <button className="primary-button" onClick={openOrder} disabled={!inventoryReady} title={inventoryReady ? '新建订单' : '请先接入真实 SKU、仓库和库存'}><span>＋</span> 新建订单</button>}</div>{!inventoryReady && <DataSourceNotice compact />}<StatCards stats={stats} />
+    <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active">全部</button><button>待审核</button><button>待发货</button><button>已完成</button></div><span>共 {orders.length} 条当前权限范围记录</span></div><OrderTable orders={orders} emptyMessage={hasQuery ? '没有符合当前搜索条件的订单' : '数据库中暂无订单；系统不会自动填充样例记录'} can={can} busy={busy} runAction={runAction} /><div className="pagination"><span>数据刷新后仍会保留</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div></article>
   </div>;
 }
 
-function OrderTable({ orders, compact = false, can, busy = '', runAction }: { orders: ErpOrder[]; compact?: boolean; can?: (permission: Permission) => boolean; busy?: string; runAction?: (order: ErpOrder, action: OrderAction) => void }) {
-  return <div className="table-wrap module-table"><table><thead><tr><th>订单号</th><th>渠道 / 目的地</th><th>商品</th><th>仓库</th><th>数量</th><th>原币金额</th><th>状态</th>{!compact && <th>受控操作</th>}</tr></thead><tbody>{orders.length ? orders.map((order) => <tr key={order.id}><td><strong>{order.orderNo}</strong><small className="cell-sub">{order.customerName}</small></td><td>{order.channel}<small className="cell-sub">{order.destination}</small></td><td>{order.skuCode}<small className="cell-sub">{order.skuName}</small></td><td>{order.warehouseName}</td><td>{order.quantity}</td><td>{formatMoney(order.amountMinor, order.currency)}</td><td><Status status={order.status} /></td>{!compact && <td><div className="row-actions">{order.status === 'pending_review' && can?.('orders:approve') && <button disabled={Boolean(busy)} onClick={() => runAction?.(order, 'approve')}>{busy === `${order.id}:approve` ? '处理中…' : '审核预占'}</button>}{order.status === 'reserved' && can?.('orders:ship') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction?.(order, 'ship')}>{busy === `${order.id}:ship` ? '处理中…' : '确认发货'}</button>}{['pending_review','reserved'].includes(order.status) && can?.('orders:cancel') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction?.(order, 'cancel')}>取消</button>}{['shipped','cancelled'].includes(order.status) && <span className="terminal-label">终态已锁定</span>}</div></td>}</tr>) : <tr><td className="empty-cell" colSpan={compact ? 7 : 8}>当前没有匹配的订单</td></tr>}</tbody></table></div>;
+function OrderTable({ orders, compact = false, emptyMessage = '数据库中暂无订单', can, busy = '', runAction }: { orders: ErpOrder[]; compact?: boolean; emptyMessage?: string; can?: (permission: Permission) => boolean; busy?: string; runAction?: (order: ErpOrder, action: OrderAction) => void }) {
+  return <div className="table-wrap module-table"><table><thead><tr><th>订单号</th><th>渠道 / 目的地</th><th>商品</th><th>仓库</th><th>数量</th><th>原币金额</th><th>状态</th>{!compact && <th>受控操作</th>}</tr></thead><tbody>{orders.length ? orders.map((order) => <tr key={order.id}><td><strong>{order.orderNo}</strong><small className="cell-sub">{order.customerName}</small></td><td>{order.channel}<small className="cell-sub">{order.destination}</small></td><td>{order.skuCode}<small className="cell-sub">{order.skuName}</small></td><td>{order.warehouseName}</td><td>{order.quantity}</td><td>{formatMoney(order.amountMinor, order.currency)}</td><td><Status status={order.status} /></td>{!compact && <td><div className="row-actions">{order.status === 'pending_review' && can?.('orders:approve') && <button disabled={Boolean(busy)} onClick={() => runAction?.(order, 'approve')}>{busy === `${order.id}:approve` ? '处理中…' : '审核预占'}</button>}{order.status === 'reserved' && can?.('orders:ship') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction?.(order, 'ship')}>{busy === `${order.id}:ship` ? '处理中…' : '确认发货'}</button>}{['pending_review','reserved'].includes(order.status) && can?.('orders:cancel') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction?.(order, 'cancel')}>取消</button>}{['shipped','cancelled'].includes(order.status) && <span className="terminal-label">终态已锁定</span>}</div></td>}</tr>) : <tr><td className="empty-cell" colSpan={compact ? 7 : 8}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
-function InventoryView({ inventory, summary }: { inventory: Inventory[]; summary: ErpPayload['summary'] }) {
+function InventoryView({ inventory, summary, hasInventoryData, hasQuery }: { inventory: Inventory[]; summary: ErpPayload['summary']; hasInventoryData: boolean; hasQuery: boolean }) {
   const totalOnHand = inventory.reduce((sum, item) => sum + item.onHandQty, 0);
   const totalReserved = inventory.reduce((sum, item) => sum + item.reservedQty, 0);
   const stats = [['库存记录', String(inventory.length), 'SKU × 仓库'],['现存数量', String(totalOnHand), '不可由页面直接修改'],['预占数量', String(totalReserved), '由订单状态机维护'],['可售数量', String(summary.totalAvailable), '现存－预占']];
   return <div className="content module-content"><div className="module-head"><div><p>可信业务闭环 / 库存</p><h1>商品库存</h1><span>余额由不可变流水和订单动作驱动，页面不提供直接改数入口</span></div><div className="ledger-chip">库存账本已启用</div></div><StatCards stats={stats} />
-    <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active">全部库存</button><button>库存预警</button></div><span>可售量 = 现存 − 预占</span></div><div className="table-wrap module-table"><table><thead><tr><th>SKU</th><th>商品名称</th><th>仓库</th><th>现存</th><th>预占</th><th>可售</th><th>库存状态</th><th>版本</th></tr></thead><tbody>{inventory.map((item) => <tr key={item.id}><td><strong>{item.skuCode}</strong></td><td>{item.skuName}</td><td>{item.warehouseName}</td><td>{item.onHandQty}</td><td>{item.reservedQty}</td><td><strong>{item.availableQty}</strong></td><td><InventoryStatus available={item.availableQty} /></td><td>v{item.version}</td></tr>)}</tbody></table></div><div className="pagination"><span>订单审核、取消和发货后自动更新</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div></article>
+    {!hasInventoryData && <DataSourceNotice compact />}
+    <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active">全部库存</button><button>库存预警</button></div><span>可售量 = 现存 − 预占</span></div><div className="table-wrap module-table"><table><thead><tr><th>SKU</th><th>商品名称</th><th>仓库</th><th>现存</th><th>预占</th><th>可售</th><th>库存状态</th><th>版本</th></tr></thead><tbody>{inventory.length ? inventory.map((item) => <tr key={item.id}><td><strong>{item.skuCode}</strong></td><td>{item.skuName}</td><td>{item.warehouseName}</td><td>{item.onHandQty}</td><td>{item.reservedQty}</td><td><strong>{item.availableQty}</strong></td><td><InventoryStatus available={item.availableQty} /></td><td>v{item.version}</td></tr>) : <tr><td className="empty-cell" colSpan={8}>{hasQuery ? '没有符合当前搜索条件的库存记录' : '尚未接入真实 SKU、仓库和库存记录'}</td></tr>}</tbody></table></div><div className="pagination"><span>订单审核、取消和发货后自动更新</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div></article>
   </div>;
 }
 
-function DemoModule({ module }: { module: (typeof demoModules)[keyof typeof demoModules] }) {
-  return <div className="content module-content"><div className="module-head"><div><p>业务规划 / 下一开发阶段</p><h1>{module.title}</h1><span>{module.desc}</span></div><div className="demo-chip">演示数据 · 不参与业务记账</div></div><StatCards stats={module.stats} />
-    <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active">功能预览</button></div><span>该模块将在订单库存闭环验收后接入</span></div><div className="table-wrap module-table"><table><thead><tr>{module.columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{module.rows.map((row) => <tr key={row[0]}>{row.map((cell, index) => <td key={`${row[0]}-${index}`}>{index === 0 ? <strong>{cell}</strong> : /状态/.test(module.columns[index]) ? <span className="status-pill">{cell}</span> : cell}</td>)}</tr>)}</tbody></table></div><div className="planned-note"><b>开发闸门</b><span>当前真实数据只覆盖订单与库存；本模块不会误标为实时数据。</span></div></article>
+function PlannedModule({ module }: { module: (typeof plannedModules)[keyof typeof plannedModules] }) {
+  return <div className="content module-content"><div className="module-head"><div><p>业务规划 / 数据源待接入</p><h1>{module.title}</h1><span>{module.desc}</span></div><div className="source-chip">当前无业务数据</div></div>
+    <article className="card source-empty"><div className="source-empty-mark">0</div><p>真实数据源尚未接入</p><h2>这里不会展示虚构记录</h2><span>接入{module.source}后，本模块才会生成指标和明细。</span></article>
   </div>;
+}
+
+function DataSourceNotice({ compact = false }: { compact?: boolean }) {
+  return <div className={compact ? 'data-source-notice compact' : 'data-source-notice'}><div className="source-status">空</div><div><strong>当前数据库没有业务数据</strong><span>系统已关闭样例数据生成。接入 Excel / CSV 或平台 API 后，这里只显示你的真实记录。</span></div></div>;
 }
 
 function StatCards({ stats }: { stats: string[][] }) {
