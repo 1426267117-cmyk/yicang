@@ -13,6 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL('https://yicang-erp.champztj.chatgpt.site'),
   title: '易仓 ERP｜跨境业务管理平台',
   description: '统一管理订单、库存、采购、仓库、物流与财务的跨境电商 ERP。',
   openGraph: {
