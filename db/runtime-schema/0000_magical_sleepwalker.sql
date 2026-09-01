@@ -231,35 +231,4 @@ BEGIN
   );
 END;--> statement-breakpoint
 INSERT OR IGNORE INTO tenants (id, name, created_at)
-VALUES ('tenant_yicang_primary', '易仓 ERP 工作区', '2026-09-01T00:00:00.000Z');--> statement-breakpoint
-UPDATE members
-SET tenant_id = 'tenant_yicang_primary'
-WHERE tenant_id = 'tenant_yicang_demo';--> statement-breakpoint
-DELETE FROM audit_logs
-WHERE tenant_id = 'tenant_yicang_demo'
-  AND entity_id IN ('ord_seed_pending', 'ord_seed_reserved', 'ord_seed_picking', 'ord_seed_shipped');--> statement-breakpoint
-DELETE FROM inventory_movements
-WHERE tenant_id = 'tenant_yicang_demo'
-  AND id IN ('mov_seed_sofa_reserve', 'mov_seed_cabinet_reserve', 'mov_seed_desk_ship');--> statement-breakpoint
-DELETE FROM orders
-WHERE tenant_id = 'tenant_yicang_demo'
-  AND request_hash = 'seed'
-  AND id IN ('ord_seed_pending', 'ord_seed_reserved', 'ord_seed_picking', 'ord_seed_shipped');--> statement-breakpoint
-DELETE FROM inventory_balances
-WHERE tenant_id = 'tenant_yicang_demo'
-  AND id IN ('inv_chair_usw', 'inv_desk_use', 'inv_sofa_uk', 'inv_cabinet_de', 'inv_lamp_ca');--> statement-breakpoint
-DELETE FROM skus
-WHERE tenant_id = 'tenant_yicang_demo'
-  AND id IN ('sku_chair', 'sku_desk', 'sku_sofa', 'sku_cabinet', 'sku_lamp')
-  AND NOT EXISTS (SELECT 1 FROM orders WHERE orders.sku_id = skus.id);--> statement-breakpoint
-DELETE FROM warehouses
-WHERE tenant_id = 'tenant_yicang_demo'
-  AND id IN ('wh_us_west', 'wh_us_east', 'wh_uk', 'wh_de', 'wh_ca')
-  AND NOT EXISTS (SELECT 1 FROM orders WHERE orders.warehouse_id = warehouses.id);--> statement-breakpoint
-DELETE FROM tenants
-WHERE id = 'tenant_yicang_demo'
-  AND NOT EXISTS (SELECT 1 FROM members WHERE tenant_id = 'tenant_yicang_demo')
-  AND NOT EXISTS (SELECT 1 FROM orders WHERE tenant_id = 'tenant_yicang_demo')
-  AND NOT EXISTS (SELECT 1 FROM inventory_balances WHERE tenant_id = 'tenant_yicang_demo')
-  AND NOT EXISTS (SELECT 1 FROM skus WHERE tenant_id = 'tenant_yicang_demo')
-  AND NOT EXISTS (SELECT 1 FROM warehouses WHERE tenant_id = 'tenant_yicang_demo');
+VALUES ('tenant_yicang_primary', '易仓 ERP 工作区', '2026-09-01T00:00:00.000Z');
