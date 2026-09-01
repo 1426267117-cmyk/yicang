@@ -1,4 +1,4 @@
-import migrationSql from '../drizzle/0000_magical_sleepwalker.sql?raw';
+import migrationSql from './runtime-schema/0000_magical_sleepwalker.sql?raw';
 
 let initialization: Promise<void> | undefined;
 
