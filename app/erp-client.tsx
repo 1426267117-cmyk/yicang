@@ -34,7 +34,11 @@ type ShopifyStatus = {
   ok: true; apiVersion: string; readOnly: true;
   stores: Array<{
     key: 'zimasya' | 'kaguyasu' | 'anzhap' | 'bizfurniz'; displayName: string;
-    expectedDomain: string; credentialsConfigured: boolean; identityVerified: boolean;
+    expectedDomain: string; appConfigured: boolean; encryptionReady: boolean; credentialsConfigured: boolean;
+    authorizationRequired: boolean; authorizationStartUrl: string | null;
+    authorizationVerified: boolean; authorizationUpdatedAt: string | null;
+    accessTokenExpiresAt: string | null; refreshTokenExpiresAt: string | null;
+    identityVerified: boolean;
     officialStoreId: string | null; verifiedDomain: string | null; identityVerifiedAt: string | null;
     lastSuccessfulSyncAt: string | null; completedWatermark: string | null;
     syncStatus: string; lastErrorCode: string | null;
@@ -118,6 +122,23 @@ export default function ErpClient() {
     const timer = window.setTimeout(() => { void loadData(); }, 0);
     return () => window.clearTimeout(timer);
   }, [loadData]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('shopify_oauth') && params.get('status') === 'connected') {
+      window.history.replaceState({}, '', window.location.pathname);
+      const startTimer = window.setTimeout(() => {
+        setActive('platform');
+        setToast('Shopify 只读授权已安全保存，可以开始首次同步');
+      }, 0);
+      const clearTimer = window.setTimeout(() => setToast(''), 3600);
+      return () => {
+        window.clearTimeout(startTimer);
+        window.clearTimeout(clearTimer);
+      };
+    }
+    return undefined;
+  }, []);
 
   const can = useCallback((permission: Permission) => payload?.user.permissions.includes(permission) ?? false, [payload]);
   const filteredOrders = useMemo(() => {
@@ -294,7 +315,7 @@ function PlatformOrdersView({ orders, summary, status, canSync, syncBusy, runSyn
     ['含退款', String(summary.platformRefunded), '退款对象独立保存'],
   ];
   return <div className="content module-content"><div className="module-head"><div><p>多店铺接入 / Shopify 第一阶段</p><h1>平台订单</h1><span>订单、订单行、退款交易、履约与追踪均从官方 API 只读同步；不会自动改平台或扣 ERP 库存。</span></div><div className="ledger-chip">Admin GraphQL {status?.apiVersion ?? '2026-07'} · 只读</div></div><StatCards stats={stats} />
-    <section className="connector-grid">{status?.stores.map((store) => <article className="card connector-card" key={store.key}><div className="connector-card-head"><div><p>SHOPIFY</p><h3>{store.displayName}</h3><small>{store.expectedDomain}</small></div><span className={store.identityVerified ? 'connector-state ready' : store.credentialsConfigured ? 'connector-state pending' : 'connector-state'}>{store.identityVerified ? '身份已核验' : store.credentialsConfigured ? '待首次核验' : '缺少授权'}</span></div><dl><div><dt>同步水位</dt><dd>{store.completedWatermark ? formatTime(store.completedWatermark) : '尚未建立'}</dd></div><div><dt>运行状态</dt><dd>{store.syncStatus === 'idle' ? '正常' : store.syncStatus === 'failed' ? `失败：${store.lastErrorCode ?? '待重试'}` : store.syncStatus === 'running' ? '同步中' : '未开始'}</dd></div></dl>{canSync && <button className="primary-button connector-sync" disabled={!store.credentialsConfigured || Boolean(syncBusy)} onClick={() => runSync(store)}>{syncBusy === store.key ? '只读同步中…' : store.completedWatermark ? '运行增量同步' : '回补最近 7 天'}</button>}</article>)}{!status && <article className="card connector-card"><p>正在读取连接器状态…</p></article>}</section>
+    <section className="connector-grid">{status?.stores.map((store) => <article className="card connector-card" key={store.key}><div className="connector-card-head"><div><p>SHOPIFY</p><h3>{store.displayName}</h3><small>{store.verifiedDomain ?? store.expectedDomain}</small></div><span className={store.identityVerified ? 'connector-state ready' : store.credentialsConfigured ? 'connector-state pending' : 'connector-state'}>{store.identityVerified ? '身份已核验' : store.authorizationVerified ? '已授权待同步' : store.appConfigured && store.encryptionReady ? '待授权' : store.appConfigured ? '密钥待配置' : '应用待配置'}</span></div><dl><div><dt>同步水位</dt><dd>{store.completedWatermark ? formatTime(store.completedWatermark) : '尚未建立'}</dd></div><div><dt>运行状态</dt><dd>{store.syncStatus === 'idle' ? '正常' : store.syncStatus === 'failed' ? `失败：${store.lastErrorCode ?? '待重试'}` : store.syncStatus === 'running' ? '同步中' : '未开始'}</dd></div></dl>{canSync && store.credentialsConfigured && <button className="primary-button connector-sync" disabled={Boolean(syncBusy)} onClick={() => runSync(store)}>{syncBusy === store.key ? '只读同步中…' : store.completedWatermark ? '运行增量同步' : '回补最近 7 天'}</button>}{canSync && !store.credentialsConfigured && store.authorizationStartUrl && <a className="primary-button connector-sync" href={store.authorizationStartUrl}>授权只读订单</a>}{canSync && !store.credentialsConfigured && !store.authorizationStartUrl && <button className="primary-button connector-sync" disabled>{store.appConfigured && !store.encryptionReady ? '加密密钥待配置' : store.appConfigured ? '等待授权配置' : '应用参数待配置'}</button>}</article>)}{!status && <article className="card connector-card"><p>正在读取连接器状态…</p></article>}</section>
     <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active">全部平台订单</button></div><span>当前显示最近 {orders.length} 条</span></div><div className="table-wrap module-table"><table><thead><tr><th>平台订单</th><th>店铺</th><th>原始状态</th><th>订单行</th><th>退款 / 履约</th><th>原币当前金额</th><th>更新时间</th></tr></thead><tbody>{orders.length ? orders.map((order) => <tr key={order.id}><td><strong>{order.sourceOrderName ?? order.sourceOrderId}</strong><small className="cell-sub">{order.test ? '测试单 · ' : ''}{order.sourceCancelledAt ? '已取消' : '原始保留'}</small></td><td>{order.storeName}<small className="cell-sub">{order.platform}</small></td><td>{order.financialStatus ?? '未知'}<small className="cell-sub">{order.fulfillmentStatus ?? '履约未知'}</small></td><td>{order.lineCount}</td><td>{order.refundCount} / {order.fulfillmentCount}</td><td>{formatExactMoney(order.currentTotalAmount, order.currency)}</td><td>{formatTime(order.sourceUpdatedAt)}</td></tr>) : <tr><td className="empty-cell" colSpan={7}>尚未取得 ERP 独立店铺授权；连接器、数据模型和幂等入库已准备好，不会用模拟订单填充。</td></tr>}</tbody></table></div></article>
   </div>;
 }

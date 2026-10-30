@@ -1,0 +1,1 @@
+ALTER TABLE `connector_credentials` ADD `refresh_started_at` text;

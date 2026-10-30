@@ -10,6 +10,7 @@ const tenantId = 'tenant_test';
 const config: ShopifyCredentialConfig = {
   key: 'zimasya', displayName: 'ZIMASYA', domain: '346c85.myshopify.com',
   expectedDomain: '346c85.myshopify.com', environmentPrefix: 'SHOPIFY_ZIMASYA',
+  acceptedDomains: ['346c85.myshopify.com'], authMode: 'oauth', credentialRef: 'env:SHOPIFY_ZIMASYA',
   adminAccessToken: null, clientId: null, clientSecret: null,
 };
 const context: ShopifyShopContext = {
@@ -142,7 +143,12 @@ describe('平台订单 D1 幂等入库', () => {
 });
 
 async function applyMigrations(db: D1Database) {
-  for (const migration of ['../drizzle/0000_wooden_deathstrike.sql', '../drizzle/0001_premium_the_stranger.sql']) {
+  for (const migration of [
+    '../drizzle/0000_wooden_deathstrike.sql',
+    '../drizzle/0001_premium_the_stranger.sql',
+    '../drizzle/0002_organic_titanium_man.sql',
+    '../drizzle/0003_fancy_jane_foster.sql',
+  ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {
       await db.prepare(statement).run();

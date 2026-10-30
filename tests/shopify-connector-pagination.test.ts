@@ -7,6 +7,7 @@ import { money } from './fixtures/shopify-order';
 const config: ShopifyCredentialConfig = {
   key: 'zimasya', displayName: 'ZIMASYA', domain: '346c85.myshopify.com',
   expectedDomain: '346c85.myshopify.com', environmentPrefix: 'SHOPIFY_ZIMASYA',
+  acceptedDomains: ['346c85.myshopify.com'], authMode: 'oauth', credentialRef: 'env:SHOPIFY_ZIMASYA',
   adminAccessToken: 'test-only-token', clientId: null, clientSecret: null,
 };
 

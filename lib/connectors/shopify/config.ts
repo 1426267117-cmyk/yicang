@@ -5,36 +5,51 @@ export const SHOPIFY_STORE_CANDIDATES = [
     key: 'zimasya',
     displayName: 'ZIMASYA',
     expectedDomain: '346c85.myshopify.com',
+    acceptedDomains: ['346c85.myshopify.com'],
     environmentPrefix: 'SHOPIFY_ZIMASYA',
+    authMode: 'oauth',
   },
   {
     key: 'kaguyasu',
     displayName: 'Kaguyasu',
     expectedDomain: 'officebaseca.myshopify.com',
+    acceptedDomains: ['officebaseca.myshopify.com'],
     environmentPrefix: 'SHOPIFY_KAGUYASU',
+    authMode: 'oauth',
   },
   {
     key: 'anzhap',
     displayName: 'Anzhap',
     expectedDomain: 'anzhap.myshopify.com',
+    acceptedDomains: ['anzhap.myshopify.com'],
     environmentPrefix: 'SHOPIFY_ANZ',
+    authMode: 'oauth',
   },
   {
     key: 'bizfurniz',
     displayName: 'BizFurniz',
-    expectedDomain: 'bizfurniz.myshopify.com',
+    expectedDomain: 'z6w01w-xs.myshopify.com',
+    acceptedDomains: ['z6w01w-xs.myshopify.com', 'bizfurniz.myshopify.com'],
     environmentPrefix: 'SHOPIFY_BIZFURNIZ',
+    authMode: 'oauth',
   },
 ] as const;
 
 export type ShopifyStoreKey = (typeof SHOPIFY_STORE_CANDIDATES)[number]['key'];
+
+export function isShopifyStoreKey(value: string): value is ShopifyStoreKey {
+  return SHOPIFY_STORE_CANDIDATES.some((candidate) => candidate.key === value);
+}
 
 export type ShopifyCredentialConfig = {
   key: ShopifyStoreKey;
   displayName: string;
   domain: string;
   expectedDomain: string;
+  acceptedDomains: readonly string[];
   environmentPrefix: string;
+  authMode: 'oauth' | 'client_credentials';
+  credentialRef: string;
   adminAccessToken: string | null;
   clientId: string | null;
   clientSecret: string | null;
@@ -48,9 +63,15 @@ export function resolveShopifyStoreConfig(
   if (!candidate) throw new Error('UNKNOWN_SHOPIFY_STORE');
   const overrideDomain = envString(runtimeEnv, `${candidate.environmentPrefix}_SHOP_DOMAIN`);
   const domain = normalizeShopifyDomain(overrideDomain ?? candidate.expectedDomain);
+  const acceptedDomains = [...new Set([
+    domain,
+    ...candidate.acceptedDomains.map(normalizeShopifyDomain),
+  ])];
   return {
     ...candidate,
     domain,
+    acceptedDomains,
+    credentialRef: `env:${candidate.environmentPrefix}`,
     adminAccessToken: envString(runtimeEnv, `${candidate.environmentPrefix}_ADMIN_ACCESS_TOKEN`),
     clientId: envString(runtimeEnv, `${candidate.environmentPrefix}_CLIENT_ID`),
     clientSecret: envString(runtimeEnv, `${candidate.environmentPrefix}_CLIENT_SECRET`),
@@ -58,7 +79,33 @@ export function resolveShopifyStoreConfig(
 }
 
 export function hasShopifyCredentials(config: ShopifyCredentialConfig) {
-  return Boolean(config.adminAccessToken || (config.clientId && config.clientSecret));
+  return Boolean(
+    config.adminAccessToken
+    || (config.authMode === 'client_credentials' && config.clientId && config.clientSecret),
+  );
+}
+
+export function hasShopifyAppCredentials(config: ShopifyCredentialConfig) {
+  return Boolean(config.clientId && config.clientSecret);
+}
+
+export function withShopifyAdminAccessToken(
+  config: ShopifyCredentialConfig,
+  input: { token: string; domain: string; credentialRef: string },
+): ShopifyCredentialConfig {
+  const domain = normalizeShopifyDomain(input.domain);
+  if (!shopifyDomainAccepted(config, domain)) throw new Error('SHOPIFY_DOMAIN_NOT_ALLOWED');
+  return {
+    ...config,
+    domain,
+    credentialRef: input.credentialRef,
+    adminAccessToken: input.token,
+  };
+}
+
+export function shopifyDomainAccepted(config: ShopifyCredentialConfig, value: string) {
+  const domain = normalizeShopifyDomain(value);
+  return config.acceptedDomains.includes(domain);
 }
 
 export function normalizeShopifyDomain(value: string) {

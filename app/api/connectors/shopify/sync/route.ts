@@ -4,9 +4,11 @@ import { PlatformOrderRepository } from '../../../../../lib/connectors/repositor
 import { ShopifyAdminClient } from '../../../../../lib/connectors/shopify/client';
 import {
   hasShopifyCredentials,
+  hasShopifyAppCredentials,
   resolveShopifyStoreConfig,
 } from '../../../../../lib/connectors/shopify/config';
 import { ShopifyOrderConnector } from '../../../../../lib/connectors/shopify/connector';
+import { resolveShopifyRuntimeConfig } from '../../../../../lib/connectors/shopify/credential-store';
 import { sanitizedConnectorError, ShopifyConnectorError } from '../../../../../lib/connectors/shopify/errors';
 import { runShopifyOrderSync } from '../../../../../lib/connectors/shopify/sync-service';
 import {
@@ -32,15 +34,26 @@ export async function POST(request: Request) {
     }
     const runtimeEnv = env as unknown as Record<string, unknown>;
     requireProductionAccessPolicy(runtimeEnv, user.email);
-    const config = resolveShopifyStoreConfig(runtimeEnv, parsed.data.storeKey);
+    const baseConfig = resolveShopifyStoreConfig(runtimeEnv, parsed.data.storeKey);
+    const config = await resolveShopifyRuntimeConfig({
+      db,
+      tenantId: user.tenantId,
+      runtimeEnv,
+      storeKey: parsed.data.storeKey,
+      requestUrl: request.url,
+    });
     if (!hasShopifyCredentials(config)) {
+      const appConfigured = hasShopifyAppCredentials(baseConfig);
       return Response.json({
         ok: false,
-        code: 'SHOPIFY_CREDENTIALS_MISSING',
-        message: `${config.displayName} 尚未配置 ERP 独立 Shopify 只读凭证`,
+        code: appConfigured ? 'SHOPIFY_AUTHORIZATION_REQUIRED' : 'SHOPIFY_APP_CREDENTIALS_MISSING',
+        message: appConfigured
+          ? `${config.displayName} 尚未完成 ERP 独立 Shopify 只读授权`
+          : `${config.displayName} 尚未配置 ERP 独立 Shopify 应用参数`,
         requiredEnvironment: [
-          `${config.environmentPrefix}_ADMIN_ACCESS_TOKEN`,
-          `或 ${config.environmentPrefix}_CLIENT_ID + ${config.environmentPrefix}_CLIENT_SECRET`,
+          `${config.environmentPrefix}_CLIENT_ID`,
+          `${config.environmentPrefix}_CLIENT_SECRET`,
+          'ERP_CONNECTOR_CREDENTIALS_KEY',
         ],
       }, { status: 503 });
     }

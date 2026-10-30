@@ -2,7 +2,7 @@ import type { CanonicalOrderGraph, ConnectorPage } from '../types';
 import { asRecord, requireString, stringOrNull } from '../canonical';
 import { ShopifyAdminClient } from './client';
 import type { ShopifyCredentialConfig } from './config';
-import { normalizeShopifyDomain } from './config';
+import { normalizeShopifyDomain, shopifyDomainAccepted } from './config';
 import { ShopifyConnectorError } from './errors';
 import { mapShopifyOrder } from './mapper';
 import shopContextQuery from './graphql/shop-context.graphql?raw';
@@ -49,7 +49,7 @@ export class ShopifyOrderConnector {
         .filter((value): value is string => Boolean(value)),
     );
     const domain = normalizeShopifyDomain(requireString(shop?.myshopifyDomain, 'shop.myshopifyDomain'));
-    if (domain !== this.config.domain) {
+    if (!shopifyDomainAccepted(this.config, domain)) {
       throw new ShopifyConnectorError(
         'SHOPIFY_IDENTITY_MISMATCH',
         `${this.config.displayName} 返回的官方店铺域名与 ERP 配置不一致，已停止写入`,

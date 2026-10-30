@@ -100,7 +100,7 @@ export class PlatformOrderRepository {
       context.timezoneOffset,
       context.currency,
       '2026-07',
-      config.environmentPrefix,
+      config.credentialRef,
       now,
       now,
       now,

@@ -15,6 +15,20 @@
       "when": 1793354143514,
       "tag": "0001_premium_the_stranger",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1793379777797,
+      "tag": "0002_organic_titanium_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1793379974796,
+      "tag": "0003_fancy_jane_foster",
+      "breakpoints": true
     }
   ]
 }

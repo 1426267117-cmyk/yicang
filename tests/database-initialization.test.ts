@@ -21,10 +21,11 @@ describe('数据库初始化', () => {
   });
 
   it('新增正式迁移不写入店铺、订单或模拟业务数据', () => {
-    const sql = readFileSync(
-      new URL('../drizzle/0001_premium_the_stranger.sql', import.meta.url),
-      'utf8',
-    );
+    const sql = [
+      '../drizzle/0001_premium_the_stranger.sql',
+      '../drizzle/0002_organic_titanium_man.sql',
+      '../drizzle/0003_fancy_jane_foster.sql',
+    ].map((migration) => readFileSync(new URL(migration, import.meta.url), 'utf8')).join('\n');
     expect(sql).not.toMatch(/INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+(platform_stores|platform_orders|platform_order_lines|platform_refunds|platform_fulfillments)/i);
   });
 

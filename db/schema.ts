@@ -151,6 +151,29 @@ export const platformStores = sqliteTable('platform_stores', {
   index('idx_platform_stores_tenant').on(table.tenantId, table.platform),
 ]);
 
+export const connectorCredentials = sqliteTable('connector_credentials', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  platform: text('platform').notNull(),
+  storeKey: text('store_key').notNull(),
+  shopDomain: text('shop_domain').notNull(),
+  officialStoreId: text('official_store_id').notNull(),
+  accessTokenCiphertext: text('access_token_ciphertext').notNull(),
+  refreshTokenCiphertext: text('refresh_token_ciphertext'),
+  grantedScopes: text('granted_scopes').notNull(),
+  accessTokenExpiresAt: text('access_token_expires_at'),
+  refreshTokenExpiresAt: text('refresh_token_expires_at'),
+  refreshStartedAt: text('refresh_started_at'),
+  keyVersion: integer('key_version').notNull().default(1),
+  createdBy: text('created_by').notNull(),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_connector_credentials_store').on(table.tenantId, table.platform, table.storeKey),
+  uniqueIndex('uq_connector_credentials_identity').on(table.tenantId, table.platform, table.officialStoreId),
+  index('idx_connector_credentials_tenant').on(table.tenantId, table.platform),
+]);
+
 export const platformOrders = sqliteTable('platform_orders', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),
