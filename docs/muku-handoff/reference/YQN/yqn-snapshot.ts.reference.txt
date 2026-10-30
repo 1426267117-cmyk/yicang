@@ -1,0 +1,282 @@
+import { normalizeSkuKey } from "./channel-sku-sales.ts";
+
+type JsonRecord = Record<string, unknown>;
+
+export type YqnInventorySnapshotRow = {
+  recordKey: string;
+  warehouseCode: string;
+  warehouseName: string;
+  region: string;
+  sku: string;
+  availableQty: number;
+  lockedQty: number;
+  inboundQty: number;
+  ageDays: number;
+  stockValue: number;
+  sourceUpdatedAt: string;
+  snapshotAt: string;
+};
+
+export type YqnFulfillmentSnapshotRow = {
+  deliverOrderNo: string;
+  sourceOrderNo: string;
+  warehouseCode: string;
+  warehouseName: string;
+  status: string;
+  logisticStatus: string;
+  isException: boolean;
+  latestShipDate: string;
+  sourceUpdatedAt: string;
+  snapshotAt: string;
+};
+
+export type YqnInboundSnapshotRow = {
+  inboundPlanOrderNo: string;
+  warehouseCode: string;
+  status: string;
+  shipmentNo: string | null;
+  actualShipDate: string | null;
+  estimatedArriveAt: string | null;
+  actualArriveAt: string | null;
+  inboundCompleteAt: string | null;
+  gp20: number | null;
+  gp40: number | null;
+  hq40: number | null;
+  hq45: number | null;
+  containerCount: number | null;
+  planQty: number;
+  packedQty: number;
+  receivedQty: number;
+  sourceUpdatedAt: string;
+  snapshotAt: string;
+  items: Array<{
+    skuKey: string;
+    sourceSku: string;
+    plannedQty: number;
+    packedQty: number;
+    receivedQty: number;
+  }>;
+};
+
+export type YqnNormalizedSnapshot = {
+  capturedAt: string;
+  inventory: YqnInventorySnapshotRow[];
+  fulfillment: YqnFulfillmentSnapshotRow[];
+  inboundPlans: YqnInboundSnapshotRow[];
+};
+
+function asRecord(value: unknown): JsonRecord {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
+}
+
+function readPath(record: JsonRecord, path: string): unknown {
+  return path.split(".").reduce<unknown>((value, key) => asRecord(value)[key], record);
+}
+
+function firstValue(record: JsonRecord, paths: string[]) {
+  for (const path of paths) {
+    const value = readPath(record, path);
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return undefined;
+}
+
+function textValue(record: JsonRecord, paths: string[], fallback = "") {
+  const value = firstValue(record, paths);
+  return value === undefined ? fallback : String(value);
+}
+
+function numberValue(record: JsonRecord, paths: string[], fallback = 0) {
+  const raw = firstValue(record, paths);
+  const value = typeof raw === "number" ? raw : Number(String(raw ?? "").replace(/,/g, ""));
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function nullableNumberValue(record: JsonRecord, paths: string[]) {
+  const raw = firstValue(record, paths);
+  if (raw === undefined) return null;
+  const value = typeof raw === "number" ? raw : Number(String(raw).replace(/,/g, ""));
+  return Number.isFinite(value) ? value : null;
+}
+
+function stableKey(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function inferRegion(warehouseName: string) {
+  const normalized = warehouseName.toLowerCase();
+  if (/savannah|new jersey|new york|georgia|ga\b/.test(normalized)) return "美东";
+  if (/los angeles|california|ca\b|ontario/.test(normalized)) return "美西";
+  if (/dallas|texas|houston|tx\b|chicago/.test(normalized)) return "美中";
+  return "未分区";
+}
+
+function parseInventoryRow(row: JsonRecord, snapshotAt: string): YqnInventorySnapshotRow {
+  const warehouseCode = textValue(row, ["warehouseCode", "warehouse_code", "orgWarehouseCode", "warehouse.code", "orgWarehouse.code"], "UNKNOWN");
+  const warehouseName = textValue(row, ["warehouseName", "warehouse_name", "orgWarehouseName", "warehouse.name", "orgWarehouse.name"], warehouseCode);
+  const sku = textValue(row, ["erpSku", "sku", "productSku", "itemSku", "product.sku"], "UNKNOWN");
+  const lot = textValue(row, ["lotNo", "batchNo", "inventoryBatchNo", "id"], "");
+  const rawAge = firstValue(row, ["ageDays", "inventoryAge", "stockAge", "storageAge", "agingDays"]);
+  const ageDays = rawAge === undefined ? -1 : Math.max(0, Math.round(numberValue(row, ["ageDays", "inventoryAge", "stockAge", "storageAge", "agingDays"], 0)));
+  return {
+    recordKey: stableKey([warehouseCode, sku, lot, ageDays].join("|")),
+    warehouseCode,
+    warehouseName,
+    region: inferRegion(warehouseName),
+    sku,
+    availableQty: numberValue(row, ["inventoryAvailable", "inventory_available", "availableQty", "availableQuantity", "usableQty", "saleableQty", "stockNum", "availableStock"]),
+    lockedQty: numberValue(row, ["inventoryReserved", "inventory_reserved", "lockedQty", "lockQty", "frozenQty", "occupiedQty", "reservedQty"]),
+    inboundQty: numberValue(row, ["inventoryTransport", "inventory_transport", "inboundQty", "inTransitQty", "onWayQty", "transportQty"]),
+    ageDays,
+    stockValue: numberValue(row, ["stockValue", "inventoryValue", "amount"]),
+    sourceUpdatedAt: textValue(row, ["updatedAt", "updated_at", "lastUpdatedAt", "modifyTime"], snapshotAt),
+    snapshotAt,
+  };
+}
+
+function parseFulfillmentRow(row: JsonRecord, snapshotAt: string): YqnFulfillmentSnapshotRow {
+  const status = textValue(row, ["orderStatusEnum", "deliverOrderStatus", "status", "statusName"], "unknown");
+  const exceptionCode = textValue(row, ["errorCode", "exceptionCode", "errorType", "exceptionType"], "");
+  const isException = Boolean(exceptionCode && exceptionCode !== "unexception") || /异常|error|failed|failure/i.test(status);
+  return {
+    deliverOrderNo: textValue(row, ["orderNo", "deliverOrderNo", "documentNo", "shipmentNo", "id"], stableKey(JSON.stringify(row))),
+    sourceOrderNo: textValue(row, ["poNumber", "sourceNo", "orderNo", "saleOrderNo"]),
+    warehouseCode: textValue(row, ["orgWarehouseCode", "warehouseCode", "orgWarehouse.code"]),
+    warehouseName: textValue(row, ["orgWarehouseName", "warehouseName", "orgWarehouse.name"]),
+    status,
+    logisticStatus: textValue(row, ["logisticStatus", "shipmentPackages.0.trackingNo", "saleShipmentPackagesList.0.logisticStatus", "trackingStatus"]),
+    isException,
+    latestShipDate: textValue(row, ["latestDeliveryDate", "latestShipDate", "warehouseLastOutboundDate"]),
+    sourceUpdatedAt: textValue(row, ["shipmentPackages.0.shipmentDate", "paidAt", "updatedAt", "createdAt"], snapshotAt),
+    snapshotAt,
+  };
+}
+
+function parseInboundPlan(row: JsonRecord, snapshotAt: string): YqnInboundSnapshotRow {
+  const typeCounts = {
+    gp20: nullableNumberValue(row, ["gpQuantity20"]),
+    gp40: nullableNumberValue(row, ["gpQuantity40"]),
+    hq40: nullableNumberValue(row, ["hqQuantity40"]),
+    hq45: nullableNumberValue(row, ["hqQuantity45"]),
+  };
+  const knownTypeCounts = Object.values(typeCounts).filter((value): value is number => value !== null);
+  const details = Array.isArray(row.planProductDetailParamList)
+    ? row.planProductDetailParamList.filter((item): item is JsonRecord => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+    : [];
+  const items = new Map<string, { sourceSku: string; plannedQty: number; packedQty: number; receivedQty: number }>();
+  for (const detail of details) {
+    const sourceSku = textValue(detail, ["sku"]).trim();
+    if (!sourceSku) continue;
+    const skuKey = normalizeSkuKey(sourceSku);
+    const current = items.get(skuKey) ?? { sourceSku, plannedQty: 0, packedQty: 0, receivedQty: 0 };
+    current.plannedQty += numberValue(detail, ["qty"]);
+    current.packedQty += numberValue(detail, ["qtyPacked"]);
+    current.receivedQty += numberValue(detail, ["qtyReceived"]);
+    items.set(skuKey, current);
+  }
+  return {
+    inboundPlanOrderNo: textValue(row, ["inboundPlanOrderNo"]),
+    warehouseCode: textValue(row, ["orgWarehouseCode"]),
+    status: textValue(row, ["inboundPlanOrderStatus"], "unknown"),
+    shipmentNo: textValue(row, ["shipmentNo"]) || null,
+    actualShipDate: textValue(row, ["actualShipDate"]) || null,
+    estimatedArriveAt: textValue(row, ["estimateArriveTime"]) || null,
+    actualArriveAt: textValue(row, ["actualArriveTime"]) || null,
+    inboundCompleteAt: textValue(row, ["inboundCompleteTime"]) || null,
+    ...typeCounts,
+    containerCount: knownTypeCounts.length ? knownTypeCounts.reduce((sum, value) => sum + value, 0) : null,
+    planQty: numberValue(row, ["planQty"]),
+    packedQty: numberValue(row, ["packedQty"]),
+    receivedQty: numberValue(row, ["receivedQty"]),
+    sourceUpdatedAt: textValue(row, ["inboundCompleteTime", "actualArriveTime", "actualShipDate"], snapshotAt),
+    snapshotAt,
+    items: [...items.entries()].map(([skuKey, item]) => ({ skuKey, ...item })),
+  };
+}
+
+export function normalizeYqnSnapshot(input: {
+  capturedAt: string;
+  inventoryRows: unknown[];
+  fulfillmentRows: unknown[];
+  inboundRows: unknown[];
+}): YqnNormalizedSnapshot {
+  const inventory = input.inventoryRows.map(asRecord).map((row) => parseInventoryRow(row, input.capturedAt))
+    .filter((row) => row.sku !== "UNKNOWN" && row.warehouseCode !== "UNKNOWN");
+  const fulfillment = input.fulfillmentRows.map(asRecord).map((row) => parseFulfillmentRow(row, input.capturedAt));
+  const inboundPlans = input.inboundRows.map(asRecord).map((row) => parseInboundPlan(row, input.capturedAt))
+    .filter((row) => row.inboundPlanOrderNo && row.warehouseCode);
+  return { capturedAt: input.capturedAt, inventory, fulfillment, inboundPlans };
+}
+
+function chunks<T>(items: T[], size = 80) {
+  const result: T[][] = [];
+  for (let index = 0; index < items.length; index += size) result.push(items.slice(index, index + size));
+  return result;
+}
+
+export async function persistYqnSnapshot(db: D1Database, snapshot: YqnNormalizedSnapshot) {
+  const inventoryStatements = snapshot.inventory.map((row) => db.prepare(`INSERT INTO inventory_snapshots
+      (record_key, warehouse_code, warehouse_name, region, sku, available_qty, locked_qty, inbound_qty, age_days, stock_value, source_updated_at, snapshot_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(record_key) DO UPDATE SET warehouse_code=excluded.warehouse_code, warehouse_name=excluded.warehouse_name,
+      region=excluded.region, sku=excluded.sku, available_qty=excluded.available_qty, locked_qty=excluded.locked_qty,
+      inbound_qty=excluded.inbound_qty, age_days=excluded.age_days, stock_value=excluded.stock_value,
+      source_updated_at=excluded.source_updated_at, snapshot_at=excluded.snapshot_at`)
+    .bind(row.recordKey, row.warehouseCode, row.warehouseName, row.region, row.sku, row.availableQty, row.lockedQty,
+      row.inboundQty, row.ageDays, row.stockValue, row.sourceUpdatedAt, row.snapshotAt));
+  for (const batch of chunks(inventoryStatements)) await db.batch(batch);
+
+  const fulfillmentStatements = snapshot.fulfillment.map((row) => db.prepare(`INSERT INTO fulfillment_orders
+      (deliver_order_no, source_order_no, warehouse_code, warehouse_name, status, logistic_status, is_exception, latest_ship_date, source_updated_at, snapshot_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(deliver_order_no) DO UPDATE SET source_order_no=excluded.source_order_no, warehouse_code=excluded.warehouse_code,
+      warehouse_name=excluded.warehouse_name, status=excluded.status, logistic_status=excluded.logistic_status,
+      is_exception=excluded.is_exception, latest_ship_date=excluded.latest_ship_date,
+      source_updated_at=excluded.source_updated_at, snapshot_at=excluded.snapshot_at`)
+    .bind(row.deliverOrderNo, row.sourceOrderNo, row.warehouseCode, row.warehouseName, row.status, row.logisticStatus,
+      row.isException ? 1 : 0, row.latestShipDate, row.sourceUpdatedAt, row.snapshotAt));
+  for (const batch of chunks(fulfillmentStatements)) await db.batch(batch);
+
+  const inboundPlanStatements = snapshot.inboundPlans.map((row) => db.prepare(`INSERT INTO container_shipments
+      (inbound_plan_order_no, warehouse_code, status, shipment_no, actual_ship_date, estimated_arrive_at,
+       actual_arrive_at, inbound_complete_at, gp20_qty, gp40_qty, hq40_qty, hq45_qty, container_count,
+       plan_qty, packed_qty, received_qty, source_updated_at, snapshot_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(inbound_plan_order_no) DO UPDATE SET warehouse_code=excluded.warehouse_code,
+      status=excluded.status, shipment_no=excluded.shipment_no, actual_ship_date=excluded.actual_ship_date,
+      estimated_arrive_at=excluded.estimated_arrive_at, actual_arrive_at=excluded.actual_arrive_at,
+      inbound_complete_at=excluded.inbound_complete_at, gp20_qty=excluded.gp20_qty, gp40_qty=excluded.gp40_qty,
+      hq40_qty=excluded.hq40_qty, hq45_qty=excluded.hq45_qty, container_count=excluded.container_count,
+      plan_qty=excluded.plan_qty, packed_qty=excluded.packed_qty, received_qty=excluded.received_qty,
+      source_updated_at=excluded.source_updated_at, snapshot_at=excluded.snapshot_at`)
+    .bind(row.inboundPlanOrderNo, row.warehouseCode, row.status, row.shipmentNo, row.actualShipDate,
+      row.estimatedArriveAt, row.actualArriveAt, row.inboundCompleteAt, row.gp20, row.gp40, row.hq40, row.hq45,
+      row.containerCount, row.planQty, row.packedQty, row.receivedQty, row.sourceUpdatedAt, row.snapshotAt));
+  for (const batch of chunks(inboundPlanStatements)) await db.batch(batch);
+
+  for (const plan of snapshot.inboundPlans) {
+    await db.prepare("UPDATE container_shipment_items SET active=0 WHERE inbound_plan_order_no=? AND active=1")
+      .bind(plan.inboundPlanOrderNo).run();
+    const itemStatements = plan.items.map((item) => db.prepare(`INSERT INTO container_shipment_items
+        (inbound_plan_order_no, sku_key, source_sku, active, planned_qty, packed_qty, received_qty, source_updated_at, snapshot_at)
+        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+        ON CONFLICT(inbound_plan_order_no, sku_key) DO UPDATE SET source_sku=excluded.source_sku, active=1,
+        planned_qty=excluded.planned_qty, packed_qty=excluded.packed_qty, received_qty=excluded.received_qty,
+        source_updated_at=excluded.source_updated_at, snapshot_at=excluded.snapshot_at`)
+      .bind(plan.inboundPlanOrderNo, item.skuKey, item.sourceSku, item.plannedQty, item.packedQty,
+        item.receivedQty, plan.sourceUpdatedAt, plan.snapshotAt));
+    for (const batch of chunks(itemStatements)) await db.batch(batch);
+  }
+
+  return {
+    inventory: snapshot.inventory.length,
+    fulfillment: snapshot.fulfillment.length,
+    inboundPlans: snapshot.inboundPlans.length,
+    inboundItems: snapshot.inboundPlans.reduce((sum, row) => sum + row.items.length, 0),
+  };
+}

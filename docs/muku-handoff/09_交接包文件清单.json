@@ -1,0 +1,147 @@
+﻿{
+  "createdAt": "2026-10-30T09:26:42.990226+00:00",
+  "files": [
+    {
+      "path": "00_先读我.html",
+      "bytes": 5310,
+      "sha256": "32aef0e6d5ffdd11c3cc1abe7bcf88fa1f8178e099ed8cd6d88566997d540290"
+    },
+    {
+      "path": "01_给ERP项目的开场提示词.txt",
+      "bytes": 5237,
+      "sha256": "1a0ec85776c2bfe63a6593dd0dfd45b942924dfe2893863423309790777fcaf3"
+    },
+    {
+      "path": "02_接入能力与缺口.json",
+      "bytes": 4672,
+      "sha256": "0cd132a8a40a73c20c6b255148ed6bb66f0ed0aba2678a508120a07a5ed027ca"
+    },
+    {
+      "path": "03_看板只读接口目录.json",
+      "bytes": 4004,
+      "sha256": "b5abac395cf1bd8c09a8823667923d6efd5972af9108f59e2fa4d99f7341fed3"
+    },
+    {
+      "path": "04_店铺与仓库映射.json",
+      "bytes": 3272,
+      "sha256": "fe0b75f07809464880982ac1643e1f642da3f044ad96602c47b29c46932c3d76"
+    },
+    {
+      "path": "05_订单数据模型与验收.txt",
+      "bytes": 3613,
+      "sha256": "b1d54d5cec16fa0e5d5b5476a3502dc7907c08e6b3582837ca975584b78a926c"
+    },
+    {
+      "path": "06_官方资料与授权说明.txt",
+      "bytes": 2837,
+      "sha256": "b496147f7a048b40c330d64099fd403766e5edd005a92ff4aa53bf3283cab758"
+    },
+    {
+      "path": "07_当前核验范围与限制.txt",
+      "bytes": 2195,
+      "sha256": "4dbe1144bf05fb31e722e160554810d442c0a9fc37e51b7e1d151b0f0354c123"
+    },
+    {
+      "path": "08_源码来源与SHA256.json",
+      "bytes": 6237,
+      "sha256": "49ff8e6c3cb2b4a37e93d2c417964cc8d304c21f6b0d6015d5289a084f4cb79f"
+    },
+    {
+      "path": "reference/README.txt",
+      "bytes": 1618,
+      "sha256": "46796ce6761da97bd261c3781ba783c9c95db40fc7fb08ff8c6e566f8ea14611"
+    },
+    {
+      "path": "reference/Shopify/shopify_yesterday_sales.py.reference.txt",
+      "bytes": 32428,
+      "sha256": "be69d471eabfbb4db09da391ccadd23b09e5bf1cb4da9f50072025ba9232d0d5"
+    },
+    {
+      "path": "reference/Wayfair/summarize_wayfair_refunds.py.reference.txt",
+      "bytes": 8400,
+      "sha256": "e327ab64eedb5b0f69a14546af02d30fde3b15a6f7b5ef43af658c0502226225"
+    },
+    {
+      "path": "reference/Wayfair/summarize_wayfair_sales.py.reference.txt",
+      "bytes": 9025,
+      "sha256": "be3d47d13d59309f67b6d2ca2b94454f63720d61951610ca5198d099ee695368"
+    },
+    {
+      "path": "reference/YQN/yqn-openapi.ts.reference.txt",
+      "bytes": 10743,
+      "sha256": "cec9ea6a481e2d8cf984c2715dcc175e444bf0d51f0bcc293fb12ae08c23ebc4"
+    },
+    {
+      "path": "reference/YQN/yqn-snapshot.ts.reference.txt",
+      "bytes": 14864,
+      "sha256": "afb6e0b30a5768108c9de0853563cf3601a6555578a750819d2f79b4d40a35de"
+    },
+    {
+      "path": "reference/公共规则/business-time.mjs.reference.txt",
+      "bytes": 1099,
+      "sha256": "ab1f9e0de803f05213845223d1d71a7d40aac2ef54bc849fc2827c27918492b2"
+    },
+    {
+      "path": "reference/公共规则/channel-business-rules.ts.reference.txt",
+      "bytes": 533,
+      "sha256": "f073808eea1329b21e7b725d5774f0f11e17eac6867bc49d5bcf3865efdf3f47"
+    },
+    {
+      "path": "reference/公共规则/channel-report-date.mjs.reference.txt",
+      "bytes": 1774,
+      "sha256": "c5fa8861e6d325cabca3a13ae487e4007795cb5f8d2e6061f44fb865cf7c329d"
+    },
+    {
+      "path": "reference/公共规则/channel-sku-sales.ts.reference.txt",
+      "bytes": 16591,
+      "sha256": "99398f47fdaabfa6e4691e85bb5ea92327fbaa52b325cedb66a495e6911bd101"
+    },
+    {
+      "path": "reference/公共规则/package-volume.mjs.reference.txt",
+      "bytes": 1856,
+      "sha256": "98384456db0e848a14e68ae82214bcb2e3558aef5659bb186e27d68eabaafea1"
+    },
+    {
+      "path": "reference/广告/build_amazon_browser_metrics.py.reference.txt",
+      "bytes": 14235,
+      "sha256": "40d71329baa27fc5a122813b2929b687c2cfaa200b8f99771affb682a94fe56e"
+    },
+    {
+      "path": "reference/广告/summarize_ad_spend.py.reference.txt",
+      "bytes": 18030,
+      "sha256": "373ba26ba1420c14fe639768c192cdacc7082b14534b64013b6594dc92ffc5f5"
+    },
+    {
+      "path": "reference/看板只读路由/channel-daily.route.ts.reference.txt",
+      "bytes": 37519,
+      "sha256": "022b6843ea23d0431a3b7ada304db8ed76e407dfcd069dcdc9f62222fa57e891"
+    },
+    {
+      "path": "reference/看板只读路由/container-sales.route.ts.reference.txt",
+      "bytes": 24383,
+      "sha256": "114f3820e4f52882024ff188a0cda523601a701792bc5b1be2a0e9a567b716d2"
+    },
+    {
+      "path": "reference/看板只读路由/inventory-search.route.ts.reference.txt",
+      "bytes": 16064,
+      "sha256": "7f074b39626919f5b3f29e4831f55b8b1ee1da0f1f07285f930227104c512b43"
+    },
+    {
+      "path": "reference/看板只读路由/inventory-warehouse.route.ts.reference.txt",
+      "bytes": 5267,
+      "sha256": "7edc9fe3880c1baad22e3651e0b9b5a57be559fc1df50e7403b55e2685a25c38"
+    },
+    {
+      "path": "reference/看板只读路由/sku-sales.route.ts.reference.txt",
+      "bytes": 3048,
+      "sha256": "83974a373fc36d34b1a97ba7ab2e1b490db2d1b167030842ea19ec64900828dd"
+    },
+    {
+      "path": "reference/看板只读路由/store-sales.route.ts.reference.txt",
+      "bytes": 25121,
+      "sha256": "352866cf5c5c5e2944ffa614e43bcdd94ee38146debc10251bd4a6e7b16fcb23"
+    }
+  ],
+  "credentialPatternScan": "passed",
+  "scope": "No raw order data, credentials, databases, deployment or upload scripts included."
+}

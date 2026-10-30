@@ -1,0 +1,705 @@
+import { env } from "cloudflare:workers";
+import { ensureDatabase } from "../../../db/bootstrap";
+import { requireApiAuth } from "../../../lib/auth";
+
+const STORE_IDS = ["zimasya", "kaguyasu", "anzhap", "bizfurniz"] as const;
+type StoreId = typeof STORE_IDS[number];
+const STORE_ID_SET = new Set<string>(STORE_IDS);
+const STORE_NAMES: Record<StoreId, string> = {
+  zimasya: "ZIMASYA",
+  kaguyasu: "Kaguyasu",
+  anzhap: "Anzhap",
+  bizfurniz: "BizFurniz",
+};
+const DAY_MS = 86_400_000;
+const MAX_RANGE_DAYS = 366;
+const DEFAULT_RANGE_DAYS = 30;
+
+type SalesRow = {
+  store_id: string;
+  store_name: string;
+  date: string;
+  currency: string;
+  orders: number | string | null;
+  sales: number | string | null;
+  refunds: number | string | null;
+  source_updated_at: string | null;
+};
+
+type FinanceRow = {
+  store_id: string;
+  store_name: string;
+  date: string;
+  currency: string;
+  orders: number | string | null;
+  gross_sales: number | string | null;
+  discounts: number | string | null;
+  sales_reversals: number | string | null;
+  net_sales: number | string | null;
+  shipping_charges: number | string | null;
+  return_fees: number | string | null;
+  taxes: number | string | null;
+  duties: number | string | null;
+  additional_fees: number | string | null;
+  total_sales: number | string | null;
+  metric_version: string;
+  source_updated_at: string;
+};
+
+type RangeRow = { min_date: string | null; max_date: string | null };
+
+type StoreSnapshotRow = {
+  store_id: string;
+  store_name: string;
+  currency: string;
+  status: string;
+  last_sync_at: string | null;
+};
+
+type StoreFinanceStateRow = {
+  store_id: string;
+  status: string;
+  message: string;
+  last_success_at: string | null;
+  last_attempt_at: string | null;
+};
+
+type StoreAccumulator = {
+  storeId: string;
+  storeName: string;
+  currency: string;
+  status: string;
+  lastSyncAt: string | null;
+  sourceUpdatedAt: string | null;
+  coveredDays: number;
+  orders: number;
+  sales: number;
+  refunds: number;
+};
+
+type DailyStoreSales = {
+  storeId: string;
+  storeName: string;
+  currency: string;
+  orders: number;
+  sales: number;
+  refunds: number;
+  sourceUpdatedAt: string | null;
+};
+
+type DailyAccumulator = {
+  date: string;
+  orders: number;
+  sales: number;
+  refunds: number;
+  stores: DailyStoreSales[];
+};
+
+type FinanceTotals = {
+  orders: number;
+  grossSales: number;
+  discounts: number;
+  salesReversals: number;
+  netSales: number;
+  shippingCharges: number;
+  returnFees: number;
+  taxes: number;
+  duties: number;
+  additionalFees: number;
+  totalSales: number;
+};
+
+const FINANCE_MONEY_KEYS = [
+  "grossSales",
+  "discounts",
+  "salesReversals",
+  "netSales",
+  "shippingCharges",
+  "returnFees",
+  "taxes",
+  "duties",
+  "additionalFees",
+  "totalSales",
+] as const;
+
+type FinanceMoneyKey = typeof FINANCE_MONEY_KEYS[number];
+type FinancePercentChange = { orders: number | null } & Record<FinanceMoneyKey, number | null>;
+
+function json(body: unknown, status = 200) {
+  return Response.json(body, {
+    status,
+    headers: { "Cache-Control": "no-store" },
+  });
+}
+
+function parsedDate(value: string | null) {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value ? parsed : null;
+}
+
+function formattedDate(value: Date) {
+  return value.toISOString().slice(0, 10);
+}
+
+function shiftedDate(value: Date, days: number) {
+  return new Date(value.getTime() + days * DAY_MS);
+}
+
+function numberValue(value: unknown) {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function integerValue(value: unknown) {
+  return Math.round(numberValue(value));
+}
+
+function moneyValue(amount: number) {
+  return Math.round((amount + Number.EPSILON) * 100) / 100;
+}
+
+function currencyValue(currencies: Set<string>) {
+  if (currencies.size === 0) return null;
+  return currencies.size === 1 ? currencies.values().next().value ?? null : "MIXED";
+}
+
+function storeOrder(storeId: string) {
+  const index = STORE_IDS.indexOf(storeId as typeof STORE_IDS[number]);
+  return index === -1 ? STORE_IDS.length : index;
+}
+
+function isHealthyStore(status: string) {
+  return status === "healthy" || status === "live";
+}
+
+function emptyFinanceTotals(): FinanceTotals {
+  return {
+    orders: 0,
+    grossSales: 0,
+    discounts: 0,
+    salesReversals: 0,
+    netSales: 0,
+    shippingCharges: 0,
+    returnFees: 0,
+    taxes: 0,
+    duties: 0,
+    additionalFees: 0,
+    totalSales: 0,
+  };
+}
+
+function financeTotalsFromRow(row: FinanceRow): FinanceTotals {
+  return {
+    orders: integerValue(row.orders),
+    grossSales: numberValue(row.gross_sales),
+    discounts: numberValue(row.discounts),
+    salesReversals: numberValue(row.sales_reversals),
+    netSales: numberValue(row.net_sales),
+    shippingCharges: numberValue(row.shipping_charges),
+    returnFees: numberValue(row.return_fees),
+    taxes: numberValue(row.taxes),
+    duties: numberValue(row.duties),
+    additionalFees: numberValue(row.additional_fees),
+    totalSales: numberValue(row.total_sales),
+  };
+}
+
+function addFinanceTotals(target: FinanceTotals, value: FinanceTotals) {
+  target.orders += value.orders;
+  for (const key of FINANCE_MONEY_KEYS) target[key] += value[key];
+}
+
+function roundedFinanceTotals(value: FinanceTotals): FinanceTotals {
+  const result = { ...value, orders: Math.round(value.orders) };
+  for (const key of FINANCE_MONEY_KEYS) result[key] = moneyValue(value[key]);
+  return result;
+}
+
+function financePercentChange(current: FinanceTotals, previous: FinanceTotals): FinancePercentChange {
+  const change = (value: number, baseline: number) => baseline === 0
+    ? null
+    : Math.round(((value - baseline) / Math.abs(baseline)) * 1_000) / 10;
+  const result = {
+    orders: change(current.orders, previous.orders),
+  } as FinancePercentChange;
+  for (const key of FINANCE_MONEY_KEYS) result[key] = change(current[key], previous[key]);
+  return result;
+}
+
+function aggregateFinance(
+  rows: FinanceRow[],
+  selectedStoreIds: readonly StoreId[],
+  snapshots: Map<string, StoreSnapshotRow>,
+  financeStates: Map<string, StoreFinanceStateRow>,
+  requestedDays: number,
+) {
+  type DailyFinanceAccumulator = {
+    date: string;
+    currency: string;
+    totals: FinanceTotals;
+    stores: Array<{
+      storeId: string;
+      storeName: string;
+      metricVersion: string;
+      sourceUpdatedAt: string;
+      totals: FinanceTotals;
+    }>;
+  };
+  type StoreFinanceAccumulator = {
+    storeId: StoreId;
+    storeName: string;
+    status: string;
+    message: string;
+    lastSuccessAt: string | null;
+    lastAttemptAt: string | null;
+    coveredDays: number;
+    currencies: Set<string>;
+    metricVersions: Set<string>;
+    sourceUpdatedAt: string | null;
+    totalsByCurrency: Map<string, FinanceTotals>;
+  };
+
+  const byCurrency = new Map<string, FinanceTotals>();
+  const daily = new Map<string, DailyFinanceAccumulator>();
+  const coveredDates = new Set<string>();
+  const metricVersions = new Set<string>();
+  const stores = new Map<StoreId, StoreFinanceAccumulator>();
+  for (const storeId of selectedStoreIds) {
+    const snapshot = snapshots.get(storeId);
+    const financeState = financeStates.get(storeId);
+    stores.set(storeId, {
+      storeId,
+      storeName: snapshot?.store_name ?? STORE_NAMES[storeId],
+      status: financeState?.status ?? "unavailable",
+      message: financeState?.message ?? "Shopify 财务指标暂不可用",
+      lastSuccessAt: financeState?.last_success_at ?? null,
+      lastAttemptAt: financeState?.last_attempt_at ?? null,
+      coveredDays: 0,
+      currencies: new Set<string>(),
+      metricVersions: new Set<string>(),
+      sourceUpdatedAt: null,
+      totalsByCurrency: new Map<string, FinanceTotals>(),
+    });
+  }
+
+  for (const row of rows) {
+    const totals = financeTotalsFromRow(row);
+    coveredDates.add(row.date);
+    metricVersions.add(row.metric_version);
+
+    let currencyTotals = byCurrency.get(row.currency);
+    if (!currencyTotals) {
+      currencyTotals = emptyFinanceTotals();
+      byCurrency.set(row.currency, currencyTotals);
+    }
+    addFinanceTotals(currencyTotals, totals);
+
+    const dailyKey = `${row.date}\u0000${row.currency}`;
+    let day = daily.get(dailyKey);
+    if (!day) {
+      day = { date: row.date, currency: row.currency, totals: emptyFinanceTotals(), stores: [] };
+      daily.set(dailyKey, day);
+    }
+    addFinanceTotals(day.totals, totals);
+    day.stores.push({
+      storeId: row.store_id,
+      storeName: row.store_name,
+      metricVersion: row.metric_version,
+      sourceUpdatedAt: row.source_updated_at,
+      totals: roundedFinanceTotals(totals),
+    });
+
+    const store = stores.get(row.store_id as StoreId);
+    if (!store) continue;
+    store.storeName = row.store_name;
+    store.coveredDays += 1;
+    store.currencies.add(row.currency);
+    store.metricVersions.add(row.metric_version);
+    if (!store.sourceUpdatedAt || row.source_updated_at > store.sourceUpdatedAt) {
+      store.sourceUpdatedAt = row.source_updated_at;
+    }
+    let storeCurrencyTotals = store.totalsByCurrency.get(row.currency);
+    if (!storeCurrencyTotals) {
+      storeCurrencyTotals = emptyFinanceTotals();
+      store.totalsByCurrency.set(row.currency, storeCurrencyTotals);
+    }
+    addFinanceTotals(storeCurrencyTotals, totals);
+  }
+
+  const expectedStoreDays = requestedDays * selectedStoreIds.length;
+  const coveredStoreDays = rows.length;
+  const storeRows = Array.from(stores.values())
+    .sort((left, right) => storeOrder(left.storeId) - storeOrder(right.storeId))
+    .map((store) => {
+      const currency = currencyValue(store.currencies);
+      const healthy = isHealthyStore(store.status);
+      const storeCurrencyTotals = store.totalsByCurrency.size === 1
+        ? store.totalsByCurrency.values().next().value ?? null
+        : null;
+      return {
+        storeId: store.storeId,
+        storeName: store.storeName,
+        status: store.status,
+        message: store.message,
+        healthy,
+        stale: store.coveredDays > 0 && !healthy,
+        lastSuccessAt: store.lastSuccessAt,
+        lastAttemptAt: store.lastAttemptAt,
+        currency,
+        metricVersion: store.metricVersions.size === 0
+          ? null
+          : store.metricVersions.size === 1
+            ? store.metricVersions.values().next().value ?? null
+            : "MIXED",
+        sourceUpdatedAt: store.sourceUpdatedAt,
+        coveredDays: store.coveredDays,
+        complete: store.coveredDays === requestedDays && healthy,
+        totals: storeCurrencyTotals ? roundedFinanceTotals(storeCurrencyTotals) : null,
+        byCurrency: Array.from(store.totalsByCurrency.entries())
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([currencyCode, totals]) => ({
+            currency: currencyCode,
+            totals: roundedFinanceTotals(totals),
+          })),
+      };
+    });
+  const completeStoreCount = storeRows.filter((store) => store.complete).length;
+  const missingStoreIds = storeRows.filter((store) => store.coveredDays === 0).map((store) => store.storeId);
+  const unhealthyStoreIds = storeRows.filter((store) => !store.healthy).map((store) => store.storeId);
+  const staleStoreIds = storeRows.filter((store) => store.stale).map((store) => store.storeId);
+  const empty = coveredStoreDays === 0;
+  const complete = expectedStoreDays > 0
+    && coveredStoreDays === expectedStoreDays
+    && completeStoreCount === selectedStoreIds.length;
+  const partial = !empty && !complete;
+  const currency = currencyValue(new Set(byCurrency.keys()));
+  const onlyCurrencyTotals = byCurrency.size === 1
+    ? byCurrency.values().next().value ?? null
+    : null;
+
+  return {
+    availability: complete ? "available" as const : partial ? "partial" as const : "unavailable" as const,
+    reason: complete ? "complete" as const : partial ? "partial_coverage" as const : "no_data" as const,
+    currency,
+    metricVersion: metricVersions.size === 0
+      ? null
+      : metricVersions.size === 1
+        ? metricVersions.values().next().value ?? null
+        : "MIXED",
+    coverage: {
+      requestedDays,
+      coveredDays: coveredDates.size,
+      expectedStoreDays,
+      coveredStoreDays,
+      complete,
+      partial,
+      empty,
+      stale: staleStoreIds.length > 0,
+      status: complete ? "complete" as const : empty ? "empty" as const : "partial" as const,
+      completeStoreCount,
+      totalStoreCount: selectedStoreIds.length,
+      missingStoreIds,
+      unhealthyStoreIds,
+      staleStoreIds,
+    },
+    totals: onlyCurrencyTotals ? roundedFinanceTotals(onlyCurrencyTotals) : null,
+    byCurrency: Array.from(byCurrency.entries())
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([currencyCode, totals]) => ({
+        currency: currencyCode,
+        totals: roundedFinanceTotals(totals),
+      })),
+    daily: Array.from(daily.values())
+      .sort((left, right) => left.date.localeCompare(right.date) || left.currency.localeCompare(right.currency))
+      .map((day) => ({
+        date: day.date,
+        currency: day.currency,
+        totals: roundedFinanceTotals(day.totals),
+        stores: day.stores.sort((left, right) => storeOrder(left.storeId) - storeOrder(right.storeId)),
+      })),
+    stores: storeRows,
+  };
+}
+
+export async function GET(request: Request) {
+  const authResponse = await requireApiAuth(request);
+  if (authResponse) return authResponse;
+  const url = new URL(request.url);
+  const rawFrom = url.searchParams.get("from");
+  const rawTo = url.searchParams.get("to");
+  const rawStore = (url.searchParams.get("store") ?? "all").trim().toLowerCase();
+
+  if (rawStore !== "all" && !STORE_ID_SET.has(rawStore)) {
+    return json({
+      error: {
+        code: "invalid_store",
+        message: `store 必须是 all 或 ${STORE_IDS.join("、")}`,
+      },
+    }, 400);
+  }
+
+  const explicitToDate = rawTo === null ? null : parsedDate(rawTo);
+  if (rawTo !== null && !explicitToDate) {
+    return json({ error: { code: "invalid_to", message: "to 必须是有效的 YYYY-MM-DD 日期" } }, 400);
+  }
+  const explicitFromDate = rawFrom === null ? null : parsedDate(rawFrom);
+  if (rawFrom !== null && !explicitFromDate) {
+    return json({ error: { code: "invalid_from", message: "from 必须是有效的 YYYY-MM-DD 日期" } }, 400);
+  }
+  const store = rawStore;
+  const selectedStoreIds: StoreId[] = store === "all" ? [...STORE_IDS] : [store as StoreId];
+  const storePredicate = store === "all" ? "" : " AND store_id=?";
+  const storeParameters = store === "all" ? [] : [store];
+
+  try {
+    await ensureDatabase();
+    const [rangeResult, financeRangeResult] = await Promise.all([
+      env.DB.prepare(`SELECT MIN(date) AS min_date, MAX(date) AS max_date
+        FROM store_daily_sales
+        WHERE 1=1${storePredicate}`)
+        .bind(...storeParameters).first<RangeRow>(),
+      env.DB.prepare(`SELECT MIN(date) AS min_date, MAX(date) AS max_date
+        FROM store_daily_finance
+        WHERE 1=1${storePredicate}`)
+        .bind(...storeParameters).first<RangeRow>(),
+    ]);
+
+    const today = parsedDate(formattedDate(new Date()))!;
+    const latestDataDateValue = [rangeResult?.max_date, financeRangeResult?.max_date]
+      .filter((value): value is string => Boolean(value))
+      .sort()
+      .at(-1) ?? null;
+    const latestDataDate = parsedDate(latestDataDateValue);
+    const toDate = explicitToDate ?? latestDataDate ?? today;
+    const fromDate = explicitFromDate ?? shiftedDate(toDate, -(DEFAULT_RANGE_DAYS - 1));
+    if (fromDate.getTime() > toDate.getTime()) {
+      return json({ error: { code: "invalid_range", message: "from 不能晚于 to" } }, 400);
+    }
+    const requestedDays = Math.floor((toDate.getTime() - fromDate.getTime()) / DAY_MS) + 1;
+    if (requestedDays > MAX_RANGE_DAYS) {
+      return json({ error: { code: "range_too_large", message: `日期范围最多 ${MAX_RANGE_DAYS} 天` } }, 400);
+    }
+
+    const from = formattedDate(fromDate);
+    const to = formattedDate(toDate);
+    const comparisonTo = formattedDate(shiftedDate(fromDate, -1));
+    const comparisonFrom = formattedDate(shiftedDate(fromDate, -requestedDays));
+    const salesParameters = [from, to, ...storeParameters];
+    const financeParameters = [comparisonFrom, to, ...storeParameters];
+    const snapshotPlaceholders = selectedStoreIds.map(() => "?").join(",");
+
+    const [salesResult, financeResult, snapshotsResult, financeStatesResult] = await Promise.all([
+      env.DB.prepare(`SELECT store_id, store_name, date, currency, orders, sales, refunds, source_updated_at
+        FROM store_daily_sales
+        WHERE date>=? AND date<=?${storePredicate}
+        ORDER BY date, store_id`)
+        .bind(...salesParameters).all<SalesRow>(),
+      env.DB.prepare(`SELECT store_id, store_name, date, currency, orders, gross_sales, discounts,
+          sales_reversals, net_sales, shipping_charges, return_fees, taxes, duties, additional_fees,
+          total_sales, metric_version, source_updated_at
+        FROM store_daily_finance
+        WHERE date>=? AND date<=?${storePredicate}
+        ORDER BY date, store_id`)
+        .bind(...financeParameters).all<FinanceRow>(),
+      env.DB.prepare(`SELECT store_id, store_name, currency, status, last_sync_at
+        FROM store_snapshots
+        WHERE store_id IN (${snapshotPlaceholders})`)
+        .bind(...selectedStoreIds).all<StoreSnapshotRow>(),
+      env.DB.prepare(`SELECT store_id, status, message, last_success_at, last_attempt_at
+        FROM store_finance_state
+        WHERE store_id IN (${snapshotPlaceholders})`)
+        .bind(...selectedStoreIds).all<StoreFinanceStateRow>(),
+    ]);
+
+    const snapshots = new Map(snapshotsResult.results.map((row) => [row.store_id, row]));
+    const financeStates = new Map(financeStatesResult.results.map((row) => [row.store_id, row]));
+    const daily = new Map<string, DailyAccumulator>();
+    const stores = new Map<string, StoreAccumulator>();
+    let totalOrders = 0;
+    let totalSales = 0;
+    let totalRefunds = 0;
+
+    for (const storeId of selectedStoreIds) {
+      const snapshot = snapshots.get(storeId);
+      stores.set(storeId, {
+        storeId,
+        storeName: snapshot?.store_name ?? STORE_NAMES[storeId],
+        currency: snapshot?.currency ?? "USD",
+        status: snapshot?.status ?? "unknown",
+        lastSyncAt: snapshot?.last_sync_at ?? null,
+        sourceUpdatedAt: null,
+        coveredDays: 0,
+        orders: 0,
+        sales: 0,
+        refunds: 0,
+      });
+    }
+
+    for (const row of salesResult.results) {
+      const orders = integerValue(row.orders);
+      const sales = numberValue(row.sales);
+      const refunds = numberValue(row.refunds);
+      totalOrders += orders;
+      totalSales += sales;
+      totalRefunds += refunds;
+
+      let day = daily.get(row.date);
+      if (!day) {
+        day = { date: row.date, orders: 0, sales: 0, refunds: 0, stores: [] };
+        daily.set(row.date, day);
+      }
+      const storeDay = {
+        storeId: row.store_id,
+        storeName: row.store_name,
+        currency: row.currency,
+        orders,
+        sales: moneyValue(sales),
+        refunds: moneyValue(refunds),
+        sourceUpdatedAt: row.source_updated_at,
+      };
+      day.orders += orders;
+      day.sales += sales;
+      day.refunds += refunds;
+      day.stores.push(storeDay);
+
+      const storeTotal = stores.get(row.store_id);
+      if (!storeTotal) continue;
+      storeTotal.storeName = row.store_name;
+      storeTotal.currency = storeTotal.currency === row.currency ? row.currency : "MIXED";
+      storeTotal.sourceUpdatedAt = !storeTotal.sourceUpdatedAt || (row.source_updated_at ?? "") > storeTotal.sourceUpdatedAt
+        ? row.source_updated_at
+        : storeTotal.sourceUpdatedAt;
+      storeTotal.coveredDays += 1;
+      storeTotal.orders += orders;
+      storeTotal.sales += sales;
+      storeTotal.refunds += refunds;
+    }
+
+    const dailyRows = Array.from(daily.values()).map((day) => ({
+      date: day.date,
+      orders: day.orders,
+      sales: moneyValue(day.sales),
+      refunds: moneyValue(day.refunds),
+      stores: day.stores.sort((left, right) => storeOrder(left.storeId) - storeOrder(right.storeId)),
+    }));
+    const storeRows = Array.from(stores.values())
+      .sort((left, right) => storeOrder(left.storeId) - storeOrder(right.storeId))
+      .map((row) => ({
+        storeId: row.storeId,
+        storeName: row.storeName,
+        currency: row.currency,
+        status: row.status,
+        lastSyncAt: row.lastSyncAt,
+        sourceUpdatedAt: row.sourceUpdatedAt,
+        coveredDays: row.coveredDays,
+        complete: row.coveredDays === requestedDays && isHealthyStore(row.status),
+        orders: row.orders,
+        sales: moneyValue(row.sales),
+        refunds: moneyValue(row.refunds),
+      }));
+    const coveredDays = dailyRows.length;
+    const coveredStoreDays = storeRows.reduce((sum, row) => sum + row.coveredDays, 0);
+    const expectedStoreDays = requestedDays * selectedStoreIds.length;
+    const completeStoreCount = storeRows.filter((row) => row.complete).length;
+    const empty = coveredStoreDays === 0;
+    const complete = expectedStoreDays > 0
+      && coveredStoreDays === expectedStoreDays
+      && completeStoreCount === selectedStoreIds.length;
+    const partial = !empty && !complete;
+    const currencies = new Set(storeRows.map((row) => row.currency));
+    const currentFinanceRows = financeResult.results.filter((row) => row.date >= from && row.date <= to);
+    const previousFinanceRows = financeResult.results.filter(
+      (row) => row.date >= comparisonFrom && row.date <= comparisonTo,
+    );
+    const finance = aggregateFinance(
+      currentFinanceRows,
+      selectedStoreIds,
+      snapshots,
+      financeStates,
+      requestedDays,
+    );
+    const previousFinance = aggregateFinance(
+      previousFinanceRows,
+      selectedStoreIds,
+      snapshots,
+      financeStates,
+      requestedDays,
+    );
+    const comparisonComplete = finance.coverage.complete
+      && previousFinance.coverage.complete
+      && finance.currency !== null
+      && finance.currency !== "MIXED"
+      && finance.currency === previousFinance.currency
+      && finance.metricVersion !== null
+      && finance.metricVersion !== "MIXED"
+      && finance.metricVersion === previousFinance.metricVersion
+      && finance.totals !== null
+      && previousFinance.totals !== null;
+
+    return json({
+      from,
+      to,
+      store,
+      currency: currencyValue(currencies),
+      dataRange: {
+        minDate: rangeResult?.min_date ?? null,
+        maxDate: rangeResult?.max_date ?? null,
+      },
+      coverage: {
+        requestedDays,
+        coveredDays,
+        expectedStoreDays,
+        coveredStoreDays,
+        complete,
+        partial,
+        empty,
+        status: complete ? "complete" : empty ? "empty" : "partial",
+        completeStoreCount,
+        totalStoreCount: selectedStoreIds.length,
+      },
+      totals: {
+        orders: totalOrders,
+        sales: moneyValue(totalSales),
+        refunds: moneyValue(totalRefunds),
+      },
+      daily: dailyRows,
+      stores: storeRows,
+      finance: {
+        available: !finance.coverage.empty,
+        availability: finance.availability,
+        reason: finance.reason,
+        source: "shopifyql",
+        metricVersion: finance.metricVersion,
+        currency: finance.currency,
+        dataRange: {
+          minDate: financeRangeResult?.min_date ?? null,
+          maxDate: financeRangeResult?.max_date ?? null,
+        },
+        coverage: finance.coverage,
+        totals: finance.totals,
+        byCurrency: finance.byCurrency,
+        daily: finance.daily,
+        stores: finance.stores,
+        comparison: {
+          mode: "previous_period",
+          from: comparisonFrom,
+          to: comparisonTo,
+          complete: comparisonComplete,
+          currency: previousFinance.currency,
+          metricVersion: previousFinance.metricVersion,
+          coverage: previousFinance.coverage,
+          totals: previousFinance.totals,
+          byCurrency: previousFinance.byCurrency,
+          percentChange: comparisonComplete
+            ? financePercentChange(finance.totals!, previousFinance.totals!)
+            : null,
+        },
+      },
+    });
+  } catch {
+    return json({
+      error: { code: "store_sales_unavailable", message: "销售历史暂不可用" },
+    }, 503);
+  }
+}

@@ -1,0 +1,26 @@
+const MILLISECONDS_PER_MINUTE = 60 * 1000;
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Counts elapsed seconds that fall on Monday through Friday in a fixed-offset
+ * local timezone. The dashboard uses UTC+08:00 because the shared inventory
+ * files and their update schedule are maintained in Asia/Shanghai.
+ */
+export function elapsedWeekdaySeconds(startMs, endMs, utcOffsetMinutes = 0) {
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 0;
+
+  const offsetMs = utcOffsetMinutes * MILLISECONDS_PER_MINUTE;
+  let cursor = startMs + offsetMs;
+  const shiftedEnd = endMs + offsetMs;
+  let elapsedMs = 0;
+
+  while (cursor < shiftedEnd) {
+    const localDayIndex = Math.floor(cursor / MILLISECONDS_PER_DAY);
+    const nextBoundary = Math.min(shiftedEnd, (localDayIndex + 1) * MILLISECONDS_PER_DAY);
+    const weekday = new Date(localDayIndex * MILLISECONDS_PER_DAY).getUTCDay();
+    if (weekday >= 1 && weekday <= 5) elapsedMs += nextBoundary - cursor;
+    cursor = nextBoundary;
+  }
+
+  return Math.floor(elapsedMs / 1000);
+}

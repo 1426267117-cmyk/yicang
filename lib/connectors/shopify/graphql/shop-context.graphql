@@ -1,0 +1,15 @@
+query ErpShopContext {
+  shop {
+    id
+    name
+    myshopifyDomain
+    ianaTimezone
+    timezoneOffset
+    currencyCode
+  }
+  currentAppInstallation {
+    accessScopes {
+      handle
+    }
+  }
+}

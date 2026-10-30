@@ -53,7 +53,7 @@ const ORDER_SELECT = `
 
 export async function getErpPayload(db: D1Database, user: UserContext) {
   requirePermission(user, 'orders:read');
-  const [ordersResult, inventoryResult, auditResult] = await Promise.all([
+  const [ordersResult, inventoryResult, auditResult, platformOrdersResult] = await Promise.all([
     db.prepare(`${ORDER_SELECT} WHERE o.tenant_id = ? ORDER BY o.created_at DESC LIMIT 100`).bind(user.tenantId).all<OrderRow>(),
     db.prepare(`
       SELECT b.id, b.sku_id, s.code AS sku_code, s.name AS sku_name,
@@ -78,6 +78,30 @@ export async function getErpPayload(db: D1Database, user: UserContext) {
           after_json: string | null; created_at: string;
         }>()
       : Promise.resolve({ results: [] }),
+    db.prepare(`
+      SELECT po.id, po.platform, po.source_order_id, po.source_order_name,
+             po.source_created_at, po.source_updated_at, po.source_cancelled_at,
+             po.test, po.financial_status, po.fulfillment_status, po.currency,
+             po.current_total_amount, po.current_total_minor, po.refunded_amount,
+             po.refunded_minor, po.business_ownership, po.api_version,
+             ps.connector_key, ps.display_name AS store_name,
+             (SELECT COUNT(*) FROM platform_order_lines l WHERE l.order_id = po.id AND l.is_current = 1) AS line_count,
+             (SELECT COUNT(*) FROM platform_refunds r WHERE r.order_id = po.id AND r.is_current = 1) AS refund_count,
+             (SELECT COUNT(*) FROM platform_fulfillments f WHERE f.order_id = po.id AND f.is_current = 1) AS fulfillment_count
+      FROM platform_orders po
+      JOIN platform_stores ps ON ps.id = po.platform_store_id AND ps.tenant_id = po.tenant_id
+      WHERE po.tenant_id = ?
+      ORDER BY po.source_updated_at DESC
+      LIMIT 100
+    `).bind(user.tenantId).all<{
+      id: string; platform: string; source_order_id: string; source_order_name: string | null;
+      source_created_at: string; source_updated_at: string; source_cancelled_at: string | null;
+      test: number | null; financial_status: string | null; fulfillment_status: string | null;
+      currency: string | null; current_total_amount: string | null; current_total_minor: number | null;
+      refunded_amount: string | null; refunded_minor: number | null; business_ownership: string | null;
+      api_version: string; connector_key: string; store_name: string; line_count: number;
+      refund_count: number; fulfillment_count: number;
+    }>(),
   ]);
 
   const orders = ordersResult.results.map(mapOrder);
@@ -94,6 +118,30 @@ export async function getErpPayload(db: D1Database, user: UserContext) {
     version: row.version,
     updatedAt: row.updated_at,
   }));
+  const platformOrders = platformOrdersResult.results.map((row) => ({
+    id: row.id,
+    platform: row.platform,
+    storeKey: row.connector_key,
+    storeName: row.store_name,
+    sourceOrderId: row.source_order_id,
+    sourceOrderName: row.source_order_name,
+    sourceCreatedAt: row.source_created_at,
+    sourceUpdatedAt: row.source_updated_at,
+    sourceCancelledAt: row.source_cancelled_at,
+    test: row.test === null ? null : Boolean(row.test),
+    financialStatus: row.financial_status,
+    fulfillmentStatus: row.fulfillment_status,
+    currency: row.currency,
+    currentTotalAmount: row.current_total_amount,
+    currentTotalMinor: row.current_total_minor,
+    refundedAmount: row.refunded_amount,
+    refundedMinor: row.refunded_minor,
+    businessOwnership: row.business_ownership,
+    apiVersion: row.api_version,
+    lineCount: Number(row.line_count),
+    refundCount: Number(row.refund_count),
+    fulfillmentCount: Number(row.fulfillment_count),
+  }));
 
   return {
     ok: true,
@@ -105,10 +153,15 @@ export async function getErpPayload(db: D1Database, user: UserContext) {
       tenantName: user.tenantName,
     },
     orders,
+    platformOrders,
     inventory,
     audit: auditResult.results,
     summary: {
       totalOrders: orders.length,
+      totalPlatformOrders: platformOrders.length,
+      platformPending: platformOrders.filter((order) => order.financialStatus === 'PENDING').length,
+      platformCancelled: platformOrders.filter((order) => Boolean(order.sourceCancelledAt)).length,
+      platformRefunded: platformOrders.filter((order) => order.refundCount > 0).length,
       pendingReview: orders.filter((order) => order.status === 'pending_review').length,
       readyToShip: orders.filter((order) => order.status === 'reserved').length,
       shipped: orders.filter((order) => order.status === 'shipped').length,

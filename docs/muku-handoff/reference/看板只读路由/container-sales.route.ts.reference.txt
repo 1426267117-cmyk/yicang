@@ -1,0 +1,315 @@
+import { env } from "cloudflare:workers";
+import { ensureDatabase } from "../../../../db/bootstrap";
+import { requireApiAuth } from "../../../../lib/auth";
+
+type ShipmentRow = {
+  inbound_plan_order_no: string; warehouse_code: string; status: string; shipment_no: string | null;
+  actual_ship_date: string | null; estimated_arrive_at: string | null; actual_arrive_at: string | null;
+  inbound_complete_at: string | null; container_count: number | string | null; plan_qty: number | string;
+  source_updated_at: string | null; snapshot_at: string;
+};
+type ItemRow = { inbound_plan_order_no: string; sku_key: string; source_sku: string; planned_qty: number | string };
+type PriceDayRow = { sku_key: string; platform: string; report_date: string; units: number | string; sales_minor: number | string };
+type BaselineRow = { year: number | string; month: number | string; container_count: number | string; reference_sales_per_container: number | string; source_label: string; verified_at: string };
+type SalesDayRow = { report_date: string; net_sales: number | string | null; row_count: number | string; unknown_rows: number | string; platforms: number | string };
+type DailySnapshotRow = { snapshot_date: string; source_snapshot_id: string; captured_at: string; in_transit_containers: number | string };
+type ConnectorRow = { status: string; last_sync_at: string | null; message: string };
+type PricePoint = { reportDate: string; units: number; salesMinor: number };
+
+function numeric(value: unknown) { const parsed = Number(value ?? 0); return Number.isFinite(parsed) ? parsed : 0; }
+function nullableNumeric(value: unknown) { if (value === null || value === undefined || value === "") return null; const parsed = Number(value); return Number.isFinite(parsed) ? parsed : null; }
+function isCancelled(status: string) { return /取消|cancel/i.test(status) || status.trim() === "100"; }
+function isTerminal(status: string) { return isCancelled(status) || /已完成|完成|complete/i.test(status) || status.trim() === "70"; }
+function latest(values: Array<string | null>) { return values.filter((value): value is string => Boolean(value)).sort().at(-1) ?? null; }
+function datePart(value: string | null) { return value ? value.slice(0, 10) : null; }
+function addDays(date: string, days: number) { const parsed = new Date(`${date}T00:00:00.000Z`); parsed.setUTCDate(parsed.getUTCDate() + days); return parsed.toISOString().slice(0, 10); }
+function beijingToday() { return new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10); }
+function daysInMonth(month: string) { const [year, monthNumber] = month.split("-").map(Number); return new Date(Date.UTC(year, monthNumber, 0)).getUTCDate(); }
+function monthOf(date: string | null) { return date?.slice(0, 7) ?? null; }
+function confidenceFromCoverage(coverage: number) { return coverage >= 0.9 ? "high" : coverage >= 0.6 ? "medium" : "low"; }
+function knownContainerSum<T extends { containerCount: number | null }>(rows: T[]) {
+  if (rows.length === 0) return 0;
+  if (rows.some((row) => row.containerCount === null)) return null;
+  return rows.reduce((sum, row) => sum + (row.containerCount ?? 0), 0);
+}
+
+export async function GET(request: Request) {
+  const authResponse = await requireApiAuth(request);
+  if (authResponse) return authResponse;
+  try {
+    await ensureDatabase();
+    const url = new URL(request.url);
+    const today = beijingToday();
+    const requestedYear = Number(url.searchParams.get("year") || today.slice(0, 4));
+    const year = Number.isInteger(requestedYear) && requestedYear >= 2020 && requestedYear <= 2100 ? requestedYear : Number(today.slice(0, 4));
+    const from = `${year}-01-01`;
+    const to = `${year}-12-31`;
+    const priceEnd = today < to ? today : to;
+    const priceFrom = addDays(priceEnd, -179);
+    const yesterday = addDays(today, -1);
+
+    const [shipmentResult, itemResult, priceResult, baselineResult, salesResult, snapshotResult, connector] = await Promise.all([
+      env.DB.prepare(`SELECT inbound_plan_order_no, warehouse_code, status, shipment_no, actual_ship_date,
+        estimated_arrive_at, actual_arrive_at, inbound_complete_at, container_count, plan_qty,
+        source_updated_at, snapshot_at FROM container_shipments
+        WHERE (actual_ship_date BETWEEN ? AND ?)
+          OR (actual_ship_date IS NOT NULL AND actual_arrive_at IS NULL AND status NOT LIKE '%取消%')
+        ORDER BY actual_ship_date, inbound_plan_order_no`).bind(from, to).all<ShipmentRow>(),
+      env.DB.prepare(`SELECT inbound_plan_order_no, sku_key, source_sku, planned_qty
+        FROM container_shipment_items WHERE active=1`).all<ItemRow>(),
+      env.DB.prepare(`SELECT metric.sku_key, metric.platform, metric.report_date,
+        SUM(metric.units) AS units, SUM(metric.sales_minor) AS sales_minor
+        FROM channel_sku_daily_current current
+        JOIN channel_sku_daily_runs run ON run.sku_snapshot_id=current.sku_snapshot_id
+          AND run.channel_snapshot_id=current.channel_snapshot_id AND run.report_date=current.report_date
+          AND run.platform=current.platform
+        JOIN channel_sku_daily_metrics metric ON metric.sku_snapshot_id=current.sku_snapshot_id
+          AND metric.channel_snapshot_id=current.channel_snapshot_id AND metric.report_date=current.report_date
+          AND metric.platform=current.platform AND metric.store=current.store AND metric.currency=current.currency
+        JOIN channel_daily_metrics parent ON parent.report_date=current.report_date
+          AND parent.platform=current.platform AND parent.store=current.store AND parent.currency=current.currency
+          AND parent.snapshot_id=current.channel_snapshot_id
+        WHERE current.status='complete' AND run.completeness='complete'
+          AND parent.business_status='included' AND metric.currency='USD'
+          AND metric.units > 0 AND metric.report_date BETWEEN ? AND ?
+        GROUP BY metric.sku_key, metric.platform, metric.report_date`).bind(priceFrom, priceEnd).all<PriceDayRow>(),
+      env.DB.prepare(`SELECT year, month, container_count, reference_sales_per_container, source_label, verified_at
+        FROM container_monthly_baselines WHERE year=? ORDER BY month`).bind(year).all<BaselineRow>(),
+      env.DB.prepare(`SELECT metric.report_date, SUM(metric.net) AS net_sales, COUNT(*) AS row_count,
+          SUM(CASE WHEN metric.net IS NULL THEN 1 ELSE 0 END) AS unknown_rows,
+          COUNT(DISTINCT metric.platform) AS platforms
+        FROM channel_daily_metrics metric JOIN channel_report_runs run ON run.snapshot_id=metric.snapshot_id
+        WHERE run.completeness='complete' AND metric.business_status='included'
+          AND metric.currency='USD' AND metric.report_date BETWEEN ? AND ?
+        GROUP BY metric.report_date ORDER BY metric.report_date`).bind(from, priceEnd).all<SalesDayRow>(),
+      env.DB.prepare(`SELECT snapshot_date, source_snapshot_id, captured_at, in_transit_containers
+        FROM container_daily_snapshots WHERE snapshot_date IN (?, ?) ORDER BY snapshot_date`)
+        .bind(yesterday, today).all<DailySnapshotRow>(),
+      env.DB.prepare(`SELECT status, last_sync_at, message FROM connector_state WHERE source='erp' LIMIT 1`).first<ConnectorRow>(),
+    ]);
+
+    const itemsByPlan = new Map<string, ItemRow[]>();
+    for (const item of itemResult.results ?? []) {
+      if (!itemsByPlan.has(item.inbound_plan_order_no)) itemsByPlan.set(item.inbound_plan_order_no, []);
+      itemsByPlan.get(item.inbound_plan_order_no)!.push(item);
+    }
+
+    const priceDaysBySku = new Map<string, PricePoint[]>();
+    const salesPlatforms = new Set<string>();
+    for (const row of priceResult.results ?? []) {
+      const units = numeric(row.units);
+      if (units <= 0) continue;
+      salesPlatforms.add(row.platform.toLowerCase());
+      if (!priceDaysBySku.has(row.sku_key)) priceDaysBySku.set(row.sku_key, []);
+      priceDaysBySku.get(row.sku_key)!.push({ reportDate: row.report_date, units, salesMinor: numeric(row.sales_minor) });
+    }
+    const priceCutoffs = [30, 90, 180].map((days) => ({ days, from: addDays(priceEnd, -(days - 1)) }));
+    const prices = new Map<string, { unitMinor: number; lastBusinessDate: string; windowDays: number }>();
+    for (const [sku, rows] of priceDaysBySku) {
+      for (const window of priceCutoffs) {
+        const selected = rows.filter((row) => row.reportDate >= window.from && row.reportDate <= priceEnd);
+        const units = selected.reduce((sum, row) => sum + row.units, 0);
+        const salesMinor = selected.reduce((sum, row) => sum + row.salesMinor, 0);
+        if (units <= 0 || salesMinor <= 0) continue;
+        prices.set(sku, { unitMinor: salesMinor / units, lastBusinessDate: selected.map((row) => row.reportDate).sort().at(-1)!, windowDays: window.days });
+        break;
+      }
+    }
+
+    const rawShipments = (shipmentResult.results ?? []).filter((row) => !isCancelled(row.status)).map((row) => {
+      const items = itemsByPlan.get(row.inbound_plan_order_no) ?? [];
+      let totalQty = 0; let pricedQty = 0; let knownSalesMinor = 0;
+      const skuKeys = new Set<string>(); const matchedSkuKeys = new Set<string>();
+      for (const item of items) {
+        const quantity = numeric(item.planned_qty); totalQty += quantity; skuKeys.add(item.sku_key);
+        const price = prices.get(item.sku_key); if (!price) continue;
+        matchedSkuKeys.add(item.sku_key); pricedQty += quantity; knownSalesMinor += quantity * price.unitMinor;
+      }
+      const shipmentNo = row.shipment_no?.trim() || null;
+      return {
+        businessKey: (shipmentNo || row.inbound_plan_order_no).trim().toLowerCase(),
+        orderNo: row.inbound_plan_order_no, warehouseCode: row.warehouse_code, status: row.status, shipmentNo,
+        actualShipDate: datePart(row.actual_ship_date), estimatedArriveAt: row.estimated_arrive_at,
+        actualArriveAt: row.actual_arrive_at, inboundCompleteAt: row.inbound_complete_at,
+        containerCount: nullableNumeric(row.container_count), planQty: numeric(row.plan_qty),
+        skuCount: skuKeys.size, matchedSkuCount: matchedSkuKeys.size, pricedQty, totalQty,
+        priceCoverage: totalQty > 0 ? pricedQty / totalQty : null,
+        matchedValue: pricedQty > 0 ? Math.round(knownSalesMinor) / 100 : null,
+        inTransit: Boolean(row.actual_ship_date) && !isTerminal(row.status),
+        sourceUpdatedAt: row.source_updated_at, snapshotAt: row.snapshot_at,
+      };
+    });
+    const shipmentByBusinessKey = new Map<string, typeof rawShipments[number]>();
+    for (const shipment of rawShipments) {
+      const prior = shipmentByBusinessKey.get(shipment.businessKey);
+      if (!prior || String(shipment.sourceUpdatedAt ?? shipment.snapshotAt) > String(prior.sourceUpdatedAt ?? prior.snapshotAt)) shipmentByBusinessKey.set(shipment.businessKey, shipment);
+    }
+    const shipments = [...shipmentByBusinessKey.values()];
+    const activeTransit = shipments.filter((row) => row.inTransit);
+    const currentMonth = today.slice(0, 7);
+    const currentMonthShipments = shipments.filter((row) => monthOf(row.actualShipDate) === currentMonth);
+
+    const baselineByMonth = new Map<number, BaselineRow>();
+    for (const row of baselineResult.results ?? []) baselineByMonth.set(numeric(row.month), row);
+    const referenceRows = baselineResult.results ?? [];
+    const referenceContainers = referenceRows.reduce((sum, row) => sum + numeric(row.container_count), 0);
+    const referencePerContainer = referenceContainers > 0
+      ? referenceRows.reduce((sum, row) => sum + numeric(row.container_count) * numeric(row.reference_sales_per_container), 0) / referenceContainers
+      : 105_300;
+
+    const validSalesDays = (salesResult.results ?? []).filter((row) => numeric(row.unknown_rows) === 0 && numeric(row.platforms) >= 3 && numeric(row.row_count) >= 9);
+    const salesByMonth = new Map<string, SalesDayRow[]>();
+    for (const row of validSalesDays) {
+      const month = row.report_date.slice(0, 7); if (!salesByMonth.has(month)) salesByMonth.set(month, []);
+      salesByMonth.get(month)!.push(row);
+    }
+    const currentSalesDays = salesByMonth.get(currentMonth) ?? [];
+    const currentSales = currentSalesDays.reduce((sum, row) => sum + numeric(row.net_sales), 0);
+    const currentSalesLatestDate = currentSalesDays.map((row) => row.report_date).sort().at(-1) ?? null;
+    const currentSalesElapsedDays = currentSalesLatestDate ? Number(currentSalesLatestDate.slice(8, 10)) : 0;
+    const currentMonthDays = daysInMonth(currentMonth);
+    const currentSalesCoverage = currentSalesElapsedDays > 0 ? currentSalesDays.length / currentSalesElapsedDays : 0;
+    const projectedCurrentSales = currentSalesDays.length > 0 ? currentSales / currentSalesDays.length * currentMonthDays : null;
+    const projectedCurrentContainers = projectedCurrentSales === null ? null : Math.ceil(projectedCurrentSales / referencePerContainer);
+
+    const rawMonthlyMap = new Map<string, { containerCount: number; knownCount: boolean; shipments: number }>();
+    for (const shipment of shipments) {
+      const month = monthOf(shipment.actualShipDate); if (!month || !month.startsWith(String(year))) continue;
+      const value = rawMonthlyMap.get(month) ?? { containerCount: 0, knownCount: true, shipments: 0 };
+      value.shipments += 1; if (shipment.containerCount === null) value.knownCount = false; else value.containerCount += shipment.containerCount;
+      rawMonthlyMap.set(month, value);
+    }
+    const sourceHealthy = connector?.status === "healthy";
+    const monthly = Array.from({ length: 12 }, (_, index) => {
+      const month = `${year}-${String(index + 1).padStart(2, "0")}`;
+      const baseline = baselineByMonth.get(index + 1); const raw = rawMonthlyMap.get(month); const isFuture = month > currentMonth;
+      const actualContainerCount = baseline ? numeric(baseline.container_count)
+        : isFuture ? null : raw ? (raw.knownCount ? raw.containerCount : null) : sourceHealthy ? 0 : null;
+      const monthSalesRows = salesByMonth.get(month) ?? [];
+      const actualSales = monthSalesRows.reduce((sum, row) => sum + numeric(row.net_sales), 0);
+      let referenceSales: number | null = monthSalesRows.length > 0 ? actualSales : null;
+      if (month === currentMonth && projectedCurrentSales !== null) referenceSales = projectedCurrentSales;
+      return {
+        month, actualContainerCount,
+        actualSource: baseline ? "audited_monthly_report" : isFuture ? "not_available" : "yqn_openapi",
+        rawYqnContainerCount: raw?.knownCount ? raw.containerCount : null, shipmentCount: raw?.shipments ?? 0,
+        referenceDemandContainers: referenceSales === null ? null : Math.ceil(referenceSales / referencePerContainer),
+        referenceSales, salesCoverageDays: monthSalesRows.length,
+        salesLatestDate: monthSalesRows.map((row) => row.report_date).sort().at(-1) ?? null,
+        baselineSource: baseline?.source_label ?? null, baselineVerifiedAt: baseline?.verified_at ?? null,
+      };
+    });
+
+    const auditedMonths = referenceRows.filter((row) => numeric(row.container_count) > 0);
+    const historicalContainers = auditedMonths.reduce((sum, row) => sum + numeric(row.container_count), 0);
+    const dailySnapshots = snapshotResult.results ?? [];
+    const todaySnapshot = dailySnapshots.find((row) => row.snapshot_date === today) ?? null;
+    const yesterdaySnapshot = dailySnapshots.find((row) => row.snapshot_date === yesterday) ?? null;
+    const containerFactsAvailable = sourceHealthy || shipments.length > 0 || Boolean(todaySnapshot);
+    const currentMonthSent = containerFactsAvailable ? knownContainerSum(currentMonthShipments) : null;
+    const inTransitContainers = containerFactsAvailable ? knownContainerSum(activeTransit) : null;
+    const recentStart = addDays(today, -29);
+    const recentDays = validSalesDays.filter((row) => row.report_date >= recentStart && row.report_date <= today);
+    const recentSales = recentDays.reduce((sum, row) => sum + numeric(row.net_sales), 0);
+    const recentCoverage = recentDays.length / 30;
+    const dailySalesVelocity = recentDays.length > 0 ? recentSales / recentDays.length : null;
+    const nextMonthDate = addDays(`${currentMonth}-${String(currentMonthDays).padStart(2, "0")}`, 1);
+    const nextMonthSuggested = dailySalesVelocity === null ? null : Math.ceil(dailySalesVelocity * daysInMonth(nextMonthDate.slice(0, 7)) / referencePerContainer);
+    const demandHorizons = [30, 60, 90].map((days) => ({ days,
+      projectedSales: dailySalesVelocity === null ? null : dailySalesVelocity * days,
+      requiredContainers: dailySalesVelocity === null ? null : Math.ceil(dailySalesVelocity * days / referencePerContainer),
+      salesCoverage: recentCoverage, confidence: confidenceFromCoverage(recentCoverage) }));
+
+    const todayShipped = shipments.filter((row) => row.actualShipDate === today);
+    const todayArrived = shipments.filter((row) => datePart(row.actualArriveAt) === today);
+    const todayCompleted = shipments.filter((row) => datePart(row.inboundCompleteAt) === today);
+    const next7 = addDays(today, 7); const next14 = addDays(today, 14);
+    const expected7 = activeTransit.filter((row) => { const date = datePart(row.estimatedArriveAt); return Boolean(date && date >= today && date <= next7); });
+    const expected14 = activeTransit.filter((row) => { const date = datePart(row.estimatedArriveAt); return Boolean(date && date >= today && date <= next14); });
+    const overdue = activeTransit.filter((row) => { const date = datePart(row.estimatedArriveAt); return Boolean(date && date < today && !row.inboundCompleteAt); });
+    const inTransitChange = inTransitContainers !== null && yesterdaySnapshot ? inTransitContainers - numeric(yesterdaySnapshot.in_transit_containers) : null;
+
+    const completedShipments = shipments.filter((row) => isTerminal(row.status));
+    const leadTimeKnown = completedShipments.filter((row) => row.actualShipDate && row.inboundCompleteAt).length;
+    const totalItemQty = shipments.reduce((sum, row) => sum + row.totalQty, 0);
+    const pricedQty = shipments.reduce((sum, row) => sum + row.pricedQty, 0);
+    const uniqueItemSkus = new Set((itemResult.results ?? []).map((row) => row.sku_key));
+    const matchedItemSkus = new Set((itemResult.results ?? []).filter((row) => prices.has(row.sku_key)).map((row) => row.sku_key));
+    const matchedValue = shipments.reduce((sum, row) => sum + (row.matchedValue ?? 0), 0);
+    const priceCoverage = totalItemQty > 0 ? pricedQty / totalItemQty : null;
+    const forecastCoverage = {
+      dailySkuSales: salesPlatforms.size / 3, packingCapacity: 0,
+      warehouseLeadTime: completedShipments.length > 0 ? leadTimeKnown / completedShipments.length : 0,
+      safetyStock: 0, seasonalityPromotionNewProduct: 0,
+    };
+    const targets = [1_000_000, 1_300_000, 1_500_000, 1_800_000].map((targetSales) => ({
+      targetSales, requiredContainers: Math.ceil(targetSales / referencePerContainer),
+      projectedSales: Math.ceil(targetSales / referencePerContainer) * referencePerContainer, basis: "reference_forecast",
+    }));
+
+    return Response.json({
+      ok: true, year, today,
+      source: {
+        containers: "已核验装柜月报（1—9 月）+ 运去哪 OpenAPI（当前月、在途与发货明细）",
+        prices: "看板现有全渠道 SKU 日销售事实 · 最近 30 天优先，缺失时扩展至 90/180 天",
+        sales: "全渠道完整 T+1 日报 · included 店铺 · USD 净销售额",
+        priceWindowStart: priceFrom, priceWindowEnd: priceEnd, snapshotTimezone: "Asia/Shanghai",
+      },
+      health: { status: connector?.status ?? "unknown", message: connector?.message ?? "未获取运去哪连接状态", usingLastValidData: !sourceHealthy },
+      freshness: {
+        containerUpdatedAt: latest(shipments.map((row) => row.snapshotAt)),
+        containerSourceUpdatedAt: latest(shipments.map((row) => row.sourceUpdatedAt)),
+        connectorLastSyncAt: connector?.last_sync_at ?? null,
+        priceBusinessDate: latest([...prices.values()].map((row) => row.lastBusinessDate)),
+        priceReferenceDate: latest(auditedMonths.map((row) => row.verified_at)),
+        salesBusinessDate: validSalesDays.map((row) => row.report_date).sort().at(-1) ?? null,
+      },
+      deduplication: {
+        rawShipmentRows: rawShipments.length, uniqueBusinessRows: shipments.length,
+        duplicatesRemoved: rawShipments.length - shipments.length,
+        businessKey: "运单号优先；缺失时使用入库计划单号",
+        overlapPolicy: "历史装柜趋势与当前在途是不同状态维度，不相加；计划计算仅按唯一业务编号计一次",
+      },
+      daily: {
+        newContainers: containerFactsAvailable ? knownContainerSum(todayShipped) : null,
+        shippedItemQty: containerFactsAvailable ? todayShipped.reduce((sum, row) => sum + row.totalQty, 0) : null,
+        arrivedContainers: containerFactsAvailable ? knownContainerSum(todayArrived) : null,
+        completedContainers: containerFactsAvailable ? knownContainerSum(todayCompleted) : null,
+        inTransitContainers, inTransitChange,
+        expected7Days: containerFactsAvailable ? knownContainerSum(expected7) : null,
+        expected14Days: containerFactsAvailable ? knownContainerSum(expected14) : null,
+        overdueContainers: containerFactsAvailable ? knownContainerSum(overdue) : null,
+        snapshotStarted: Boolean(todaySnapshot), snapshotDate: todaySnapshot?.snapshot_date ?? null,
+        previousSnapshotDate: yesterdaySnapshot?.snapshot_date ?? null,
+      },
+      planning: {
+        projectedCurrentMonthSales: projectedCurrentSales, projectedCurrentMonthContainers: projectedCurrentContainers,
+        currentMonthSentContainers: currentMonthSent, currentInTransitContainers: inTransitContainers,
+        remainingToProjectedDemand: projectedCurrentContainers === null || currentMonthSent === null ? null : Math.max(0, projectedCurrentContainers - currentMonthSent),
+        paceForecastMonthEnd: currentMonthSent === null ? null : Math.ceil(currentMonthSent / Math.max(1, Number(today.slice(8, 10))) * currentMonthDays),
+        nextMonthSuggestedContainers: nextMonthSuggested, salesCoverageDays: currentSalesDays.length,
+        salesElapsedDays: currentSalesElapsedDays, salesCoverage: currentSalesCoverage,
+        confidence: confidenceFromCoverage(currentSalesCoverage), referenceSalesPerContainer: referencePerContainer,
+        basis: "参考预测：完整业务日净销售额日均 × 预测天数，再 ÷ 10.53 万美元/柜，柜数向上取整",
+      },
+      horizons: demandHorizons,
+      coverage: {
+        shipmentOrders: shipments.length, containerCountKnown: shipments.filter((row) => row.containerCount !== null).length,
+        skuRows: (itemResult.results ?? []).length, uniqueSkus: uniqueItemSkus.size, matchedSkus: matchedItemSkus.size,
+        matchedItemQty: pricedQty, totalItemQty, priceCoverage, matchedValue: pricedQty > 0 ? matchedValue : null,
+        unmatchedItemQty: Math.max(0, totalItemQty - pricedQty), auditedMonths: auditedMonths.length, historicalContainers,
+      },
+      skuForecast: {
+        status: "insufficient_data", confidence: "low", recommendationQty: null, recommendationContainers: null,
+        formula: "未来预测销量 − 当前可用库存 − 已确认在途数量 + 安全库存，再按 SKU 单柜装载量或体积换算",
+        coverage: forecastCoverage,
+        missing: ["Amazon、Shopify、Wayfair 完整 SKU 逐日销量", "每个 SKU 的单柜装载数量或体积", "各仓库运输周期配置", "SKU 安全库存天数", "季节性、促销和新品影响参数"],
+      },
+      monthly, targets,
+      shipments: shipments.slice().sort((left, right) => String(right.actualShipDate ?? right.estimatedArriveAt ?? "").localeCompare(String(left.actualShipDate ?? left.estimatedArriveAt ?? ""))),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "container sales unavailable";
+    return Response.json({ ok: false, error: message.slice(0, 500) }, { status: 500 });
+  }
+}

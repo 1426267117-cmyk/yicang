@@ -1,0 +1,167 @@
+﻿{
+  "checkedAt": "2026-10-30T09:26:42.990226+00:00",
+  "sourceReferences": [
+    {
+      "path": "reference/Shopify/shopify_yesterday_sales.py.reference.txt",
+      "sourceVersion": "collector-runtime-20261029-muku-live-v2",
+      "sourceFile": "shopify_yesterday_sales.py",
+      "sha256": "be69d471eabfbb4db09da391ccadd23b09e5bf1cb4da9f50072025ba9232d0d5",
+      "bytes": 32428,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/Wayfair/summarize_wayfair_sales.py.reference.txt",
+      "sourceVersion": "protected-daily-v14",
+      "sourceFile": "summarize_wayfair_sales.py",
+      "sha256": "be3d47d13d59309f67b6d2ca2b94454f63720d61951610ca5198d099ee695368",
+      "bytes": 9025,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/Wayfair/summarize_wayfair_refunds.py.reference.txt",
+      "sourceVersion": "protected-daily-v14",
+      "sourceFile": "summarize_wayfair_refunds.py",
+      "sha256": "e327ab64eedb5b0f69a14546af02d30fde3b15a6f7b5ef43af658c0502226225",
+      "bytes": 8400,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/广告/summarize_ad_spend.py.reference.txt",
+      "sourceVersion": "protected-daily-v14",
+      "sourceFile": "summarize_ad_spend.py",
+      "sha256": "373ba26ba1420c14fe639768c192cdacc7082b14534b64013b6594dc92ffc5f5",
+      "bytes": 18030,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/广告/build_amazon_browser_metrics.py.reference.txt",
+      "sourceVersion": "protected-daily-v14",
+      "sourceFile": "build_amazon_browser_metrics.py",
+      "sha256": "40d71329baa27fc5a122813b2929b687c2cfaa200b8f99771affb682a94fe56e",
+      "bytes": 14235,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/YQN/yqn-openapi.ts.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "yqn-openapi.ts",
+      "sha256": "cec9ea6a481e2d8cf984c2715dcc175e444bf0d51f0bcc293fb12ae08c23ebc4",
+      "bytes": 10743,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/YQN/yqn-snapshot.ts.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "yqn-snapshot.ts",
+      "sha256": "afb6e0b30a5768108c9de0853563cf3601a6555578a750819d2f79b4d40a35de",
+      "bytes": 14864,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/公共规则/channel-sku-sales.ts.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "channel-sku-sales.ts",
+      "sha256": "99398f47fdaabfa6e4691e85bb5ea92327fbaa52b325cedb66a495e6911bd101",
+      "bytes": 16591,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/公共规则/channel-business-rules.ts.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "channel-business-rules.ts",
+      "sha256": "f073808eea1329b21e7b725d5774f0f11e17eac6867bc49d5bcf3865efdf3f47",
+      "bytes": 533,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/公共规则/channel-report-date.mjs.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "channel-report-date.mjs",
+      "sha256": "c5fa8861e6d325cabca3a13ae487e4007795cb5f8d2e6061f44fb865cf7c329d",
+      "bytes": 1774,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/公共规则/business-time.mjs.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "business-time.mjs",
+      "sha256": "ab1f9e0de803f05213845223d1d71a7d40aac2ef54bc849fc2827c27918492b2",
+      "bytes": 1099,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/公共规则/package-volume.mjs.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "package-volume.mjs",
+      "sha256": "98384456db0e848a14e68ae82214bcb2e3558aef5659bb186e27d68eabaafea1",
+      "bytes": 1856,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/看板只读路由/channel-daily.route.ts.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "route.ts",
+      "sha256": "022b6843ea23d0431a3b7ada304db8ed76e407dfcd069dcdc9f62222fa57e891",
+      "bytes": 37519,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/看板只读路由/store-sales.route.ts.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "route.ts",
+      "sha256": "352866cf5c5c5e2944ffa614e43bcdd94ee38146debc10251bd4a6e7b16fcb23",
+      "bytes": 25121,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/看板只读路由/inventory-search.route.ts.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "route.ts",
+      "sha256": "7f074b39626919f5b3f29e4831f55b8b1ee1da0f1f07285f930227104c512b43",
+      "bytes": 16064,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/看板只读路由/inventory-warehouse.route.ts.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "route.ts",
+      "sha256": "7edc9fe3880c1baad22e3651e0b9b5a57be559fc1df50e7403b55e2685a25c38",
+      "bytes": 5267,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/看板只读路由/sku-sales.route.ts.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "route.ts",
+      "sha256": "83974a373fc36d34b1a97ba7ab2e1b490db2d1b167030842ea19ec64900828dd",
+      "bytes": 3048,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    },
+    {
+      "path": "reference/看板只读路由/container-sales.route.ts.reference.txt",
+      "sourceVersion": "Site-v19",
+      "sourceFile": "route.ts",
+      "sha256": "114f3820e4f52882024ff188a0cda523601a701792bc5b1be2a0e9a567b716d2",
+      "bytes": 24383,
+      "mode": "reference_only",
+      "modifiedFromSource": false
+    }
+  ]
+}

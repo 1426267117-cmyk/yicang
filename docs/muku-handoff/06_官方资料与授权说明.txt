@@ -1,0 +1,25 @@
+﻿资料核对日期：2026-10-30。以下明确区分平台官方能力与本机接入状态。
+
+Shopify：官方 Admin GraphQL order 可以读取订单、订单行、财务与履约信息；默认历史访问为最近60天，更早记录要申请相应历史订单访问。大批量历史读取可评估 Bulk Operations。ERP 的实际应用权限和受保护客户数据权限需要单独核验。
+https://shopify.dev/docs/api/admin-graphql/2026-07/queries/order
+https://shopify.dev/docs/apps/build/orders-fulfillment/order-management-apps/build-fulfillment-solutions
+本包当前正式采集器辅助代码固定版本2026-07；这是原项目配置，不是新ERP必须永久沿用的版本。新ERP实施时固定其经核验且受支持的版本。包内没有生成待执行的 GraphQL 操作。
+
+Amazon：官方 SP-API Orders 支持订单同步。官方当前文档说明 Orders v0 已弃用，当前版本为 v2026-01-01；ERP 应先核对角色、应用与卖家授权，再使用该版本的实际模型。不得照搬旧 v0 的字段、RDT 做法或限流参数。
+https://developer-docs.amazon.com/sp-api/docs/orders-api
+https://developer-docs.amazon.com/sp-api/docs/onboarding-overview
+https://developer-docs.amazon.com/sp-api/lang-zh/docs/orders-api-migration-guide
+本包没有 Amazon LWA refresh token、正式 Orders API 客户端授权或 Seller ID 证明。看板目前的原生报表/紫鸟回退不等于 ERP 已取得 SP-API 授权。
+
+Wayfair：官方明确提供订单及库存 API，也提供 EDI 交换方案。正式生产订单接入应从供应商 Developer Portal 核验应用、供应商身份和权限。本次没有验证本公司的正式订单API凭证，不能宣称开箱即用。
+https://sell.wayfair.com/operate-manage-orders
+https://developer.wayfair.io/posts/introduction/docs
+https://partners.wayfair.com/developer/applications
+包内 Wayfair 代码是 PO/Settled/WSP 报表解析参考，不是已实现的正式供应商订单 API 连接器。
+
+运去哪：原项目使用/参考的客户对接文档入口：
+https://open-hwc.yqn.com/apiDocs
+https://s.apifox.cn/01ab0c63-8c21-4114-b763-368c9ee91f6b
+这两个文档页本次未能通过文档读取工具直接访问，因此包内路径以原项目实现为参考，不把字段契约、所有接口权限或IP条件说成已全部验证。实施前应在已授权环境核验当前官方契约。
+已存在客户端参考：库存 /v2/inventory/get_inventory_by_page；出库 /v1/saleOrder/findByPage；入库计划 /v1/inbound/findByPage 与 /v1/inbound/getInboundPlanInfo；轨迹 https://ship-api.yqn.com/api/v2/orderShipment/track/{trackingNo} 及旧轨迹路径。
+各接口用途、仓库可见范围及 Key/Token 权限分别确认。测试环境和测试密钥不能作为生产数据来源；包内不携带任何真实密钥。

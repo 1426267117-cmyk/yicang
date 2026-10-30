@@ -1,0 +1,144 @@
+import { env } from "cloudflare:workers";
+import { ensureDatabase } from "../../../../db/bootstrap";
+import { requireApiAuth } from "../../../../lib/auth";
+
+const MAX_WAREHOUSE_LENGTH = 80;
+const MAX_ITEMS = 250;
+const AGE_FILTERS = ["all", "age_0_30", "age_31_60", "age_61_90", "over90"] as const;
+type AgeFilter = typeof AGE_FILTERS[number];
+
+type WarehouseItemRow = {
+  sku: string;
+  available: number | string | null;
+  locked: number | string | null;
+  inbound: number | string | null;
+  age_days: number | string | null;
+  last_updated_at: string | null;
+  warehouse_name: string | null;
+  region: string | null;
+  total_available: number | string | null;
+  total_locked: number | string | null;
+  total_inbound: number | string | null;
+};
+
+function json(body: unknown, status = 200) {
+  return Response.json(body, {
+    status,
+    headers: { "Cache-Control": "no-store" },
+  });
+}
+
+function numberValue(value: unknown) {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function ageValue(value: unknown) {
+  if (value === null || value === undefined) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+export async function GET(request: Request) {
+  const authResponse = await requireApiAuth(request);
+  if (authResponse) return authResponse;
+  const url = new URL(request.url);
+  const warehouse = (url.searchParams.get("warehouse") ?? "").trim();
+  const age = (url.searchParams.get("age") ?? "all").trim() as AgeFilter;
+
+  if (!warehouse) {
+    return json({ error: { code: "warehouse_required", message: "warehouse 为必填项" } }, 400);
+  }
+  if (warehouse.length > MAX_WAREHOUSE_LENGTH) {
+    return json({
+      error: {
+        code: "invalid_warehouse",
+        message: `warehouse 最多 ${MAX_WAREHOUSE_LENGTH} 个字符`,
+      },
+    }, 400);
+  }
+  if (!AGE_FILTERS.includes(age)) {
+    return json({ error: { code: "invalid_age", message: "age 必须是 all、age_0_30、age_31_60、age_61_90 或 over90" } }, 400);
+  }
+
+  try {
+    await ensureDatabase();
+    const fileSource = await env.DB.prepare(`SELECT
+      (SELECT COUNT(*) FROM file_inventory_records WHERE active=1) AS active_count,
+      (SELECT status FROM connector_state WHERE source='files') AS status`)
+      .first<{ active_count: number | string; status: string | null }>();
+    const useFiles = numberValue(fileSource?.active_count) > 0 || fileSource?.status === "healthy";
+    const inventoryTable = useFiles ? "file_inventory_records" : "inventory_snapshots";
+    const activePredicate = useFiles ? "active=1 AND" : "";
+    const agePredicate = age === "age_0_30"
+      ? " AND age_days BETWEEN 0 AND 30"
+      : age === "age_31_60"
+        ? " AND age_days BETWEEN 31 AND 60"
+        : age === "age_61_90"
+          ? " AND age_days BETWEEN 61 AND 90"
+          : age === "over90"
+            ? " AND age_days > 90"
+            : "";
+
+    const result = await env.DB.prepare(`WITH sku_rows AS (
+      SELECT sku,
+        MAX(warehouse_name) AS warehouse_name,
+        MAX(region) AS region,
+        COALESCE(SUM(available_qty), 0) AS available,
+        COALESCE(SUM(locked_qty), 0) AS locked,
+        COALESCE(SUM(inbound_qty), 0) AS inbound,
+        MAX(CASE WHEN age_days >= 0 THEN age_days ELSE NULL END) AS age_days,
+        MAX(source_updated_at) AS last_updated_at
+      FROM ${inventoryTable}
+      WHERE ${activePredicate} warehouse_code=?${agePredicate}
+      GROUP BY sku
+      HAVING COALESCE(SUM(available_qty + locked_qty + inbound_qty), 0) > 0
+    )
+    SELECT sku, available, locked, inbound, age_days, last_updated_at,
+      MAX(warehouse_name) OVER () AS warehouse_name,
+      MAX(region) OVER () AS region,
+      COALESCE(SUM(available) OVER (), 0) AS total_available,
+      COALESCE(SUM(locked) OVER (), 0) AS total_locked,
+      COALESCE(SUM(inbound) OVER (), 0) AS total_inbound
+    FROM sku_rows
+    ORDER BY available DESC, inbound DESC, sku
+    LIMIT ?`)
+      .bind(warehouse, MAX_ITEMS + 1)
+      .all<WarehouseItemRow>();
+
+    const rows = result.results;
+    const hasMore = rows.length > MAX_ITEMS;
+    const visibleRows = rows.slice(0, MAX_ITEMS);
+    const summary = rows[0];
+    const items = visibleRows.map((row) => ({
+      sku: row.sku,
+      available: numberValue(row.available),
+      locked: numberValue(row.locked),
+      inbound: numberValue(row.inbound),
+      ageDays: ageValue(row.age_days),
+      lastUpdatedAt: row.last_updated_at,
+    }));
+
+    return json({
+      source: useFiles ? "files" : "erp",
+      ageFilter: age,
+      warehouse: {
+        code: warehouse,
+        name: summary?.warehouse_name ?? warehouse,
+        region: summary?.region ?? "未分区",
+      },
+      count: items.length,
+      hasMore,
+      totals: {
+        available: numberValue(summary?.total_available),
+        locked: numberValue(summary?.total_locked),
+        inbound: numberValue(summary?.total_inbound),
+      },
+      items,
+    });
+  } catch {
+    return json({
+      error: { code: "warehouse_inventory_unavailable", message: "仓库库存明细暂不可用" },
+    }, 503);
+  }
+}

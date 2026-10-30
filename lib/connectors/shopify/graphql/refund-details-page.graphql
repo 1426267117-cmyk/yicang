@@ -1,0 +1,36 @@
+query ErpRefundDetailsPage(
+  $id: ID!
+  $lineItemsFirst: Int!
+  $lineItemsAfter: String
+  $transactionsFirst: Int!
+  $transactionsAfter: String
+) {
+  refund(id: $id) {
+    id
+    refundLineItems(first: $lineItemsFirst, after: $lineItemsAfter) {
+      nodes {
+        id
+        quantity
+        restockType
+        subtotalSet { shopMoney { amount currencyCode } }
+        totalTaxSet { shopMoney { amount currencyCode } }
+        lineItem { id }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+    transactions(first: $transactionsFirst, after: $transactionsAfter) {
+      nodes {
+        id
+        kind
+        status
+        gateway
+        createdAt
+        processedAt
+        test
+        amountSet { shopMoney { amount currencyCode } }
+        parentTransaction { id }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}

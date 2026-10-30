@@ -1,0 +1,18 @@
+query ErpOrdersPage($first: Int!, $after: String, $query: String!) {
+  orders(
+    first: $first
+    after: $after
+    query: $query
+    sortKey: UPDATED_AT
+    reverse: false
+  ) {
+    nodes {
+      id
+      updatedAt
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}

@@ -1,0 +1,13 @@
+query ErpFulfillmentLinesPage($id: ID!, $first: Int!, $after: String) {
+  fulfillment(id: $id) {
+    id
+    fulfillmentLineItems(first: $first, after: $after) {
+      nodes {
+        id
+        quantity
+        lineItem { id }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}

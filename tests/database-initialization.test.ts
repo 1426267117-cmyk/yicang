@@ -12,4 +12,31 @@ describe('数据库初始化', () => {
       /INSERT\s+OR\s+IGNORE\s+INTO\s+(warehouses|skus|inventory_balances|orders|inventory_movements)/i,
     );
   });
+
+  it('请求处理只检查迁移状态，不在运行时建表', () => {
+    const source = readFileSync(new URL('../db/initialize.ts', import.meta.url), 'utf8');
+    expect(source).not.toContain('runtime-schema');
+    expect(source).not.toMatch(/CREATE\s+TABLE/i);
+    expect(source).toContain('DATABASE_MIGRATIONS_PENDING');
+  });
+
+  it('新增正式迁移不写入店铺、订单或模拟业务数据', () => {
+    const sql = readFileSync(
+      new URL('../drizzle/0001_premium_the_stranger.sql', import.meta.url),
+      'utf8',
+    );
+    expect(sql).not.toMatch(/INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+(platform_stores|platform_orders|platform_order_lines|platform_refunds|platform_fulfillments)/i);
+  });
+
+  it('真实平台数据在访问名单缺失时保持关闭', () => {
+    const dbSource = readFileSync(new URL('../lib/db.ts', import.meta.url), 'utf8');
+    const syncSource = readFileSync(
+      new URL('../app/api/connectors/shopify/sync/route.ts', import.meta.url),
+      'utf8',
+    );
+    expect(dbSource).toContain('ERP_ACCESS_POLICY_REQUIRED');
+    expect(dbSource).toContain('ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED');
+    expect(dbSource).toContain('ERP_SYNC_OPERATOR_EMAIL_REQUIRED');
+    expect(syncSource).toContain('requireProductionAccessPolicy(runtimeEnv, user.email)');
+  });
 });

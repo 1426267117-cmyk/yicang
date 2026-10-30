@@ -1,0 +1,77 @@
+import { env } from "cloudflare:workers";
+import { ensureDatabase } from "../../../db/bootstrap";
+import { requireApiAuth } from "../../../lib/auth";
+import { loadAmazonSkuSales, normalizeSkuKey } from "../../../lib/channel-sku-sales";
+
+const MAX_SKUS = 20;
+const MAX_SKU_LENGTH = 160;
+const MAX_DAYS = 366;
+const DAY_MS = 86_400_000;
+
+function json(body: unknown, status = 200) {
+  return Response.json(body, { status, headers: { "Cache-Control": "private, no-store" } });
+}
+
+function strictDate(value: string | null) {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value ? value : null;
+}
+
+export async function GET(request: Request) {
+  const authResponse = await requireApiAuth(request);
+  if (authResponse) return authResponse;
+
+  const url = new URL(request.url);
+  const skus: string[] = [];
+  const normalizedSkus = new Set<string>();
+  for (const raw of url.searchParams.getAll("sku")) {
+    const sku = raw.trim();
+    const key = normalizeSkuKey(sku);
+    if (sku && key && !normalizedSkus.has(key)) {
+      normalizedSkus.add(key);
+      skus.push(sku);
+    }
+  }
+  if (skus.length < 1 || skus.length > MAX_SKUS) {
+    return json({ error: { code: "invalid_sku_count", message: `sku 必须提供 1–${MAX_SKUS} 个` } }, 400);
+  }
+  const hasInvalidSku = skus.some((sku) => sku.length > MAX_SKU_LENGTH || Array.from(sku).some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  }));
+  if (hasInvalidSku) {
+    return json({ error: { code: "invalid_sku", message: `每个 sku 最多 ${MAX_SKU_LENGTH} 个字符` } }, 400);
+  }
+
+  const rawFrom = url.searchParams.get("from");
+  const rawTo = url.searchParams.get("to");
+  if ((rawFrom === null) !== (rawTo === null)) {
+    return json({ error: { code: "incomplete_date_range", message: "from 与 to 必须同时提供" } }, 400);
+  }
+  let from: string | undefined;
+  let to: string | undefined;
+  if (rawFrom !== null && rawTo !== null) {
+    from = strictDate(rawFrom) ?? undefined;
+    to = strictDate(rawTo) ?? undefined;
+    if (!from || !to || from > to) {
+      return json({ error: { code: "invalid_date_range", message: "from/to 必须是有效且有序的 YYYY-MM-DD 日期" } }, 400);
+    }
+    const days = Math.floor((Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / DAY_MS) + 1;
+    if (days > MAX_DAYS) {
+      return json({ error: { code: "date_range_too_large", message: `最多查询 ${MAX_DAYS} 天` } }, 400);
+    }
+  }
+
+  try {
+    await ensureDatabase();
+    const result = await loadAmazonSkuSales(
+      env.DB,
+      skus.map((sku) => ({ sku })),
+      from && to ? { from, to } : { days: 30 },
+    );
+    return json(result);
+  } catch {
+    return json({ error: { code: "sku_sales_unavailable", message: "SKU 销售查询暂不可用" } }, 503);
+  }
+}

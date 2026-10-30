@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Summarize way_linhe Wayfair settled deductions for the Feishu report."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+
+ENCODINGS = ("utf-8-sig", "gb18030", "latin1")
+SETTLED_STATUS = "已结算"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Summarize way_linhe Wayfair settled deductions")
+    parser.add_argument("--date", required=True, help="Report date in YYYY-MM-DD format")
+    parser.add_argument("--deduction-file", help="way_linhe deduction CSV path or AFP URI")
+    parser.add_argument(
+        "--verified-zero",
+        action="store_true",
+        help="Record a freshly queried, settled-deduction result of zero rows; no CSV is fabricated.",
+    )
+    parser.add_argument("--exclude-sku-xlsx", required=True, help="XLSX mapping file with left-column Wayfair SKUs to exclude")
+    parser.add_argument("--input", help="Optional existing Feishu input JSON to merge into")
+    parser.add_argument("--output", help="Write Wayfair refund summary or merged JSON here")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+    return parser.parse_args()
+
+
+def local_path(path_or_uri: str) -> Path:
+    if path_or_uri.startswith("afp://"):
+        parsed = urlparse(path_or_uri)
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if not parts:
+            raise ValueError(f"AFP URI has no volume/path: {path_or_uri}")
+        return Path("/Volumes").joinpath(*parts)
+    return Path(path_or_uri).expanduser()
+
+
+def money(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("$", "").replace(",", "")
+    if not text or text in {"-", "--", "nan", "NaN"}:
+        return 0.0
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    return float(text)
+
+
+def round2(value: float) -> float:
+    return round(float(value) + 0.000000001, 2)
+
+
+def normalize_us_date(value: Any) -> str:
+    text = str(value or "").strip()
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:10], fmt).date().isoformat()
+        except ValueError:
+            pass
+    return text[:10]
+
+
+def clean_sku(value: Any) -> str:
+    text = str(value or "").strip()
+    match = re.fullmatch(r'="?([^"]+)"?', text)
+    if match:
+        text = match.group(1)
+    return text.strip()
+
+
+def csv_dicts(path: Path) -> list[dict[str, str]]:
+    last_error: Exception | None = None
+    for encoding in ENCODINGS:
+        try:
+            with path.open(newline="", encoding=encoding) as file:
+                return [dict(row) for row in csv.DictReader(file)]
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    raise UnicodeDecodeError("unknown", b"", 0, 1, f"could not decode {path}: {last_error}")
+
+
+def load_left_column_exclude_skus(path: Path) -> set[str]:
+    try:
+        from openpyxl import load_workbook
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "openpyxl is required for XLSX SKU mapping. Use the Codex bundled Python from "
+            "load_workspace_dependencies or install openpyxl for this Python."
+        ) from exc
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = workbook[workbook.sheetnames[0]]
+        output = {
+            clean_sku(row[0])
+            for row in sheet.iter_rows(min_row=2, values_only=True)
+            if row and clean_sku(row[0])
+        }
+    finally:
+        workbook.close()
+    return output
+
+
+def summarize_wayfair_refunds(deduction_file: Path, exclude_xlsx: Path, report_date: str) -> dict[str, Any]:
+    excluded_skus = load_left_column_exclude_skus(exclude_xlsx)
+    matched_rows = 0
+    settled_rows = 0
+    kept_rows = 0
+    excluded_rows = 0
+    kept_amount = 0.0
+    excluded_amount = 0.0
+    status_counts: Counter[str] = Counter()
+    type_counts: Counter[str] = Counter()
+    excluded_details: list[dict[str, Any]] = []
+    kept_details: list[dict[str, Any]] = []
+
+    for row in csv_dicts(deduction_file):
+        if normalize_us_date(row.get("结算日期")) != report_date:
+            continue
+        matched_rows += 1
+        status = str(row.get("状态") or "").strip()
+        status_counts[status] += 1
+        if status != SETTLED_STATUS:
+            continue
+        settled_rows += 1
+        sku = clean_sku(row.get("有序产品编码"))
+        amount = abs(money(row.get("总计扣款金额")))
+        deduction_type = str(row.get("扣款类型") or "").strip()
+        type_counts[deduction_type] += 1
+        detail = {
+            "po_number": row.get("采购订单编号"),
+            "deduction_id": row.get("扣款编号"),
+            "sku": sku,
+            "deduction_type": deduction_type,
+            "amount": round2(amount),
+        }
+        if sku in excluded_skus or re.search(r"(?:^|-)SZ(?:-|$)", sku.upper()):
+            excluded_rows += 1
+            excluded_amount += amount
+            excluded_details.append(detail)
+        else:
+            kept_rows += 1
+            kept_amount += amount
+            kept_details.append(detail)
+
+    return {
+        "refund": round2(-kept_amount if kept_amount else 0.0),
+        "excluded_refund": round2(-excluded_amount if excluded_amount else 0.0),
+        "diagnostics": {
+            "deduction_file": deduction_file.name,
+            "exclude_sku_xlsx": str(exclude_xlsx),
+            "date_field": "结算日期",
+            "status_filter": SETTLED_STATUS,
+            "exclude_rule": "exact SKU mapping OR delimiter-bounded SZ owner code (including LH-SZ aliases); identical to sales ownership",
+            "exclude_sku_count": len(excluded_skus),
+            "matched_rows": matched_rows,
+            "settled_rows": settled_rows,
+            "kept_rows": kept_rows,
+            "excluded_rows": excluded_rows,
+            "kept_amount": round2(kept_amount),
+            "excluded_amount": round2(excluded_amount),
+            "status_counts": dict(status_counts),
+            "type_counts": dict(type_counts),
+            "kept_details": kept_details,
+            "excluded_details": excluded_details,
+        },
+    }
+
+
+def merge_summary(input_path: Path, summary: dict[str, Any]) -> dict[str, Any]:
+    data = json.loads(input_path.read_text(encoding="utf-8"))
+    wayfair = data.setdefault("wayfair", {})
+    wayfair["refund"] = summary["refund"]
+    wayfair["excluded_refund"] = summary["excluded_refund"]
+    wayfair.pop("roi", None)
+    data.setdefault("diagnostics", {})["wayfair_refunds"] = summary["diagnostics"]
+    return data
+
+
+def main() -> None:
+    args = parse_args()
+    exclude_xlsx = local_path(args.exclude_sku_xlsx)
+    if args.verified_zero == bool(args.deduction_file):
+        raise ValueError("Specify exactly one of --deduction-file or --verified-zero")
+    if args.verified_zero:
+        summary = {
+            "refund": 0.0,
+            "excluded_refund": 0.0,
+            "diagnostics": {
+                "deduction_file": None,
+                "date_field": "结算日期",
+                "status_filter": SETTLED_STATUS,
+                "verified_zero": True,
+                "verification": "Wayfair settled-deduction query returned zero rows; portal did not generate an empty CSV.",
+                "matched_rows": 0,
+                "settled_rows": 0,
+                "kept_rows": 0,
+                "excluded_rows": 0,
+                "kept_amount": 0.0,
+                "excluded_amount": 0.0,
+                "status_counts": {},
+                "type_counts": {},
+                "kept_details": [],
+                "excluded_details": [],
+            },
+        }
+    else:
+        summary = summarize_wayfair_refunds(local_path(args.deduction_file), exclude_xlsx, args.date)
+    output_data = merge_summary(Path(args.input), summary) if args.input else summary
+    text = json.dumps(output_data, ensure_ascii=False, indent=2 if args.pretty else None)
+    if args.output:
+        Path(args.output).write_text(text + "\n", encoding="utf-8")
+    print(text)
+
+
+if __name__ == "__main__":
+    main()

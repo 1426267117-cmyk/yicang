@@ -21,6 +21,8 @@ describe('库存与权限规则', () => {
 
   it('操作员不能审核订单，查看者不能写订单', () => {
     expect(ROLE_PERMISSIONS.operator).not.toContain('orders:approve');
-    expect(ROLE_PERMISSIONS.viewer).toEqual(['orders:read']);
+    expect(ROLE_PERMISSIONS.viewer).toContain('orders:read');
+    expect(ROLE_PERMISSIONS.viewer).toContain('connectors:read');
+    expect(ROLE_PERMISSIONS.viewer).not.toContain('connectors:sync');
   });
 });

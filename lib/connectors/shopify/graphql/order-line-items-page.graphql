@@ -1,0 +1,21 @@
+query ErpOrderLineItemsPage($id: ID!, $first: Int!, $after: String!) {
+  order(id: $id) {
+    id
+    lineItems(first: $first, after: $after) {
+      nodes {
+        id
+        sku
+        title
+        name
+        quantity
+        currentQuantity
+        unfulfilledQuantity
+        originalUnitPriceSet { shopMoney { amount currencyCode } }
+        originalTotalSet { shopMoney { amount currencyCode } }
+        discountedTotalSet { shopMoney { amount currencyCode } }
+        totalDiscountSet { shopMoney { amount currencyCode } }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}

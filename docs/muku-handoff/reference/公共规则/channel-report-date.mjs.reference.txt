@@ -1,0 +1,35 @@
+function validDate(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value ? value : null;
+}
+
+/**
+ * A partial report is still the latest synchronized business day. Its quality
+ * badge stays partial; it must not send the viewer back to an older month.
+ * Finance-only dates after the latest channel report are not channel reports.
+ * @param {{coverage?: {latestReportDate?: string | null, latestCompleteReportDate?: string | null}, daily?: Array<{date: string, coverage: {status?: string | null, rowCount?: unknown}}>} | null | undefined} payload
+ * @returns {string | null}
+ */
+export function latestAvailableChannelDate(payload) {
+  const complete = validDate(payload?.coverage?.latestCompleteReportDate);
+  const latest = validDate(payload?.coverage?.latestReportDate);
+  if (!latest) return complete;
+  const days = payload?.daily ?? [];
+  const available = days
+    .filter((day) => validDate(day.date) && day.date <= latest
+      && ["complete", "partial"].includes(day.coverage.status ?? "")
+      && typeof day.coverage.rowCount === "number" && day.coverage.rowCount > 0)
+    .map((day) => day.date)
+    .sort().at(-1);
+  if (available) return available;
+  // A known failed/empty day is not a usable default. Older API responses may
+  // omit daily metadata, in which case their declared latest date is retained.
+  return days.some((day) => day.date === latest) ? complete : latest;
+}
+
+/** @param {string | null | undefined} anchor */
+export function channelReportMonthRange(anchor) {
+  const date = validDate(anchor);
+  return date ? { from: `${date.slice(0, 7)}-01`, to: date } : null;
+}

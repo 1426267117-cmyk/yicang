@@ -15,4 +15,28 @@ export const orderActionSchema = z.object({
   action: z.enum(['approve', 'ship', 'cancel']),
 });
 
+export const shopifyOrderSyncSchema = z.object({
+  storeKey: z.enum(['zimasya', 'kaguyasu', 'anzhap', 'bizfurniz']),
+  mode: z.enum(['backfill', 'incremental']).default('incremental'),
+  from: z.iso.datetime({ offset: true }).optional(),
+  to: z.iso.datetime({ offset: true }).optional(),
+  maxPages: z.number().int().min(1).max(500).default(100),
+}).superRefine((value, context) => {
+  if (value.mode === 'backfill' && (!value.from || !value.to)) {
+    context.addIssue({
+      code: 'custom',
+      message: '首次历史回补必须明确提供 from 和 to',
+      path: ['from'],
+    });
+  }
+  if (value.from && value.to && new Date(value.from) > new Date(value.to)) {
+    context.addIssue({
+      code: 'custom',
+      message: 'from 不能晚于 to',
+      path: ['from'],
+    });
+  }
+});
+
 export type CreateOrderInput = z.infer<typeof createOrderSchema>;
+export type ShopifyOrderSyncInput = z.infer<typeof shopifyOrderSyncSchema>;

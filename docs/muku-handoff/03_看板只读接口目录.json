@@ -1,0 +1,80 @@
+﻿{
+  "catalogType": "现有查询接口目录，不是新建 API，也不是完整 OpenAPI/ERP 订单契约",
+  "baseUrl": "https://muku.44-224-46-201.sslip.io",
+  "checkedAt": "2026-10-30T09:26:42.990226+00:00",
+  "access": "当前看板按用户要求公开查询；不分发任何写入密钥或平台凭证。权限和网络行为仍须在 ERP 后端重新验证。",
+  "clientCompatibility": "同一时段 curl 查询为 HTTP 200，Python urllib 直连为 HTTP 403；不保证所有客户端/网络可稳定调用。不得绕过认证或风控。",
+  "use": "仅作为对账/辅助查询。订单主数据直连平台。现有接口未承诺面向 ERP 的稳定 SLA、全量分页、增量游标、Webhook 或版本兼容。",
+  "allowedMethods": [
+    "GET"
+  ],
+  "forbidden": "不得调用看板任何写入、管理、强制同步或部署接口。",
+  "endpoints": [
+    {
+      "id": "channel_daily",
+      "method": "GET",
+      "url": "https://muku.44-224-46-201.sslip.io/api/reports/channel-daily?from=2026-10-01&to=2026-10-28",
+      "grain": "店铺/业务日汇总",
+      "parameters": "from/to 或 date；platform=all/amazon/shopify/wayfair；store=看板店铺标识",
+      "responseFields": "rows,daily,reports,sourceStates,coverage",
+      "limitations": "最多 366 天；不含逐笔订单；partial 是待核验，不等于没有数据",
+      "probeHttp": 200,
+      "probeClient": "curl"
+    },
+    {
+      "id": "shopify_history",
+      "method": "GET",
+      "url": "https://muku.44-224-46-201.sslip.io/api/store-sales?from=2026-10-01&to=2026-10-28&store=all",
+      "grain": "Shopify 店铺/日财务与销量",
+      "parameters": "from,to；store=all/zimasya/kaguyasu/anzhap/bizfurniz",
+      "responseFields": "daily,stores,finance,coverage",
+      "limitations": "Shopify 金额权威为 ShopifyQL 财务；不是完整订单查询",
+      "probeHttp": 200,
+      "probeClient": "curl"
+    },
+    {
+      "id": "inventory_search",
+      "method": "GET",
+      "url": "https://muku.44-224-46-201.sslip.io/api/inventory/search?q=LBZ-2189-01&limit=20",
+      "grain": "SKU/仓库库存搜索",
+      "parameters": "q 必须非空；warehouse 可选；limit=1..50",
+      "responseFields": "results,amazonSales,count,hasMore",
+      "limitations": "空 q 返回空结果而非全部库存；搜索上限不能当作全量导出",
+      "probeHttp": 200,
+      "probeClient": "curl"
+    },
+    {
+      "id": "warehouse",
+      "method": "GET",
+      "url": "https://muku.44-224-46-201.sslip.io/api/inventory/warehouse?warehouse=BLL_NJ&age=over90",
+      "grain": "仓库/SKU、库龄筛选后汇总",
+      "parameters": "warehouse 为真实代码；age=all/age_0_30/age_31_60/age_61_90/over90",
+      "responseFields": "items,warehouse,totals,count,hasMore",
+      "limitations": "最多 250 条，须检查 hasMore；仓库代码示例 BLL_NJ，不是任填 CA",
+      "probeHttp": 200,
+      "probeClient": "curl"
+    },
+    {
+      "id": "sku_sales",
+      "method": "GET",
+      "url": "https://muku.44-224-46-201.sslip.io/api/sku-sales?sku=LBZ-2189-01&from=2026-10-01&to=2026-10-28",
+      "grain": "Amazon SKU/日销量事实",
+      "parameters": "sku 可重复 1..20 个；from/to 同时提供，最多 366 天",
+      "responseFields": "platform,coverage,items",
+      "limitations": "仅 Amazon；本次目标期间有效覆盖 0/112 店铺日，不能用来代表全渠道订单",
+      "probeHttp": 200,
+      "probeClient": "curl"
+    },
+    {
+      "id": "containers",
+      "method": "GET",
+      "url": "https://muku.44-224-46-201.sslip.io/api/insights/container-sales?year=2026",
+      "grain": "发货业务/柜数事实及参考预测",
+      "parameters": "year=统计年份",
+      "responseFields": "shipments,daily,monthly,planning,horizons,coverage,health,freshness",
+      "limitations": "107 发货业务记录不代表 107 柜；当前价格覆盖 0，预测/估值不能入账",
+      "probeHttp": 200,
+      "probeClient": "curl"
+    }
+  ]
+}

@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Merge verified Amazon native SP/SB/SD reports into browser sales metrics."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import re
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+from openpyxl import load_workbook
+
+
+STORE_DIRS = {
+    "genji": "genjikagu@gmail\uff0ecom",
+    "kagu": "kaguyasu-\u7f8e\u56fd\u516c\u53f8",
+    "senyu": "\u68ee\u8bed",
+    "zhongcheng": "\u4e2d\u8bda",
+}
+REPORT_SPECS = {
+    "sp": (("\u5546\u54c1\u63a8\u5e7f_\u5e7f\u544a\u6d3b\u52a8_\u62a5\u544a*.csv", "MUKU_SP_*.csv"), "csv"),
+    "sb": (("\u54c1\u724c\u63a8\u5e7f_\u5e7f\u544a\u6d3b\u52a8_\u62a5\u544a*.xlsx", "MUKU_SB_*.xlsx"), "xlsx"),
+    "sd": (("\u5c55\u793a\u578b\u63a8\u5e7f_\u5e7f\u544a\u6d3b\u52a8_\u62a5\u544a*.xlsx", "MUKU_SD_*.xlsx"), "xlsx"),
+}
+ZHONGCHENG_EXACT = {
+    "sp_exact_jdt_core_核心词",
+    "sp_pat_jdt_category",
+}
+
+
+class SourceError(RuntimeError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", required=True)
+    parser.add_argument("--base-metrics", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--empty-report-evidence",
+        default="",
+        help=(
+            "JSON evidence for a completed, date-matched Amazon report whose "
+            "download contains headers but no data rows"
+        ),
+    )
+    parser.add_argument(
+        "--browser-root",
+        default=str(Path(os.environ.get("APPDATA", "")) / "ziniaobrowserdatas" / "ziniao browser"),
+    )
+    return parser.parse_args()
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def money(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    text = re.sub(r"[^0-9.()\-]", "", str(value).strip())
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    return float(text or 0)
+
+
+def normalize_date(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%b %d, %Y", "%m/%d/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            pass
+    raise SourceError(f"unsupported report date: {text!r}")
+
+
+def find_column(columns: Iterable[str], exact: tuple[str, ...], contains: tuple[str, ...] = ()) -> str:
+    names = [str(column).strip() for column in columns]
+    for candidate in exact:
+        for name in names:
+            if name.casefold() == candidate.casefold():
+                return name
+    for candidate in contains:
+        for name in names:
+            if candidate.casefold() in name.casefold():
+                return name
+    raise SourceError(f"required column unavailable; expected one of {exact!r}")
+
+
+def read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def read_xlsx_rows(path: Path) -> list[dict[str, Any]]:
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = workbook[workbook.sheetnames[0]]
+        # Amazon exports can declare an incorrect A1:A1 worksheet dimension.
+        # Reset it so read-only mode scans the actual populated cells.
+        if hasattr(sheet, "reset_dimensions"):
+            sheet.reset_dimensions()
+        values = sheet.iter_rows(values_only=True)
+        headers = [str(value or "").strip() for value in next(values)]
+        return [dict(zip(headers, row)) for row in values]
+    finally:
+        workbook.close()
+
+
+def read_rows(path: Path, kind: str) -> list[dict[str, Any]]:
+    return read_csv_rows(path) if kind == "csv" else read_xlsx_rows(path)
+
+
+def report_date_matches(rows: list[dict[str, Any]], report_date: str) -> bool:
+    columns = list(rows[0])
+    start_col = find_column(columns, ("开始日期", "Start date", "Date", "日期"))
+    end_col = find_column(columns, ("结束日期", "End date", "Date", "日期"))
+    dates = set()
+    for row in rows:
+        for column in (start_col, end_col):
+            normalized = normalize_date(row.get(column))
+            if normalized:
+                dates.add(normalized)
+    return dates == {report_date}
+
+
+def filter_rows_for_report_date(
+    rows: list[dict[str, Any]], report_date: str
+) -> list[dict[str, Any]]:
+    """Return only rows whose own daily date is the requested business date.
+
+    Amazon Ads exports can be single-day summaries or multi-day reports with
+    daily time units. Multi-day summary rows are deliberately rejected because
+    their metrics cannot be safely apportioned to one day.
+    """
+    if not rows:
+        return []
+    columns = list(rows[0])
+    start_col = find_column(columns, ("开始日期", "Start date", "Date", "日期"))
+    end_col = find_column(columns, ("结束日期", "End date", "Date", "日期"))
+    matched = []
+    for row in rows:
+        start = normalize_date(row.get(start_col))
+        end = normalize_date(row.get(end_col))
+        if start == report_date and end == report_date:
+            matched.append(row)
+    return matched
+
+
+def choose_report(
+    directory: Path,
+    patterns: tuple[str, ...],
+    kind: str,
+    report_date: str,
+    verified_empty_hashes: set[str],
+) -> tuple[Path, list[dict[str, Any]]]:
+    candidates = sorted(
+        {path for pattern in patterns for path in directory.glob(pattern)},
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    errors: list[str] = []
+    for path in candidates:
+        try:
+            rows = read_rows(path, kind)
+            if rows:
+                matched_rows = filter_rows_for_report_date(rows, report_date)
+                if matched_rows:
+                    return path, matched_rows
+            if not rows and sha256(path).casefold() in verified_empty_hashes:
+                return path, rows
+            if not rows:
+                raise SourceError("header-only report lacks completed-task evidence")
+        except Exception as exc:
+            errors.append(f"{path.name}: {type(exc).__name__}: {exc}")
+    detail = "; ".join(errors[:5])
+    pattern_text = " | ".join(patterns)
+    raise SourceError(f"no {report_date} report matches {directory} / ({pattern_text}); {detail}")
+
+
+def normalize_campaign(value: Any) -> str:
+    return re.sub(r"[\s_-]+", "_", str(value or "").strip().casefold()).strip("_")
+
+
+def in_scope_zhongcheng(campaign: Any) -> bool:
+    normalized = normalize_campaign(campaign)
+    return normalized.startswith("gz") or normalized in ZHONGCHENG_EXACT
+
+
+def summarize_report(rows: list[dict[str, Any]], *, filter_zhongcheng: bool) -> tuple[float, float]:
+    if not rows:
+        return 0.0, 0.0
+    columns = list(rows[0])
+    spend_col = find_column(columns, ("花费", "Spend", "Cost"), ("花费", "支出", "成本"))
+    campaign_col = find_column(columns, ("广告活动名称", "Campaign name", "Campaign"), ("广告活动",))
+    original = sum(money(row.get(spend_col)) for row in rows)
+    included = original
+    if filter_zhongcheng:
+        included = sum(
+            money(row.get(spend_col))
+            for row in rows
+            if in_scope_zhongcheng(row.get(campaign_col))
+        )
+    return round(original, 2), round(included, 2)
+
+
+def validate_base(base: dict[str, Any], report_date: str) -> None:
+    actual_date = str(base.get("date") or base.get("report_date") or "")
+    if actual_date != report_date:
+        raise SourceError(f"base metrics date {actual_date!r} does not match {report_date}")
+    stores = base.get("stores")
+    if not isinstance(stores, dict) or set(stores) != set(STORE_DIRS):
+        raise SourceError("base metrics must contain exactly genji, kagu, senyu, and zhongcheng")
+    for key, row in stores.items():
+        if not isinstance(row, dict):
+            raise SourceError(f"base sales metrics are invalid for {key}")
+        if row.get("source_unavailable") is True:
+            continue
+        for field in ("sales", "net_sales", "refund_amount", "units"):
+            if row.get(field) is None:
+                raise SourceError(f"base sales metrics {key}.{field} is unknown")
+
+
+def load_empty_report_evidence(path_value: str, report_date: str) -> dict[tuple[str, str], str]:
+    if not path_value:
+        return {}
+    evidence_path = Path(path_value).expanduser().resolve(strict=True)
+    payload = json.loads(evidence_path.read_text(encoding="utf-8-sig"))
+    if str(payload.get("date") or payload.get("report_date") or "") != report_date:
+        raise SourceError("empty-report evidence date does not match the requested report date")
+    reports = payload.get("reports")
+    if not isinstance(reports, list):
+        raise SourceError("empty-report evidence must contain a reports list")
+    verified: dict[tuple[str, str], str] = {}
+    for item in reports:
+        if not isinstance(item, dict):
+            raise SourceError("empty-report evidence contains an invalid report item")
+        store = str(item.get("store") or "")
+        product = str(item.get("product") or "").casefold()
+        status = str(item.get("status") or "").casefold()
+        task_id = str(item.get("task_id") or "")
+        file_hash = str(item.get("file_sha256") or "").casefold()
+        if store not in STORE_DIRS or product not in REPORT_SPECS:
+            raise SourceError("empty-report evidence references an unknown store or ad product")
+        if status != "completed" or not task_id:
+            raise SourceError("empty-report evidence must identify a completed report task")
+        if not re.fullmatch(r"[0-9a-f]{64}", file_hash):
+            raise SourceError("empty-report evidence contains an invalid SHA-256")
+        key = (store, product)
+        if key in verified:
+            raise SourceError("empty-report evidence contains a duplicate store/product pair")
+        verified[key] = file_hash
+    return verified
+
+
+def main() -> None:
+    args = parse_args()
+    datetime.strptime(args.date, "%Y-%m-%d")
+    base_path = Path(args.base_metrics).expanduser().resolve(strict=True)
+    output_path = Path(args.output).expanduser().resolve()
+    browser_root = Path(args.browser_root).expanduser().resolve(strict=True)
+    base = json.loads(base_path.read_text(encoding="utf-8-sig"))
+    validate_base(base, args.date)
+    empty_report_evidence = load_empty_report_evidence(args.empty_report_evidence, args.date)
+    used_empty_evidence: set[tuple[str, str]] = set()
+
+    diagnostics: dict[str, Any] = {"status": "complete", "report_count": 0, "stores": {}}
+    for store_key, directory_name in STORE_DIRS.items():
+        directory = browser_root / directory_name
+        original_total = 0.0
+        included_total = 0.0
+        sources = []
+        for product, (patterns, kind) in REPORT_SPECS.items():
+            evidence_key = (store_key, product)
+            verified_hashes = (
+                {empty_report_evidence[evidence_key]}
+                if evidence_key in empty_report_evidence
+                else set()
+            )
+            path, rows = choose_report(directory, patterns, kind, args.date, verified_hashes)
+            if not rows:
+                used_empty_evidence.add(evidence_key)
+            original, included = summarize_report(rows, filter_zhongcheng=store_key == "zhongcheng")
+            original_total += original
+            included_total += included
+            sources.append({
+                "product": product,
+                "path": str(path),
+                "size": path.stat().st_size,
+                "lastWriteTimeUtc": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+                "sha256": sha256(path),
+                "rows": len(rows),
+                "verifiedEmpty": not rows,
+                "originalAdSpend": original,
+                "includedAdSpend": included,
+            })
+            diagnostics["report_count"] += 1
+
+        row = base["stores"][store_key]
+        row["original_ad_spend"] = round(original_total, 2)
+        row["ad_spend"] = round(included_total, 2)
+        row["excluded_ad_spend"] = round(original_total - included_total, 2)
+        if row.get("source_unavailable") is True:
+            row["roi"] = None
+        else:
+            net_for_roi = (
+                float(row["net_sales"])
+                + float(row.get("shipping_collected") or 0)
+                + float(row["refund_amount"])
+            )
+            row["roi"] = round(net_for_roi / included_total, 2) if included_total else None
+        diagnostics["stores"][store_key] = {
+            "originalAdSpend": row["original_ad_spend"],
+            "adSpend": row["ad_spend"],
+            "excludedAdSpend": row["excluded_ad_spend"],
+            "salesSourceUnavailable": row.get("source_unavailable") is True,
+            "sources": sources,
+        }
+
+    if diagnostics["report_count"] != 12:
+        raise SourceError("all four stores require SP, SB, and SD reports")
+    if set(empty_report_evidence) != used_empty_evidence:
+        raise SourceError("empty-report evidence was supplied for a report that was not empty")
+    base["date"] = args.date
+    base["source"] = "amazon_seller_central_and_advertising_browser_fallback"
+    base.setdefault("diagnostics", {})["advertising"] = diagnostics
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(base, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({
+        "ok": True,
+        "date": args.date,
+        "output": str(output_path),
+        "reportCount": diagnostics["report_count"],
+        "stores": {
+            key: {"adSpend": row["ad_spend"], "roi": row["roi"]}
+            for key, row in base["stores"].items()
+        },
+    }, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,70 @@
+﻿{
+  "checkedAt": "2026-10-30T09:26:42.990226+00:00",
+  "scope": "只读代码和少量查询核验；没有新建 API、同步 ERP 或修改看板",
+  "capabilities": [
+    {
+      "area": "Shopify",
+      "existing": "4 店 OAuth/GraphQL 读取、订单/订单行分页、日期窗口、重试、SKU 销量与 ShopifyQL 财务代码",
+      "evidence": "受保护 collector runtime-20261029-muku-live-v2；本机此前已验证四店日报读取；看板 store-sales 本次 GET 200",
+      "reuse": "请求、分页、重试、订单行展开、时区和财务对账逻辑",
+      "erp_gap": "ERP 订单持久化、Webhook/增量、取消/退款/履约生命周期、客户/地址字段权限及长期历史授权未完成；凭证不随包提供",
+      "status": "代码可复用；不是开箱即用的 ERP 连接器"
+    },
+    {
+      "area": "Amazon",
+      "existing": "四店 Seller Central/原生报表回退，SP/SB/SD 广告解析、日期筛选及金额校验",
+      "evidence": "受保护 v14 日报运行时；代码和当日修复验收记录",
+      "reuse": "报表回补、广告对账、币种/日期/归属检查；四店命名映射",
+      "erp_gap": "本包未发现并交付已验证的完整 SP-API Orders 授权或 ERP 订单连接器；需独立取得应用/卖家授权和相应角色",
+      "status": "回补/对账参考；正式订单 API 待 ERP 核验"
+    },
+    {
+      "area": "Wayfair",
+      "existing": "完整 PO CSV、Settled 扣款和 WSP 广告解析；销售/扣款统一归属规则",
+      "evidence": "受保护 v14 的 Wayfair 解析器；此前已核验 Processing、扣款导出漏行和内容日期问题",
+      "reuse": "历史回补及订单/财务对账，保留 PO 与扣款编号",
+      "erp_gap": "正式供应商订单接口应用、供应商 ID 和权限尚未在本次交接中验证；CSV 下载依赖会话",
+      "status": "解析可复用；不等于已接好实时订单 API"
+    },
+    {
+      "area": "运去哪 YQN",
+      "existing": "库存分页、出库单、入库计划列表/明细、新旧轨迹客户端及标准化",
+      "evidence": "本次看板 container-sales GET 200；health=healthy，107 条去重业务记录，106 条柜数字段已知",
+      "reuse": "读取客户端、分仓分页、业务编号、入库/运输字段标准化",
+      "erp_gap": "ERP 运行环境的生产权限、仓库编码、IP 条件要逐接口核验；当前健康不证明所有接口、所有仓库均可访问",
+      "status": "入库/发柜数据当前有实证；其他能力按接口核验"
+    },
+    {
+      "area": "库存与 SKU",
+      "existing": "SKU 搜索、仓库/库龄明细、标准化匹配与版本化快照",
+      "evidence": "本次 inventory/search 和 warehouse GET 200；有效仓库示例 BLL_NJ",
+      "reuse": "标准 SKU/原始 SKU 双轨、仓库代码、库龄筛选、快照与来源时间",
+      "erp_gap": "搜索和仓库明细都有返回上限，不提供可确认的全量分页导出；不能直接当 ERP 库存总账",
+      "status": "辅助查询可用；全量初始化需补专用导出或直连源系统"
+    },
+    {
+      "area": "看板全渠道日报",
+      "existing": "按日/平台/店铺的销售、退款、件数、广告和来源状态查询",
+      "evidence": "本次 2026-10-28 查询 GET 200，九店；partial 核验状态保留",
+      "reuse": "ERP 汇总对账及归属差异桥接；最新已同步日期规则",
+      "erp_gap": "不是逐笔订单 API，没有完整订单行、买家地址和状态流；广告时区仍需核验",
+      "status": "只读对账接口可用"
+    },
+    {
+      "area": "Amazon SKU 销售接口",
+      "existing": "/api/sku-sales，按 SKU 查 Amazon 日事实",
+      "evidence": "本次 GET 200，但 2026-10-01—28 coveredStoreDays=0/112",
+      "reuse": "仅可参考覆盖率和查询契约；当前数值不能作为完整销售事实",
+      "erp_gap": "当前有效父子快照覆盖不足；不得把没有匹配解释为零销量",
+      "status": "接口存在，当前数据覆盖不可用于全量订单/销量"
+    },
+    {
+      "area": "发柜销售预测",
+      "existing": "历史装柜基线、发货业务明细、柜数参考需求及覆盖率",
+      "evidence": "当前运去哪业务明细 107 条；价格覆盖率 0，预测销售覆盖天数 0，置信度 low",
+      "reuse": "业务编号去重、数量分层和可追溯参考算法",
+      "erp_gap": "不是订单成交金额或会计货值；SKU 价格及预测基础不完整，不能拿参考估值入账",
+      "status": "事实与预测必须分开；预测不能作为 ERP 财务事实"
+    }
+  ]
+}

@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Summarize Wayfair order-day sales without losing in-progress orders."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+
+ENCODINGS = ("utf-8-sig", "gb18030", "latin1")
+DATE_FIELD = "PO Date & Time"
+COUNTED_STATUSES = {
+    "Processing",
+    "Shipped",
+    "Ready for Pickup",
+    "Picked Up (Awaiting Carrier Scan)",
+    "In Transit (Carrier Scan Received)",
+    "Delivered",
+    "Returned",
+    "Return",
+}
+
+
+def normalize_order_status(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+COUNTED_STATUS_KEYS = {normalize_order_status(status) for status in COUNTED_STATUSES}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Summarize way_linhe Wayfair sales with excluded SKUs",
+    )
+    parser.add_argument("--date", required=True, help="Report date in YYYY-MM-DD format")
+    parser.add_argument("--sale-file", required=True, help="way_linhe sale CSV path or AFP URI")
+    parser.add_argument(
+        "--exclude-sku-xlsx",
+        required=True,
+        help="XLSX mapping file with left-column Wayfair SKUs to exclude",
+    )
+    parser.add_argument("--input", help="Optional existing Feishu input JSON to merge into")
+    parser.add_argument("--output", help="Write Wayfair summary or merged JSON here")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+    return parser.parse_args()
+
+
+def local_path(path_or_uri: str) -> Path:
+    if path_or_uri.startswith("afp://"):
+        parsed = urlparse(path_or_uri)
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if not parts:
+            raise ValueError(f"AFP URI has no volume/path: {path_or_uri}")
+        return Path("/Volumes").joinpath(*parts)
+    return Path(path_or_uri).expanduser()
+
+
+def money(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("$", "").replace(",", "")
+    if not text or text in {"-", "--", "nan", "NaN"}:
+        return 0.0
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    return float(text)
+
+
+def round2(value: float) -> float:
+    return round(float(value) + 0.000000001, 2)
+
+
+def normalize_wayfair_po_datetime(value: Any) -> str:
+    text = str(value or "").strip()
+    for fmt in (
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return ""
+
+
+def clean_sku(value: Any) -> str:
+    text = str(value or "").strip()
+    match = re.fullmatch(r'="?([^"]+)"?', text)
+    if match:
+        text = match.group(1)
+    return text.strip()
+
+
+def csv_dicts(path: Path) -> list[dict[str, str]]:
+    last_error: Exception | None = None
+    for encoding in ENCODINGS:
+        try:
+            with path.open(newline="", encoding=encoding) as file:
+                return [dict(row) for row in csv.DictReader(file)]
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    raise UnicodeDecodeError("unknown", b"", 0, 1, f"could not decode {path}: {last_error}")
+
+
+def load_left_column_exclude_skus(path: Path) -> set[str]:
+    try:
+        from openpyxl import load_workbook
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "openpyxl is required for XLSX SKU mapping. Use the Codex bundled Python from "
+            "load_workspace_dependencies or install openpyxl for this Python.",
+        ) from exc
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = workbook[workbook.sheetnames[0]]
+        output = {
+            clean_sku(row[0])
+            for row in sheet.iter_rows(min_row=2, values_only=True)
+            if row and clean_sku(row[0])
+        }
+    finally:
+        workbook.close()
+    return output
+
+
+def summarize_wayfair_sales(
+    sale_file: Path,
+    exclude_xlsx: Path,
+    report_date: str,
+) -> dict[str, Any]:
+    excluded_skus = load_left_column_exclude_skus(exclude_xlsx)
+    rows = csv_dicts(sale_file)
+    if not rows:
+        raise ValueError(f"Wayfair sales export is empty: {sale_file}")
+    if DATE_FIELD not in rows[0]:
+        available_fields = ", ".join(rows[0])
+        raise ValueError(
+            f"Wayfair sales export is missing required {DATE_FIELD!r} column; "
+            f"available columns: {available_fields}",
+        )
+
+    original_sales = 0.0
+    kept_sales = 0.0
+    excluded_sales = 0.0
+    original_qty = 0.0
+    kept_qty = 0.0
+    excluded_qty = 0.0
+    matched_rows = 0
+    kept_rows = 0
+    excluded_rows = 0
+    status_counts: Counter[str] = Counter()
+    excluded_details: list[dict[str, Any]] = []
+    invalid_po_datetimes = 0
+
+    for row in rows:
+        po_datetime = normalize_wayfair_po_datetime(row.get(DATE_FIELD, ""))
+        if not po_datetime:
+            invalid_po_datetimes += 1
+            continue
+        if po_datetime != report_date:
+            continue
+        status = " ".join(str(row.get("Order Status") or "").split())
+        status_counts[status] += 1
+        if normalize_order_status(status) not in COUNTED_STATUS_KEYS:
+            continue
+        sku = clean_sku(row.get("Item Number"))
+        qty = money(row.get("Quantity"))
+        line_sales = qty * money(row.get("Wholesale Price"))
+        matched_rows += 1
+        original_sales += line_sales
+        original_qty += qty
+        if sku in excluded_skus or re.search(r"(?:^|-)SZ(?:-|$)", sku.upper()):
+            excluded_rows += 1
+            excluded_sales += line_sales
+            excluded_qty += qty
+            excluded_details.append(
+                {
+                    "po_number": row.get("PO Number"),
+                    "sku": sku,
+                    "qty": round2(qty),
+                    "sales": round2(line_sales),
+                    "status": status,
+                },
+            )
+        else:
+            kept_rows += 1
+            kept_sales += line_sales
+            kept_qty += qty
+
+    uncounted_statuses = {
+        status: count
+        for status, count in sorted(status_counts.items())
+        if normalize_order_status(status) not in COUNTED_STATUS_KEYS
+    }
+    return {
+        "sales": round2(kept_sales),
+        "refund": 0.0,
+        "net": round2(kept_sales),
+        "units": round2(kept_qty),
+        "excluded_sales": round2(excluded_sales),
+        "excluded_qty": round2(excluded_qty),
+        "original_qty": round2(original_qty),
+        "original_sales": round2(original_sales),
+        "diagnostics": {
+            "sale_file": sale_file.name,
+            "exclude_sku_xlsx": str(exclude_xlsx),
+            "date_field": DATE_FIELD,
+            "exclude_rule": "exact SKU mapping OR delimiter-bounded SZ owner code (including LH-SZ aliases)",
+            "counted_statuses": sorted(COUNTED_STATUSES),
+            "invalid_po_datetimes": invalid_po_datetimes,
+            "status_counts": dict(status_counts),
+            "uncounted_statuses": uncounted_statuses,
+            "exclude_sku_count": len(excluded_skus),
+            "matched_rows": matched_rows,
+            "kept_rows": kept_rows,
+            "excluded_rows": excluded_rows,
+            "original_qty": round2(original_qty),
+            "kept_qty": round2(kept_qty),
+            "excluded_details": excluded_details,
+        },
+    }
+
+
+def merge_summary(input_path: Path, summary: dict[str, Any]) -> dict[str, Any]:
+    data = json.loads(input_path.read_text(encoding="utf-8"))
+    wayfair = data.setdefault("wayfair", {})
+    for key in (
+        "sales",
+        "refund",
+        "net",
+        "units",
+        "excluded_sales",
+        "excluded_qty",
+        "original_qty",
+        "original_sales",
+    ):
+        wayfair[key] = summary[key]
+    data.setdefault("diagnostics", {})["wayfair_sales"] = summary["diagnostics"]
+    return data
+
+
+def main() -> None:
+    args = parse_args()
+    sale_file = local_path(args.sale_file)
+    exclude_xlsx = local_path(args.exclude_sku_xlsx)
+    summary = summarize_wayfair_sales(sale_file, exclude_xlsx, args.date)
+    output_data = merge_summary(Path(args.input), summary) if args.input else summary
+    text = json.dumps(output_data, ensure_ascii=False, indent=2 if args.pretty else None)
+    if args.output:
+        Path(args.output).write_text(text + "\n", encoding="utf-8")
+    print(text)
+
+
+if __name__ == "__main__":
+    main()

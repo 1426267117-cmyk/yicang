@@ -1,0 +1,899 @@
+#!/usr/bin/env python3
+"""Fetch Shopify sales by local calendar date without persisting access tokens.
+
+Credentials are read from environment variables. Access tokens remain in memory,
+are never printed, and expire according to Shopify's token response.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import socket
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:  # pragma: no cover - Python 3.9+ includes zoneinfo.
+    ZoneInfo = None  # type: ignore[assignment]
+    ZoneInfoNotFoundError = Exception  # type: ignore[assignment,misc]
+
+
+API_VERSION = "2026-07"
+TIMEOUT_SECONDS = 30
+MAX_REQUEST_ATTEMPTS = 3
+RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+RETRY_BACKOFF_BASE_SECONDS = 0.75
+RETRY_BACKOFF_CAP_SECONDS = 8.0
+RETRY_AFTER_CAP_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class StoreCredentials:
+    label: str
+    domain: str
+    client_id: str
+    client_secret: str
+
+
+class ShopifyError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "unknown",
+        http_status: int | None = None,
+        attempts: int = 1,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.http_status = http_status
+        self.attempts = attempts
+
+
+def _retry_delay(attempt: int, retry_after: str | None = None) -> float:
+    """Return a bounded retry delay without exposing request details."""
+
+    if retry_after:
+        try:
+            return min(RETRY_AFTER_CAP_SECONDS, max(0.0, float(retry_after.strip())))
+        except (TypeError, ValueError):
+            pass
+    ceiling = min(RETRY_BACKOFF_CAP_SECONDS, RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
+    return random.uniform(0.0, ceiling)
+
+
+def _request_json(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+) -> dict[str, Any]:
+    request = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
+    raw = ""
+    for attempt in range(MAX_REQUEST_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+                raw = response.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRYABLE_HTTP_STATUS and attempt < MAX_REQUEST_ATTEMPTS - 1:
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                time.sleep(_retry_delay(attempt, retry_after))
+                continue
+            # Keep the final message concise. Never include request headers,
+            # request bodies, URLs, access tokens, or cookies.
+            category = "auth" if exc.code in {401, 403} else "rate_limit" if exc.code == 429 else "server" if exc.code >= 500 else "http"
+            raise ShopifyError(
+                f"HTTP {exc.code}",
+                category=category,
+                http_status=exc.code,
+                attempts=attempt + 1,
+            ) from None
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionResetError) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            category = "timeout" if isinstance(reason, (TimeoutError, socket.timeout)) else "network"
+            if attempt < MAX_REQUEST_ATTEMPTS - 1:
+                time.sleep(_retry_delay(attempt))
+                continue
+            raise ShopifyError(
+                "Shopify request failed after bounded retries",
+                category=category,
+                attempts=attempt + 1,
+            ) from None
+    else:  # pragma: no cover - the loop always returns or raises.
+        raise ShopifyError("Shopify request failed", category="network", attempts=MAX_REQUEST_ATTEMPTS)
+
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ShopifyError("Shopify returned a non-JSON response", category="invalid_response") from None
+    if not isinstance(result, dict):
+        raise ShopifyError("Shopify returned an unexpected JSON response", category="invalid_response")
+    return result
+
+
+def normalize_domain(domain: str) -> str:
+    value = domain.strip().lower()
+    value = re.sub(r"^https?://", "", value).rstrip("/")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", value):
+        raise ShopifyError(f"invalid myshopify domain: {domain}")
+    return value
+
+
+def acquire_access_token(store: StoreCredentials) -> tuple[str, set[str], int | None]:
+    endpoint = f"https://{normalize_domain(store.domain)}/admin/oauth/access_token"
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "client_credentials",
+            "client_id": store.client_id,
+            "client_secret": store.client_secret,
+        }
+    ).encode("utf-8")
+    response = _request_json(
+        endpoint,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        data=body,
+    )
+    token = response.get("access_token")
+    if not isinstance(token, str) or not token:
+        raise ShopifyError("token response did not contain an access token")
+    scopes = {part.strip() for part in str(response.get("scope", "")).split(",") if part.strip()}
+    expires_in_raw = response.get("expires_in")
+    expires_in = int(expires_in_raw) if isinstance(expires_in_raw, (int, float)) else None
+    return token, scopes, expires_in
+
+
+def graphql(domain: str, token: str, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+    endpoint = f"https://{normalize_domain(domain)}/admin/api/{API_VERSION}/graphql.json"
+    body = json.dumps({"query": query, "variables": variables or {}}, separators=(",", ":")).encode("utf-8")
+
+    for attempt in range(4):
+        response = _request_json(
+            endpoint,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-Shopify-Access-Token": token,
+            },
+            data=body,
+        )
+        errors = response.get("errors")
+        if not errors:
+            data = response.get("data")
+            if not isinstance(data, dict):
+                raise ShopifyError("GraphQL response did not contain data")
+            return data
+
+        throttled = any(
+            isinstance(error, dict) and error.get("extensions", {}).get("code") == "THROTTLED"
+            for error in errors
+        )
+        if throttled and attempt < 3:
+            time.sleep(2 ** attempt)
+            continue
+        messages = "; ".join(
+            str(error.get("message", error)) if isinstance(error, dict) else str(error)
+            for error in errors
+        )
+        raise ShopifyError(f"GraphQL error: {messages}")
+    raise ShopifyError("GraphQL request was throttled repeatedly")
+
+
+SHOP_QUERY = """
+query ShopContext {
+  shop {
+    name
+    myshopifyDomain
+    ianaTimezone
+    timezoneOffset
+    currencyCode
+  }
+}
+"""
+
+
+INSTALLED_ACCESS_SCOPES_QUERY = """
+query InstalledAccessScopes {
+  currentAppInstallation {
+    accessScopes {
+      handle
+    }
+  }
+}
+"""
+
+
+def fetch_current_access_scopes(store: StoreCredentials, token: str) -> set[str]:
+    """Return the scopes granted to the app installation for this shop.
+
+    The client-credentials token response can omit installed scopes, so callers
+    must use this Admin GraphQL result for authorization decisions.
+    """
+
+    data = graphql(store.domain, token, INSTALLED_ACCESS_SCOPES_QUERY)
+    installation = data.get("currentAppInstallation")
+    if not isinstance(installation, dict):
+        raise ShopifyError("current app installation was missing")
+    access_scopes = installation.get("accessScopes")
+    if not isinstance(access_scopes, list):
+        raise ShopifyError("installed access scopes were invalid")
+
+    result: set[str] = set()
+    for item in access_scopes:
+        if not isinstance(item, dict):
+            raise ShopifyError("installed access scope was invalid")
+        handle = item.get("handle")
+        if not isinstance(handle, str) or not handle.strip():
+            raise ShopifyError("installed access scope handle was invalid")
+        result.add(handle.strip())
+    return result
+
+
+def fetch_installed_access_scopes(store: StoreCredentials, token: str) -> set[str]:
+    """Compatibility alias for callers using the earlier helper name."""
+
+    return fetch_current_access_scopes(store, token)
+
+
+ORDERS_QUERY = """
+query OrdersByDateRange($after: String, $search: String!) {
+  orders(first: 250, after: $after, sortKey: CREATED_AT, query: $search) {
+    nodes {
+      id
+      name
+      createdAt
+      test
+      cancelledAt
+      totalPriceSet { shopMoney { amount currencyCode } }
+      currentTotalPriceSet { shopMoney { amount currencyCode } }
+      totalRefundedSet { shopMoney { amount currencyCode } }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+
+DAILY_FINANCE_QUERY = """
+query DailyFinance($query: String!) {
+  shopifyqlQuery(query: $query) {
+    tableData {
+      columns { name dataType displayName }
+      rows
+    }
+    parseErrors
+  }
+}
+"""
+
+
+DAILY_FINANCE_METRICS = (
+    "orders",
+    "gross_sales",
+    "discounts",
+    "sales_reversals",
+    "net_sales",
+    "shipping_charges",
+    "return_fees",
+    "taxes",
+    "duties",
+    "additional_fees",
+    "total_sales",
+)
+MAX_DAILY_FINANCE_DAYS = 366
+
+
+SKU_SALES_WINDOW_DAYS = 30
+SKU_ORDER_PAGE_SIZE = 10
+SKU_LINE_ITEM_PAGE_SIZE = 50
+MAX_SKU_ORDER_PAGES = 5_000
+MAX_SKU_LINE_ITEM_PAGES_PER_ORDER = 200
+
+
+# Keep this query deliberately small. A 10-order page with 50 nested line items
+# stays well below Shopify's single-query cost ceiling for ordinary orders. Any
+# larger line-item connection is completed with the separate cursor query below.
+SKU_SALES_ORDERS_QUERY = f"""
+query SkuSalesOrders($after: String, $search: String!) {{
+  orders(
+    first: {SKU_ORDER_PAGE_SIZE}
+    after: $after
+    sortKey: CREATED_AT
+    reverse: false
+    query: $search
+  ) {{
+    nodes {{
+      id
+      createdAt
+      test
+      lineItems(first: {SKU_LINE_ITEM_PAGE_SIZE}) {{
+        nodes {{
+          sku
+          currentQuantity
+        }}
+        pageInfo {{ hasNextPage endCursor }}
+      }}
+    }}
+    pageInfo {{ hasNextPage endCursor }}
+  }}
+}}
+"""
+
+
+SKU_SALES_LINE_ITEMS_QUERY = f"""
+query SkuSalesLineItems($orderId: ID!, $after: String!) {{
+  node(id: $orderId) {{
+    ... on Order {{
+      lineItems(first: {SKU_LINE_ITEM_PAGE_SIZE}, after: $after) {{
+        nodes {{
+          sku
+          currentQuantity
+        }}
+        pageInfo {{ hasNextPage endCursor }}
+      }}
+    }}
+  }}
+}}
+"""
+
+
+def _parse_offset(value: str) -> timezone:
+    # Shopify currently returns values such as "-0700"; older examples and
+    # some endpoints use the ISO-style "-07:00" form.
+    match = re.search(r"([+-])(\d{2}):?(\d{2})", value)
+    if not match:
+        raise ShopifyError(f"unsupported Shopify timezone offset: {value}")
+    sign = 1 if match.group(1) == "+" else -1
+    delta = timedelta(hours=int(match.group(2)), minutes=int(match.group(3))) * sign
+    return timezone(delta)
+
+
+def _shop_timezone(iana_name: str, offset: str):
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(iana_name)
+        except ZoneInfoNotFoundError:
+            pass
+    return _parse_offset(offset)
+
+
+def _iso_seconds(value: datetime) -> str:
+    return value.isoformat(timespec="seconds")
+
+
+def _shopifyql_literal(value: str, label: str, pattern: str) -> str:
+    text = value.strip()
+    if not re.fullmatch(pattern, text):
+        raise ShopifyError(f"shop {label} was invalid")
+    return text
+
+
+def _validated_money(value: Any, metric: str) -> Any:
+    """Validate ShopifyQL money without changing its sign or representation."""
+
+    if value is None or isinstance(value, bool):
+        raise ShopifyError(f"ShopifyQL returned an invalid {metric} value")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise ShopifyError(f"ShopifyQL returned an invalid {metric} value") from None
+    if not number.is_finite():
+        raise ShopifyError(f"ShopifyQL returned an invalid {metric} value")
+    return value
+
+
+def _validated_nonnegative_integer(value: Any, metric: str) -> int:
+    if value is None or isinstance(value, bool):
+        raise ShopifyError(f"ShopifyQL returned an invalid {metric} value")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise ShopifyError(f"ShopifyQL returned an invalid {metric} value") from None
+    if not number.is_finite() or number < 0 or number != number.to_integral_value():
+        raise ShopifyError(f"ShopifyQL returned an invalid {metric} value")
+    return int(number)
+
+
+def _parse_created_at(value: Any) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ShopifyError("order did not contain createdAt")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ShopifyError("order contained an invalid createdAt") from None
+    if parsed.tzinfo is None:
+        raise ShopifyError("order createdAt did not contain a timezone")
+    return parsed
+
+
+def _connection_parts(value: Any, label: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not isinstance(value, dict):
+        raise ShopifyError(f"{label} connection was missing")
+    nodes = value.get("nodes")
+    page_info = value.get("pageInfo")
+    if not isinstance(nodes, list) or not all(isinstance(item, dict) for item in nodes):
+        raise ShopifyError(f"{label} nodes were invalid")
+    if not isinstance(page_info, dict) or not isinstance(page_info.get("hasNextPage"), bool):
+        raise ShopifyError(f"{label} pageInfo was invalid")
+    return nodes, page_info
+
+
+def _next_cursor(page_info: dict[str, Any], seen: set[str], label: str) -> str | None:
+    if page_info["hasNextPage"] is False:
+        return None
+    cursor = page_info.get("endCursor")
+    if not isinstance(cursor, str) or not cursor or cursor in seen:
+        raise ShopifyError(f"{label} pagination cursor was invalid")
+    seen.add(cursor)
+    return cursor
+
+
+def _order_line_items(
+    store: StoreCredentials,
+    token: str,
+    order: dict[str, Any],
+) -> list[dict[str, Any]]:
+    nodes, page_info = _connection_parts(order.get("lineItems"), "lineItems")
+    items = list(nodes)
+    seen_cursors: set[str] = set()
+    cursor = _next_cursor(page_info, seen_cursors, "lineItems")
+    page_count = 1
+    while cursor is not None:
+        if page_count >= MAX_SKU_LINE_ITEM_PAGES_PER_ORDER:
+            raise ShopifyError("lineItems pagination exceeded the safety limit")
+        order_id = order.get("id")
+        if not isinstance(order_id, str) or not order_id:
+            raise ShopifyError("paginated order did not contain an id")
+        node = graphql(
+            store.domain,
+            token,
+            SKU_SALES_LINE_ITEMS_QUERY,
+            {"orderId": order_id, "after": cursor},
+        ).get("node")
+        if not isinstance(node, dict):
+            raise ShopifyError("paginated order was missing")
+        nodes, page_info = _connection_parts(node.get("lineItems"), "lineItems")
+        items.extend(nodes)
+        page_count += 1
+        cursor = _next_cursor(page_info, seen_cursors, "lineItems")
+    return items
+
+
+def fetch_sku_sales_window(
+    store: StoreCredentials,
+    token: str,
+    end_date: date | None = None,
+    *,
+    days: int = SKU_SALES_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """Aggregate current line-item quantities for one inclusive local-date window."""
+
+    if days < 1:
+        raise ShopifyError("days must be at least 1")
+    shop = graphql(store.domain, token, SHOP_QUERY)["shop"]
+    shop_tz = _shop_timezone(shop["ianaTimezone"], shop["timezoneOffset"])
+    local_today = datetime.now(shop_tz).date()
+    window_end = end_date or local_today
+    window_start = window_end - timedelta(days=days - 1)
+    start = datetime.combine(window_start, datetime.min.time(), tzinfo=shop_tz)
+    end = datetime.combine(window_end + timedelta(days=1), datetime.min.time(), tzinfo=shop_tz)
+    search = f"created_at:>='{_iso_seconds(start)}' created_at:<'{_iso_seconds(end)}'"
+
+    totals: dict[str, int] = {}
+    display_skus: dict[str, str] = {}
+    total_units = 0
+    test_order_count = 0
+    order_cursor: str | None = None
+    seen_order_cursors: set[str] = set()
+    order_page_count = 0
+    while True:
+        if order_page_count >= MAX_SKU_ORDER_PAGES:
+            raise ShopifyError("orders pagination exceeded the safety limit")
+        connection = graphql(
+            store.domain,
+            token,
+            SKU_SALES_ORDERS_QUERY,
+            {"after": order_cursor, "search": search},
+        ).get("orders")
+        orders, page_info = _connection_parts(connection, "orders")
+        order_page_count += 1
+        for order in orders:
+            order_date = _parse_created_at(order.get("createdAt")).astimezone(shop_tz).date()
+            if order_date < window_start or order_date > window_end:
+                continue
+            if order.get("test") is True:
+                test_order_count += 1
+                continue
+            for line_item in _order_line_items(store, token, order):
+                raw_sku = line_item.get("sku")
+                quantity = line_item.get("currentQuantity")
+                if isinstance(quantity, bool) or not isinstance(quantity, int):
+                    raise ShopifyError("line item currentQuantity was invalid")
+                if quantity <= 0:
+                    continue
+                total_units += quantity
+                if not isinstance(raw_sku, str):
+                    continue
+                sku = raw_sku.strip()
+                normalized_sku = sku.casefold()
+                if not sku or not normalized_sku:
+                    continue
+                display_skus.setdefault(normalized_sku, sku)
+                totals[normalized_sku] = totals.get(normalized_sku, 0) + quantity
+
+        order_cursor = _next_cursor(page_info, seen_order_cursors, "orders")
+        if order_cursor is None:
+            break
+
+    items = [
+        {"sku": display_skus[key], "units": totals[key]}
+        for key in sorted(totals)
+    ]
+    return {
+        "label": store.label,
+        "domain": shop["myshopifyDomain"],
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "timezone": shop["ianaTimezone"],
+        "test_order_count_excluded": test_order_count,
+        "total_units": total_units,
+        "items": items,
+    }
+
+
+def fetch_sales_range(
+    store: StoreCredentials,
+    token: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    *,
+    days: int = 60,
+) -> dict[str, Any]:
+    """Fetch one inclusive local-date range and aggregate it without per-day calls."""
+
+    if days < 1:
+        raise ShopifyError("days must be at least 1")
+    shop = graphql(store.domain, token, SHOP_QUERY)["shop"]
+    shop_tz = _shop_timezone(shop["ianaTimezone"], shop["timezoneOffset"])
+    local_today = datetime.now(shop_tz).date()
+    range_end = end_date or local_today
+    range_start = start_date or (range_end - timedelta(days=days - 1))
+    if range_end < range_start:
+        raise ShopifyError("end date must not be earlier than start date")
+
+    start = datetime.combine(range_start, datetime.min.time(), tzinfo=shop_tz)
+    end = datetime.combine(range_end + timedelta(days=1), datetime.min.time(), tzinfo=shop_tz)
+
+    # One range query per store is substantially cheaper than one query per day.
+    # Explicit offsets preserve each shop's local calendar boundaries.
+    search = f"created_at:>='{_iso_seconds(start)}' created_at:<'{_iso_seconds(end)}'"
+    daily: dict[date, dict[str, Any]] = {}
+    current_date = range_start
+    while current_date <= range_end:
+        daily[current_date] = {
+            "date": current_date.isoformat(),
+            "order_count": 0,
+            "cancelled_order_count": 0,
+            "current_total_sales": Decimal("0"),
+            "original_order_total": Decimal("0"),
+            "refunded_total": Decimal("0"),
+        }
+        current_date += timedelta(days=1)
+
+    after: str | None = None
+    test_order_count = 0
+    while True:
+        connection = graphql(
+            store.domain,
+            token,
+            ORDERS_QUERY,
+            {"after": after, "search": search},
+        )["orders"]
+        for order in connection["nodes"]:
+            if order.get("test"):
+                test_order_count += 1
+                continue
+            order_date = _parse_created_at(order.get("createdAt")).astimezone(shop_tz).date()
+            bucket = daily.get(order_date)
+            if bucket is None:
+                # The server-side filter should make this impossible, but keeping
+                # the range authoritative prevents an unexpected row leaking in.
+                continue
+            bucket["order_count"] += 1
+            if order.get("cancelledAt") is not None:
+                bucket["cancelled_order_count"] += 1
+            bucket["current_total_sales"] += Decimal(
+                order["currentTotalPriceSet"]["shopMoney"]["amount"]
+            )
+            bucket["original_order_total"] += Decimal(
+                order["totalPriceSet"]["shopMoney"]["amount"]
+            )
+            bucket["refunded_total"] += Decimal(
+                order["totalRefundedSet"]["shopMoney"]["amount"]
+            )
+        page_info = connection["pageInfo"]
+        if not page_info["hasNextPage"]:
+            break
+        after = page_info["endCursor"]
+
+    daily_rows = [
+        {
+            "date": item["date"],
+            "order_count": item["order_count"],
+            "cancelled_order_count": item["cancelled_order_count"],
+            "current_total_sales": f"{item['current_total_sales']:.2f}",
+            "original_order_total": f"{item['original_order_total']:.2f}",
+            "refunded_total": f"{item['refunded_total']:.2f}",
+        }
+        for item in daily.values()
+    ]
+    return {
+        "label": store.label,
+        "shop_name": shop["name"],
+        "domain": shop["myshopifyDomain"],
+        "start_date": range_start.isoformat(),
+        "end_date": range_end.isoformat(),
+        "timezone": shop["ianaTimezone"],
+        "currency": shop["currencyCode"],
+        "test_order_count_excluded": test_order_count,
+        "daily": daily_rows,
+    }
+
+
+def fetch_daily_finance_range(
+    store: StoreCredentials,
+    token: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    *,
+    days: int = MAX_DAILY_FINANCE_DAYS,
+) -> dict[str, Any]:
+    """Fetch Shopify Analytics daily sales metrics for one local-date range.
+
+    Values are returned with ShopifyQL's original signs. In particular,
+    ``sales_reversals`` is not converted to an absolute or forced-negative
+    number.
+    """
+
+    if days < 1 or days > MAX_DAILY_FINANCE_DAYS:
+        raise ShopifyError(f"days must be between 1 and {MAX_DAILY_FINANCE_DAYS}")
+    shop = graphql(store.domain, token, SHOP_QUERY).get("shop")
+    if not isinstance(shop, dict):
+        raise ShopifyError("shop context was missing")
+    timezone_name = _shopifyql_literal(
+        str(shop.get("ianaTimezone", "")),
+        "timezone",
+        r"[A-Za-z0-9_+./-]+",
+    )
+    currency = _shopifyql_literal(
+        str(shop.get("currencyCode", "")),
+        "currency",
+        r"[A-Z]{3}",
+    )
+    shop_tz = _shop_timezone(timezone_name, str(shop.get("timezoneOffset", "")))
+    local_today = datetime.now(shop_tz).date()
+    range_end = end_date or local_today
+    range_start = start_date or (range_end - timedelta(days=days - 1))
+    if range_end < range_start:
+        raise ShopifyError("end date must not be earlier than start date")
+    range_days = (range_end - range_start).days + 1
+    if range_days > MAX_DAILY_FINANCE_DAYS:
+        raise ShopifyError(f"date range must not exceed {MAX_DAILY_FINANCE_DAYS} days")
+
+    shopifyql = "\n".join(
+        (
+            "FROM sales",
+            f"SHOW {', '.join(DAILY_FINANCE_METRICS)}",
+            f"TIMESERIES day WITH CURRENCY '{currency}', TIMEZONE '{timezone_name}'",
+            f"SINCE {range_start.isoformat()} UNTIL {range_end.isoformat()}",
+            "ORDER BY day ASC",
+        )
+    )
+    response = graphql(
+        store.domain,
+        token,
+        DAILY_FINANCE_QUERY,
+        {"query": shopifyql},
+    ).get("shopifyqlQuery")
+    if not isinstance(response, dict):
+        raise ShopifyError("ShopifyQL response was missing")
+    parse_errors = response.get("parseErrors")
+    if not isinstance(parse_errors, list):
+        raise ShopifyError("ShopifyQL parseErrors was invalid")
+    if parse_errors:
+        # Parse errors may include the submitted query. Do not expose them to
+        # logs or callers; this stable message is sufficient for monitoring.
+        raise ShopifyError("ShopifyQL rejected the daily finance query")
+    table_data = response.get("tableData")
+    if not isinstance(table_data, dict):
+        raise ShopifyError("ShopifyQL table data was missing")
+    columns = table_data.get("columns")
+    rows = table_data.get("rows")
+    if not isinstance(columns, list) or not isinstance(rows, list):
+        raise ShopifyError("ShopifyQL table data was invalid")
+    column_names = {
+        item.get("name")
+        for item in columns
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    required_columns = {"day", *DAILY_FINANCE_METRICS}
+    if not required_columns.issubset(column_names):
+        raise ShopifyError("ShopifyQL daily finance columns were incomplete")
+
+    by_date: dict[date, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ShopifyError("ShopifyQL daily finance row was invalid")
+        raw_day = row.get("day")
+        if not isinstance(raw_day, str):
+            raise ShopifyError("ShopifyQL daily finance date was invalid")
+        try:
+            row_date = date.fromisoformat(raw_day)
+        except ValueError:
+            raise ShopifyError("ShopifyQL daily finance date was invalid") from None
+        if row_date < range_start or row_date > range_end or row_date in by_date:
+            raise ShopifyError("ShopifyQL daily finance date was outside the requested range")
+        normalized = {
+            "date": row_date.isoformat(),
+            "orders": _validated_nonnegative_integer(row.get("orders"), "orders"),
+        }
+        for metric in DAILY_FINANCE_METRICS:
+            if metric == "orders":
+                continue
+            normalized[metric] = _validated_money(row.get(metric), metric)
+        by_date[row_date] = normalized
+
+    daily: list[dict[str, Any]] = []
+    current_date = range_start
+    while current_date <= range_end:
+        daily.append(
+            by_date.get(
+                current_date,
+                {
+                    "date": current_date.isoformat(),
+                    **{metric: 0 for metric in DAILY_FINANCE_METRICS},
+                },
+            )
+        )
+        current_date += timedelta(days=1)
+    return {
+        "label": store.label,
+        "domain": shop.get("myshopifyDomain", store.domain),
+        "start_date": range_start.isoformat(),
+        "end_date": range_end.isoformat(),
+        "timezone": timezone_name,
+        "currency": currency,
+        "daily": daily,
+    }
+
+
+def fetch_yesterday_sales(
+    store: StoreCredentials,
+    token: str,
+    requested_date: date | None,
+) -> dict[str, Any]:
+    # Preserve the original single-day interface for manual use while sharing
+    # the same efficient range aggregation as the dashboard collector.
+    if requested_date is None:
+        shop = graphql(store.domain, token, SHOP_QUERY)["shop"]
+        shop_tz = _shop_timezone(shop["ianaTimezone"], shop["timezoneOffset"])
+        sales_date = datetime.now(shop_tz).date() - timedelta(days=1)
+    else:
+        sales_date = requested_date
+    result = fetch_sales_range(store, token, sales_date, sales_date, days=1)
+    daily = result["daily"][0]
+    return {
+        "label": store.label,
+        "shop_name": result["shop_name"],
+        "domain": result["domain"],
+        "date": sales_date.isoformat(),
+        "timezone": result["timezone"],
+        "currency": result["currency"],
+        "order_count": daily["order_count"],
+        "cancelled_order_count": daily["cancelled_order_count"],
+        "test_order_count_excluded": result["test_order_count_excluded"],
+        "current_total_sales": daily["current_total_sales"],
+        "original_order_total": daily["original_order_total"],
+        "refunded_total": daily["refunded_total"],
+    }
+
+
+def load_stores() -> list[StoreCredentials]:
+    definitions = [
+        ("zimasya", "346c85.myshopify.com", "SHOPIFY_ZIMASYA_CLIENT_ID", "SHOPIFY_ZIMASYA_CLIENT_SECRET"),
+        ("Kaguyasu", "officebaseca.myshopify.com", "SHOPIFY_KAGUYASU_CLIENT_ID", "SHOPIFY_KAGUYASU_CLIENT_SECRET"),
+        ("anz", "anzhap.myshopify.com", "SHOPIFY_ANZ_CLIENT_ID", "SHOPIFY_ANZ_CLIENT_SECRET"),
+        ("BizFurniz", "bizfurniz.myshopify.com", "SHOPIFY_BIZFURNIZ_CLIENT_ID", "SHOPIFY_BIZFURNIZ_CLIENT_SECRET"),
+    ]
+    stores: list[StoreCredentials] = []
+    missing: list[str] = []
+    for label, domain, id_var, secret_var in definitions:
+        client_id = os.environ.get(id_var, "").strip()
+        client_secret = os.environ.get(secret_var, "").strip()
+        if not client_id:
+            missing.append(id_var)
+        if not client_secret:
+            missing.append(secret_var)
+        stores.append(StoreCredentials(label, domain, client_id, client_secret))
+    if missing:
+        raise ShopifyError("missing environment variables: " + ", ".join(missing))
+    return stores
+
+
+def print_table(results: list[dict[str, Any]]) -> None:
+    headers = ["Store", "Local date", "TZ", "Orders", "Currency", "Current total", "Original total", "Refunded"]
+    rows = [
+        [
+            item["label"],
+            item["date"],
+            item["timezone"],
+            str(item["order_count"]),
+            item["currency"],
+            item["current_total_sales"],
+            item["original_order_total"],
+            item["refunded_total"],
+        ]
+        for item in results
+    ]
+    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
+    print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Fetch each configured Shopify store's sales for yesterday.")
+    parser.add_argument(
+        "--date",
+        type=date.fromisoformat,
+        help="Optional local shop date (YYYY-MM-DD); default is yesterday in each shop's timezone.",
+    )
+    parser.add_argument("--json", action="store_true", help="Print JSON instead of a table.")
+    args = parser.parse_args()
+
+    try:
+        stores = load_stores()
+    except ShopifyError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    results: list[dict[str, Any]] = []
+    failures: list[tuple[str, str]] = []
+    for store in stores:
+        try:
+            token, scopes, expires_in = acquire_access_token(store)
+            result = fetch_yesterday_sales(store, token, args.date)
+            result["token_acquired"] = True
+            result["token_expires_in_seconds"] = expires_in
+            results.append(result)
+        except ShopifyError as exc:
+            failures.append((store.label, str(exc)))
+
+    if args.json:
+        print(json.dumps({"results": results, "failures": failures}, ensure_ascii=False, indent=2))
+    elif results:
+        print_table(results)
+    if failures:
+        for label, message in failures:
+            print(f"{label}: {message}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

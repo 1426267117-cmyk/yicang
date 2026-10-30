@@ -1,0 +1,266 @@
+type JsonRecord = Record<string, unknown>;
+
+export type YqnOpenApiConfig = {
+  apiKey: string;
+  baseUrl: string;
+  warehouseCodes: string[];
+  inventoryPageSize?: number;
+  orderPageSize?: number;
+  orderLookbackDays?: number;
+  inboundLookbackDays?: number;
+  inboundPageSize?: number;
+  now?: Date;
+  fetchImpl?: typeof fetch;
+};
+
+export type YqnTrackingConfig = {
+  apiKey: string;
+  trackingBaseUrl?: string;
+  legacyBaseUrl?: string;
+  fetchImpl?: typeof fetch;
+};
+
+function asRecord(value: unknown): JsonRecord {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
+}
+
+function finiteNumber(value: unknown) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function responseRows(payload: unknown) {
+  const data = asRecord(asRecord(payload).data);
+  const content = data.content;
+  return Array.isArray(content)
+    ? content.filter((row): row is JsonRecord => Boolean(row && typeof row === "object" && !Array.isArray(row)))
+    : [];
+}
+
+function pageFinished(payload: unknown, received: number, pageSize: number) {
+  const data = asRecord(asRecord(payload).data);
+  if (data.last === true) return true;
+  const total = finiteNumber(data.totalElements);
+  if (total !== null && received >= total) return true;
+  return responseRows(payload).length < pageSize;
+}
+
+function isoDate(value: Date) {
+  return value.toISOString().slice(0, 10);
+}
+
+function clampInteger(value: number | undefined, fallback: number, minimum: number, maximum: number) {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(maximum, Math.max(minimum, Math.trunc(value as number)));
+}
+
+async function requestJson(fetchImpl: typeof fetch, url: URL, apiKey: string, init?: RequestInit) {
+  const response = await fetchImpl(url, {
+    method: init?.method ?? "GET",
+    headers: {
+      "x-api-key": apiKey,
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {}),
+    },
+    body: init?.body,
+  });
+  if (!response.ok) throw new Error(`YQN request failed: HTTP ${response.status}`);
+  const payload = await response.json();
+  const record = asRecord(payload);
+  const code = record.code ?? record.statusCode;
+  if (code !== undefined && ![200, "200", 206, "206"].includes(code as never)) {
+    const message = String(record.message ?? record.msg ?? `YQN response code ${String(code)}`);
+    throw new Error(message.slice(0, 500));
+  }
+  return payload;
+}
+
+function dateAtOffset(date: Date, offsetDays: number) {
+  const result = new Date(date);
+  result.setUTCDate(result.getUTCDate() + offsetDays);
+  return result;
+}
+
+function nonEmptyText(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+export function parseYqnWarehouseCodes(raw?: string) {
+  return Array.from(new Set(String(raw ?? "")
+    .split(/[;,\r\n]+/)
+    .map((value) => value.trim())
+    .filter(Boolean)));
+}
+
+export async function fetchAllYqnInventory(config: YqnOpenApiConfig) {
+  if (!config.warehouseCodes.length) throw new Error("YQN_WAREHOUSE_CODES is required");
+  const fetchImpl = config.fetchImpl ?? fetch;
+  const baseUrl = config.baseUrl.replace(/\/$/, "");
+  const pageSize = clampInteger(config.inventoryPageSize, 500, 1, 500);
+  const rows: JsonRecord[] = [];
+
+  for (const warehouseCode of config.warehouseCodes) {
+    let page = 1;
+    let warehouseReceived = 0;
+    for (; page <= 10_000; page += 1) {
+      const url = new URL("/v2/inventory/get_inventory_by_page", baseUrl);
+      url.searchParams.set("warehouseCodes", warehouseCode);
+      url.searchParams.set("page", String(page));
+      url.searchParams.set("rows", String(pageSize));
+      url.searchParams.set("sidx", "id");
+      url.searchParams.set("sort", "asc");
+      const payload = await requestJson(fetchImpl, url, config.apiKey);
+      const pageRows = responseRows(payload);
+      rows.push(...pageRows);
+      warehouseReceived += pageRows.length;
+      if (pageFinished(payload, warehouseReceived, pageSize)) break;
+    }
+    if (page > 10_000) throw new Error(`YQN inventory pagination exceeded safety limit for ${warehouseCode}`);
+  }
+  return rows;
+}
+
+export async function fetchAllYqnFulfillment(config: YqnOpenApiConfig) {
+  if (!config.warehouseCodes.length) throw new Error("YQN_WAREHOUSE_CODES is required");
+  const fetchImpl = config.fetchImpl ?? fetch;
+  const baseUrl = config.baseUrl.replace(/\/$/, "");
+  const pageSize = clampInteger(config.orderPageSize, 100, 1, 100);
+  const lookbackDays = clampInteger(config.orderLookbackDays, 30, 1, 30);
+  const now = config.now ? new Date(config.now) : new Date();
+  const begin = new Date(now);
+  begin.setUTCDate(begin.getUTCDate() - lookbackDays + 1);
+  const rows: JsonRecord[] = [];
+
+  for (const warehouseCode of config.warehouseCodes) {
+    let page = 1;
+    let warehouseReceived = 0;
+    for (; page <= 10_000; page += 1) {
+      const url = new URL("/v1/saleOrder/findByPage", baseUrl);
+      url.searchParams.set("page", String(page));
+      url.searchParams.set("rows", String(pageSize));
+      url.searchParams.set("sidx", "id");
+      url.searchParams.set("sort", "desc");
+      url.searchParams.set("beginDateTime", isoDate(begin));
+      url.searchParams.set("endDateTime", isoDate(now));
+      url.searchParams.set("warehouseCode", warehouseCode);
+      const payload = await requestJson(fetchImpl, url, config.apiKey);
+      const pageRows = responseRows(payload);
+      rows.push(...pageRows);
+      warehouseReceived += pageRows.length;
+      if (pageFinished(payload, warehouseReceived, pageSize)) break;
+    }
+    if (page > 10_000) throw new Error(`YQN order pagination exceeded safety limit for ${warehouseCode}`);
+  }
+  return rows;
+}
+
+export async function fetchAllYqnInboundPlans(config: YqnOpenApiConfig) {
+  const fetchImpl = config.fetchImpl ?? fetch;
+  const baseUrl = config.baseUrl.replace(/\/$/, "");
+  const pageSize = clampInteger(config.inboundPageSize, 20, 1, 20);
+  const lookbackDays = clampInteger(config.inboundLookbackDays, 365, 1, 730);
+  const now = config.now ? new Date(config.now) : new Date();
+  const firstDay = dateAtOffset(now, -lookbackDays + 1);
+  const byOrderNo = new Map<string, JsonRecord>();
+
+  for (let windowStart = new Date(firstDay); windowStart <= now; windowStart = dateAtOffset(windowStart, 30)) {
+    const windowEnd = dateAtOffset(windowStart, 29) < now ? dateAtOffset(windowStart, 29) : now;
+    let page = 1;
+    let windowReceived = 0;
+    for (; page <= 10_000; page += 1) {
+      const url = new URL("/v1/inbound/findByPage", baseUrl);
+      url.searchParams.set("page", String(page));
+      url.searchParams.set("rows", String(pageSize));
+      url.searchParams.set("sidx", "id");
+      url.searchParams.set("sord", "desc");
+      url.searchParams.set("beginDateTime", isoDate(windowStart));
+      url.searchParams.set("endDateTime", isoDate(windowEnd));
+      const payload = await requestJson(fetchImpl, url, config.apiKey);
+      const pageRows = responseRows(payload);
+      for (const row of pageRows) {
+        const orderNo = nonEmptyText(row.inboundPlanOrderNo);
+        if (orderNo) byOrderNo.set(orderNo, row);
+      }
+      windowReceived += pageRows.length;
+      if (pageFinished(payload, windowReceived, pageSize)) break;
+    }
+    if (page > 10_000) throw new Error(`YQN inbound pagination exceeded safety limit for ${isoDate(windowStart)}`);
+  }
+  return [...byOrderNo.values()];
+}
+
+export async function fetchYqnInboundPlanDetail(config: YqnOpenApiConfig, orderNo: string) {
+  const fetchImpl = config.fetchImpl ?? fetch;
+  const url = new URL("/v1/inbound/getInboundPlanInfo", config.baseUrl.replace(/\/$/, ""));
+  const payload = await requestJson(fetchImpl, url, config.apiKey, {
+    method: "POST",
+    body: JSON.stringify({ orderNo }),
+  });
+  return asRecord(asRecord(payload).data);
+}
+
+export async function fetchAllYqnInboundPlanDetails(config: YqnOpenApiConfig) {
+  const summaries = await fetchAllYqnInboundPlans(config);
+  const warehouseFilter = new Set(config.warehouseCodes.map((value) => value.trim()).filter(Boolean));
+  const candidates = summaries.filter((row) => {
+    const code = nonEmptyText(row.orgWarehouseCode);
+    return warehouseFilter.size === 0 || (code !== null && warehouseFilter.has(code));
+  });
+  const details: JsonRecord[] = [];
+  for (let index = 0; index < candidates.length; index += 5) {
+    const batch = candidates.slice(index, index + 5);
+    const batchDetails = await Promise.all(batch.map(async (summary) => {
+      const orderNo = nonEmptyText(summary.inboundPlanOrderNo);
+      return orderNo ? fetchYqnInboundPlanDetail(config, orderNo) : null;
+    }));
+    details.push(...batchDetails.filter((row): row is JsonRecord => row !== null));
+  }
+  return details;
+}
+
+function trackingSourceResult(payload: unknown) {
+  return {
+    ok: true as const,
+    data: asRecord(asRecord(payload).data),
+    error: null,
+  };
+}
+
+function trackingSourceError(error: unknown) {
+  return {
+    ok: false as const,
+    data: null,
+    error: error instanceof Error ? error.message.slice(0, 500) : "YQN tracking request failed",
+  };
+}
+
+export async function fetchYqnTracking(config: YqnTrackingConfig, trackingNo: string) {
+  const normalizedTrackingNo = trackingNo.trim();
+  if (!normalizedTrackingNo) throw new Error("trackingNo is required");
+
+  const fetchImpl = config.fetchImpl ?? fetch;
+  const trackingBaseUrl = (config.trackingBaseUrl || "https://ship-api.yqn.com").replace(/\/$/, "");
+  const legacyBaseUrl = (config.legacyBaseUrl || "https://hwc-open-api.yqn.com").replace(/\/$/, "");
+  const modernUrl = new URL(`/api/v2/orderShipment/track/${encodeURIComponent(normalizedTrackingNo)}`, trackingBaseUrl);
+  const legacyUrl = new URL("/v1/truck/track/details", legacyBaseUrl);
+  legacyUrl.searchParams.set("trackingNo", normalizedTrackingNo);
+
+  const [modern, legacy] = await Promise.all([
+    requestJson(fetchImpl, modernUrl, config.apiKey)
+      .then(trackingSourceResult)
+      .catch(trackingSourceError),
+    requestJson(fetchImpl, legacyUrl, config.apiKey)
+      .then(trackingSourceResult)
+      .catch(trackingSourceError),
+  ]);
+
+  if (!modern.ok && !legacy.ok) {
+    throw new Error(`YQN tracking failed: new=${modern.error}; legacy=${legacy.error}`.slice(0, 500));
+  }
+
+  return {
+    preferredSource: modern.ok ? "new" as const : "legacy" as const,
+    data: modern.ok ? modern.data : legacy.data,
+    sources: { new: modern, legacy },
+  };
+}

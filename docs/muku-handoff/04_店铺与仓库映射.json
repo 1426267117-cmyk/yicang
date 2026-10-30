@@ -1,0 +1,103 @@
+﻿{
+  "namespaceWarning": "dashboardStoreId 只属于看板，不能当作平台官方 ID；领星 sid 不等于 Amazon sellerId，广告 profileId 也不等于 sellerId。",
+  "stores": [
+    {
+      "platform": "shopify",
+      "dashboardStoreId": "zimasya",
+      "displayName": "ZIMASYA",
+      "configuredDomain": "346c85.myshopify.com",
+      "credentialEnvironmentPrefix": "SHOPIFY_ZIMASYA",
+      "shopGid": null,
+      "identityVerificationRequired": true
+    },
+    {
+      "platform": "shopify",
+      "dashboardStoreId": "kaguyasu",
+      "displayName": "Kaguyasu",
+      "configuredDomain": "officebaseca.myshopify.com",
+      "credentialEnvironmentPrefix": "SHOPIFY_KAGUYASU",
+      "shopGid": null,
+      "identityVerificationRequired": true
+    },
+    {
+      "platform": "shopify",
+      "dashboardStoreId": "anzhap",
+      "displayName": "Anzhap",
+      "configuredDomain": "anzhap.myshopify.com",
+      "credentialEnvironmentPrefix": "SHOPIFY_ANZ",
+      "shopGid": null,
+      "identityVerificationRequired": true
+    },
+    {
+      "platform": "shopify",
+      "dashboardStoreId": "bizfurniz",
+      "displayName": "BizFurniz",
+      "configuredDomain": "bizfurniz.myshopify.com",
+      "credentialEnvironmentPrefix": "SHOPIFY_BIZFURNIZ",
+      "shopGid": null,
+      "identityVerificationRequired": true
+    },
+    {
+      "platform": "amazon",
+      "dashboardStoreId": "genji",
+      "displayName": "genji furniture-US",
+      "sellerId": null,
+      "marketplaceId": null,
+      "marketplaceHint": "US",
+      "identityVerificationRequired": true
+    },
+    {
+      "platform": "amazon",
+      "dashboardStoreId": "kagu",
+      "displayName": "kaguyasu-US",
+      "sellerId": null,
+      "marketplaceId": null,
+      "marketplaceHint": "US",
+      "identityVerificationRequired": true
+    },
+    {
+      "platform": "amazon",
+      "dashboardStoreId": "senyu",
+      "displayName": "senyujp-US",
+      "sellerId": null,
+      "marketplaceId": null,
+      "marketplaceHint": "US",
+      "identityVerificationRequired": true
+    },
+    {
+      "platform": "amazon",
+      "dashboardStoreId": "zhongcheng",
+      "displayName": "Zhongcheng / 中诚",
+      "sellerId": null,
+      "marketplaceId": null,
+      "marketplaceHint": "US",
+      "identityVerificationRequired": true
+    },
+    {
+      "platform": "wayfair",
+      "dashboardStoreId": "guangzhoulinhemuyukejiyoungxs",
+      "displayName": "Wayfair-林和",
+      "supplierId": null,
+      "identityVerificationRequired": true
+    }
+  ],
+  "domainWarning": "历史 REST 日报脚本的 BizFurniz 默认域名曾为 z6w01w-xs.myshopify.com；当前采集器配置为 bizfurniz.myshopify.com。ERP 须用真实 shop ID/domain 核对，不按相似名称自动合并。",
+  "yqnWarehouseCodesObserved": [
+    "BCF_CA_US",
+    "BLL_NJ_US",
+    "CMP_GA_US",
+    "CPF_CA_US",
+    "DAO_CA_US",
+    "NJC_NJ_US",
+    "SAA_GA_US"
+  ],
+  "inventoryWarehouseCodeObserved": "BLL_NJ",
+  "mappingCandidateOnly": [
+    {
+      "inventoryWarehouse": "BLL_NJ",
+      "yqnWarehouse": "BLL_NJ_US",
+      "verified": false
+    }
+  ],
+  "mappingRule": "平台+店铺+原始SKU是源身份；标准SKU只是业务映射。仓库别名和 _US 后缀对应关系须确认，不得自动猜测或跨店合并。"
+}

@@ -1,0 +1,13 @@
+export type ChannelBusinessStatus = "included" | "excluded" | "unavailable";
+
+
+export function mergeChannelBusinessStatus(
+  baseStatus: string | null | undefined,
+  workbookStatus: string | null | undefined,
+): ChannelBusinessStatus {
+  const base = baseStatus?.trim().toLowerCase();
+  const workbook = workbookStatus?.trim().toLowerCase();
+  if (base === "excluded" || workbook === "excluded") return "excluded";
+  if (base === "unavailable" || workbook === "unavailable") return "unavailable";
+  return "included";
+}

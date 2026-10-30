@@ -1,0 +1,435 @@
+const AMAZON_STORES = ["genji", "kagu", "senyu", "zhongcheng"] as const;
+const DAY_MS = 86_400_000;
+const MAX_LOOKUPS = 50;
+const MAX_KEYS_PER_LOOKUP = 20;
+const MAX_TOTAL_LOOKUP_KEYS = 400;
+
+export type SkuSalesLookup = {
+  sku: string;
+  keys?: string[];
+};
+
+export type AmazonSkuSalesTotals = {
+  units: number;
+  orderCount: number;
+  refundUnits: number;
+  sales: number;
+  refunds: number;
+  net: number;
+  excludedUnits: number;
+  originalUnits: number;
+  excludedSales: number;
+  originalSales: number;
+};
+
+export type AmazonSkuSalesMatchStatus = "exact" | "alias" | "none" | "ambiguous" | "unknown";
+
+export type AmazonSkuSalesCoverage = {
+  status: "complete" | "partial" | "unavailable";
+  complete: boolean;
+  expectedDays: number;
+  coveredDays: number;
+  expectedStoreDays: number;
+  coveredStoreDays: number;
+  windowStart: string | null;
+  windowEnd: string | null;
+  asOfBusinessDate: string | null;
+  missingDates: string[];
+  currency: string | null;
+};
+
+export type AmazonSkuSalesItem = {
+  sku: string;
+  skuKey: string;
+  matchedSkuKeys: string[];
+  matchStatus: AmazonSkuSalesMatchStatus;
+  currency: string | null;
+  totals: AmazonSkuSalesTotals | null;
+  last7Totals: AmazonSkuSalesTotals | null;
+  daily: Array<{ date: string; units: number; orderCount: number; net: number }> | null;
+  byStore: Array<{ store: string; units: number; orderCount: number; net: number }> | null;
+};
+
+export type AmazonSkuSalesPayload = {
+  platform: "amazon";
+  source: "amazon_lingxing";
+  cadence: "T+1";
+  coverage: AmazonSkuSalesCoverage;
+  items: AmazonSkuSalesItem[];
+};
+
+type CoverageRow = {
+  report_date: string;
+  store: string;
+  currency: string;
+};
+
+type MetricRow = {
+  sku_key: string;
+  report_date: string;
+  store: string;
+  currency: string;
+  units: number | string;
+  order_count: number | string;
+  refund_units: number | string;
+  sales_minor: number | string;
+  refunds_minor: number | string;
+  net_minor: number | string;
+  excluded_units: number | string;
+  original_units: number | string;
+  excluded_sales_minor: number | string;
+  original_sales_minor: number | string;
+};
+
+type MutableTotals = {
+  units: number;
+  orderCount: number;
+  refundUnits: number;
+  salesMinor: number;
+  refundsMinor: number;
+  netMinor: number;
+  excludedUnits: number;
+  originalUnits: number;
+  excludedSalesMinor: number;
+  originalSalesMinor: number;
+};
+
+export function normalizeSkuKey(value: string) {
+  return value
+    .normalize("NFKC")
+    .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, "-")
+    .replace(/\s+/g, "")
+    .toUpperCase();
+}
+
+function dateOffset(date: string, days: number) {
+  return new Date(Date.parse(`${date}T00:00:00.000Z`) + days * DAY_MS).toISOString().slice(0, 10);
+}
+
+function inclusiveDates(from: string, to: string) {
+  const output: string[] = [];
+  for (let date = from; date <= to; date = dateOffset(date, 1)) output.push(date);
+  return output;
+}
+
+function numberValue(value: number | string | null | undefined) {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function emptyMutableTotals(): MutableTotals {
+  return {
+    units: 0,
+    orderCount: 0,
+    refundUnits: 0,
+    salesMinor: 0,
+    refundsMinor: 0,
+    netMinor: 0,
+    excludedUnits: 0,
+    originalUnits: 0,
+    excludedSalesMinor: 0,
+    originalSalesMinor: 0,
+  };
+}
+
+function addMetric(target: MutableTotals, row: MetricRow) {
+  target.units += numberValue(row.units);
+  target.orderCount += numberValue(row.order_count);
+  target.refundUnits += numberValue(row.refund_units);
+  target.salesMinor += numberValue(row.sales_minor);
+  target.refundsMinor += numberValue(row.refunds_minor);
+  target.netMinor += numberValue(row.net_minor);
+  target.excludedUnits += numberValue(row.excluded_units);
+  target.originalUnits += numberValue(row.original_units);
+  target.excludedSalesMinor += numberValue(row.excluded_sales_minor);
+  target.originalSalesMinor += numberValue(row.original_sales_minor);
+}
+
+function publicTotals(value: MutableTotals): AmazonSkuSalesTotals {
+  return {
+    units: value.units,
+    orderCount: value.orderCount,
+    refundUnits: value.refundUnits,
+    sales: value.salesMinor / 100,
+    refunds: value.refundsMinor / 100,
+    net: value.netMinor / 100,
+    excludedUnits: value.excludedUnits,
+    originalUnits: value.originalUnits,
+    excludedSales: value.excludedSalesMinor / 100,
+    originalSales: value.originalSalesMinor / 100,
+  };
+}
+
+export function resolveSkuMatchAssignments(
+  lookups: Array<{ skuKey: string; keys: string[] }>,
+  availableKeys: ReadonlySet<string>,
+  coverageComplete: boolean,
+) {
+  if (!coverageComplete) {
+    return lookups.map(() => ({ matchedSkuKeys: [] as string[], matchStatus: "unknown" as const }));
+  }
+
+  const primaryOwners = new Map<string, Set<number>>();
+  const aliasOwners = new Map<string, Set<number>>();
+  lookups.forEach((lookup, index) => {
+    if (!primaryOwners.has(lookup.skuKey)) primaryOwners.set(lookup.skuKey, new Set());
+    primaryOwners.get(lookup.skuKey)!.add(index);
+    for (const key of lookup.keys) {
+      if (key === lookup.skuKey) continue;
+      if (!aliasOwners.has(key)) aliasOwners.set(key, new Set());
+      aliasOwners.get(key)!.add(index);
+    }
+  });
+  const uniqueOwner = (key: string) => {
+    const primary = primaryOwners.get(key);
+    if (primary?.size === 1) return [...primary][0];
+    if (primary && primary.size > 1) return null;
+    const aliases = aliasOwners.get(key);
+    return aliases?.size === 1 ? [...aliases][0] : null;
+  };
+
+  return lookups.map((lookup, lookupIndex): {
+    matchedSkuKeys: string[];
+    matchStatus: AmazonSkuSalesMatchStatus;
+  } => {
+    const exactMatched = availableKeys.has(lookup.skuKey);
+    const exactOwner = uniqueOwner(lookup.skuKey);
+    const aliasMatches = lookup.keys.filter((key) => key !== lookup.skuKey && availableKeys.has(key));
+    const uniqueAliasMatches = aliasMatches.filter((key) => uniqueOwner(key) === lookupIndex);
+    const blockedAliasMatches = aliasMatches.filter((key) => (
+      aliasOwners.get(key)?.has(lookupIndex) && uniqueOwner(key) !== lookupIndex
+    ));
+    const ambiguous = (exactMatched && exactOwner !== lookupIndex) || (!exactMatched
+      && (uniqueAliasMatches.length > 1 || blockedAliasMatches.length > 0));
+    if (ambiguous) return { matchedSkuKeys: [], matchStatus: "ambiguous" };
+    if (exactMatched) return { matchedSkuKeys: [lookup.skuKey], matchStatus: "exact" };
+    if (uniqueAliasMatches.length === 1) {
+      return { matchedSkuKeys: uniqueAliasMatches, matchStatus: "alias" };
+    }
+    return { matchedSkuKeys: [], matchStatus: "none" };
+  });
+}
+
+export async function latestCompleteAmazonBusinessDate(db: D1Database) {
+  const row = await db.prepare(`
+    SELECT report_date
+    FROM channel_daily_metrics
+    WHERE platform='amazon' AND business_status='included'
+      AND store IN ('genji','kagu','senyu','zhongcheng')
+    GROUP BY report_date
+    HAVING COUNT(*)=4 AND COUNT(DISTINCT store)=4 AND COUNT(DISTINCT snapshot_id)=1
+    ORDER BY report_date DESC
+    LIMIT 1
+  `).first<{ report_date: string }>();
+  return row?.report_date ?? null;
+}
+
+export async function loadAmazonSkuSales(
+  db: D1Database,
+  lookups: SkuSalesLookup[],
+  options: { from?: string; to?: string; days?: number } = {},
+): Promise<AmazonSkuSalesPayload> {
+  if (lookups.length > MAX_LOOKUPS) {
+    throw new Error(`SKU sales lookups cannot exceed ${MAX_LOOKUPS} items`);
+  }
+  if ((options.from === undefined) !== (options.to === undefined)) {
+    throw new Error("SKU sales from/to must be provided together");
+  }
+  const normalizedLookups = lookups.map((lookup, index) => {
+    const primaryKey = normalizeSkuKey(lookup.sku);
+    const keys = Array.from(new Set([primaryKey, ...(lookup.keys ?? []).map(normalizeSkuKey)]))
+      .filter(Boolean);
+    if (keys.length > MAX_KEYS_PER_LOOKUP) {
+      throw new Error(`SKU sales lookup ${index + 1} exceeds the alias budget`);
+    }
+    return { sku: lookup.sku, skuKey: primaryKey, keys };
+  });
+  const unavailableItems = () => normalizedLookups.map((lookup): AmazonSkuSalesItem => ({
+    sku: lookup.sku,
+    skuKey: lookup.skuKey,
+    matchedSkuKeys: [],
+    matchStatus: "unknown",
+    currency: null,
+    totals: null,
+    last7Totals: null,
+    daily: null,
+    byStore: null,
+  }));
+
+  const requestedDays = Math.min(Math.max(options.days ?? 30, 1), 366);
+  const explicitRange = options.from !== undefined && options.to !== undefined;
+  const anchor = explicitRange ? options.to! : await latestCompleteAmazonBusinessDate(db);
+  const to = explicitRange ? options.to! : anchor;
+  const from = explicitRange ? options.from! : to ? dateOffset(to, -(requestedDays - 1)) : null;
+  if (!from || !to) {
+    return {
+      platform: "amazon",
+      source: "amazon_lingxing",
+      cadence: "T+1",
+      coverage: {
+        status: "unavailable",
+        complete: false,
+        expectedDays: requestedDays,
+        coveredDays: 0,
+        expectedStoreDays: requestedDays * AMAZON_STORES.length,
+        coveredStoreDays: 0,
+        windowStart: null,
+        windowEnd: null,
+        asOfBusinessDate: to,
+        missingDates: [],
+        currency: null,
+      },
+      items: unavailableItems(),
+    };
+  }
+  const expectedDates = inclusiveDates(from, to);
+  const expectedDays = expectedDates.length;
+
+  const coverageResult = await db.prepare(`
+    SELECT current.report_date, current.store, current.currency
+    FROM channel_sku_daily_current current
+    JOIN channel_sku_daily_runs run
+      ON run.sku_snapshot_id=current.sku_snapshot_id
+      AND run.channel_snapshot_id=current.channel_snapshot_id
+      AND run.report_date=current.report_date
+      AND run.platform=current.platform
+    JOIN channel_daily_metrics parent
+      ON parent.report_date=current.report_date
+      AND parent.platform=current.platform
+      AND parent.store=current.store
+      AND parent.currency=current.currency
+      AND parent.snapshot_id=current.channel_snapshot_id
+    WHERE current.platform='amazon' AND current.status='complete'
+      AND run.completeness='complete' AND parent.business_status='included'
+      AND current.store IN ('genji','kagu','senyu','zhongcheng')
+      AND current.report_date BETWEEN ? AND ?
+    ORDER BY current.report_date, current.store
+  `).bind(from, to).all<CoverageRow>();
+  const coverageRows = coverageResult.results ?? [];
+  const storeDays = new Set(coverageRows.map((row) => `${row.report_date}\u0000${row.store}`));
+  const currencyValues = new Set(coverageRows.map((row) => row.currency));
+  const missingDates = expectedDates.filter((date) => (
+    AMAZON_STORES.some((store) => !storeDays.has(`${date}\u0000${store}`))
+  ));
+  const coveredDays = expectedDays - missingDates.length;
+  const expectedStoreDays = expectedDays * AMAZON_STORES.length;
+  const complete = storeDays.size === expectedStoreDays && missingDates.length === 0 && currencyValues.size === 1;
+  const coverage: AmazonSkuSalesCoverage = {
+    status: complete ? "complete" : "partial",
+    complete,
+    expectedDays,
+    coveredDays,
+    expectedStoreDays,
+    coveredStoreDays: storeDays.size,
+    windowStart: from,
+    windowEnd: to,
+    asOfBusinessDate: anchor,
+    missingDates,
+    currency: currencyValues.size === 1 ? [...currencyValues][0] : null,
+  };
+
+  const primaryKeys = normalizedLookups.map((lookup) => lookup.skuKey);
+  const aliasKeys = normalizedLookups.flatMap((lookup) => lookup.keys.filter((key) => key !== lookup.skuKey));
+  const allKeys = Array.from(new Set([...primaryKeys, ...aliasKeys]));
+  if (allKeys.length > MAX_TOTAL_LOOKUP_KEYS) {
+    throw new Error("SKU sales aliases exceed the query budget");
+  }
+  const metricRows: MetricRow[] = [];
+  for (let keyIndex = 0; keyIndex < allKeys.length; keyIndex += 80) {
+    const keyBatch = allKeys.slice(keyIndex, keyIndex + 80);
+    const placeholders = keyBatch.map(() => "?").join(", ");
+    const metricResult = await db.prepare(`
+      SELECT metric.sku_key, metric.report_date, metric.store, metric.currency,
+        SUM(metric.units) AS units,
+        SUM(metric.order_count) AS order_count,
+        SUM(metric.refund_units) AS refund_units,
+        SUM(metric.sales_minor) AS sales_minor,
+        SUM(metric.refunds_minor) AS refunds_minor,
+        SUM(metric.net_minor) AS net_minor,
+        SUM(metric.excluded_units) AS excluded_units,
+        SUM(metric.original_units) AS original_units,
+        SUM(metric.excluded_sales_minor) AS excluded_sales_minor,
+        SUM(metric.original_sales_minor) AS original_sales_minor
+      FROM channel_sku_daily_current current
+      JOIN channel_sku_daily_runs run
+        ON run.sku_snapshot_id=current.sku_snapshot_id
+        AND run.channel_snapshot_id=current.channel_snapshot_id
+        AND run.report_date=current.report_date
+        AND run.platform=current.platform
+      JOIN channel_sku_daily_metrics metric
+        ON metric.sku_snapshot_id=current.sku_snapshot_id
+        AND metric.channel_snapshot_id=current.channel_snapshot_id
+        AND metric.report_date=current.report_date
+        AND metric.platform=current.platform
+        AND metric.store=current.store
+        AND metric.currency=current.currency
+      JOIN channel_daily_metrics parent
+        ON parent.report_date=current.report_date
+        AND parent.platform=current.platform
+        AND parent.store=current.store
+        AND parent.currency=current.currency
+        AND parent.snapshot_id=current.channel_snapshot_id
+      WHERE current.platform='amazon' AND current.status='complete'
+        AND run.completeness='complete' AND parent.business_status='included'
+        AND current.store IN ('genji','kagu','senyu','zhongcheng')
+        AND current.report_date BETWEEN ? AND ?
+        AND metric.sku_key IN (${placeholders})
+      GROUP BY metric.sku_key, metric.report_date, metric.store, metric.currency
+      ORDER BY metric.report_date, metric.store, metric.sku_key
+    `).bind(from, to, ...keyBatch).all<MetricRow>();
+    metricRows.push(...(metricResult.results ?? []));
+  }
+  const assignments = resolveSkuMatchAssignments(
+    normalizedLookups,
+    new Set(metricRows.map((row) => row.sku_key)),
+    complete,
+  );
+
+  const items = normalizedLookups.map((lookup, lookupIndex): AmazonSkuSalesItem => {
+    const assignment = assignments[lookupIndex];
+    const matchedSkuKeys = assignment.matchedSkuKeys;
+    const ambiguous = assignment.matchStatus === "ambiguous";
+    const selectedKeySet = new Set(matchedSkuKeys);
+    const matching = metricRows.filter((row) => selectedKeySet.has(row.sku_key));
+    const total = emptyMutableTotals();
+    const last7Total = emptyMutableTotals();
+    const daily = new Map<string, MutableTotals>();
+    const byStore = new Map<string, MutableTotals>();
+    const last7Start = expectedDates.at(-7) ?? from;
+    for (const row of matching) {
+      addMetric(total, row);
+      if (row.report_date >= last7Start) addMetric(last7Total, row);
+      if (!daily.has(row.report_date)) daily.set(row.report_date, emptyMutableTotals());
+      if (!byStore.has(row.store)) byStore.set(row.store, emptyMutableTotals());
+      addMetric(daily.get(row.report_date)!, row);
+      addMetric(byStore.get(row.store)!, row);
+    }
+    return {
+      sku: lookup.sku,
+      skuKey: lookup.skuKey,
+      matchedSkuKeys,
+      matchStatus: assignment.matchStatus,
+      currency: coverage.currency,
+      totals: complete && !ambiguous ? publicTotals(total) : null,
+      last7Totals: complete && !ambiguous ? publicTotals(last7Total) : null,
+      daily: complete && !ambiguous
+        ? [...daily.entries()].map(([date, value]) => ({
+            date,
+            units: value.units,
+            orderCount: value.orderCount,
+            net: value.netMinor / 100,
+          }))
+        : null,
+      byStore: complete && !ambiguous
+        ? AMAZON_STORES.map((store) => ({
+            store,
+            units: byStore.get(store)?.units ?? 0,
+            orderCount: byStore.get(store)?.orderCount ?? 0,
+            net: (byStore.get(store)?.netMinor ?? 0) / 100,
+          }))
+        : null,
+    };
+  });
+
+  return { platform: "amazon", source: "amazon_lingxing", cadence: "T+1", coverage, items };
+}

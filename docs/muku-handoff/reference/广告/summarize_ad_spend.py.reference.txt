@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""Summarize daily Shopify and Wayfair ad spend exports for the Feishu report."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+import warnings
+from collections import defaultdict
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+
+SHOPIFY_STORES = {
+    "anz": "AnzhapUS",
+    "kagu": "KaguyasuUS",
+    "zim": "ZimasyaUS",
+    "biz": "BizfurnizUS",
+}
+
+# Only channels that are currently active for each store are required.  A
+# deactivated account must not keep the whole daily report permanently partial.
+ACTIVE_SHOPIFY_CHANNELS = {
+    "AnzhapUS": {"fb", "google", "pin", "tiktok"},
+    "KaguyasuUS": {"google"},
+    "ZimasyaUS": {"fb", "google", "pin"},
+    "BizfurnizUS": {"fb", "google", "pin"},
+}
+
+ENCODINGS = ["utf-8-sig", "utf-16", "utf-16-le", "gb18030", "latin1"]
+
+warnings.filterwarnings("ignore", message="Workbook contains no default style.*")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Summarize Shopify and Wayfair ad spend exports")
+    parser.add_argument("--date", required=True, help="Report date in YYYY-MM-DD format")
+    parser.add_argument("--ad-dir", required=True, help="Ad export folder path or afp:// URI")
+    parser.add_argument("--input", help="Optional existing Feishu input JSON to merge into")
+    parser.add_argument("--output", help="Write ad summary or merged JSON here")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+    parser.add_argument(
+        "--wayfair-store-filter",
+        choices=["linhe", "all"],
+        default="linhe",
+        help="Wayfair ad files to include. Default is only way_linhe files.",
+    )
+    parser.add_argument(
+        "--wayfair-exclude-patterns",
+        default="tsc,lm",
+        help="Comma-separated case-insensitive campaign-name fragments to exclude from Wayfair ad spend.",
+    )
+    return parser.parse_args()
+
+
+def local_path(path_or_uri: str) -> Path:
+    if path_or_uri.startswith("afp://"):
+        parsed = urlparse(path_or_uri)
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if not parts:
+            raise ValueError(f"AFP URI has no volume/path: {path_or_uri}")
+        return Path("/Volumes").joinpath(*parts)
+    return Path(path_or_uri).expanduser()
+
+
+def money(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("$", "").replace(",", "")
+    if not text or text in {"--", "-", "nan", "NaN"}:
+        return 0.0
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    return float(text)
+
+
+def normalize_date(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    if not text or text in {"nan", "NaN"}:
+        return ""
+    text = text.replace("/", "-")
+    match = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
+    if match:
+        year, month, day = match.groups()
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    return text
+
+
+def file_declares_date_coverage(path: Path, target_date: str) -> bool:
+    """Return true when the export filename explicitly brackets target_date.
+
+    Official advertising exports may omit rows for zero-spend days.  The
+    filename's requested range is therefore the zero-evidence boundary: a
+    missing row inside that range is a verified zero, while a date beyond the
+    range is unknown and must not be treated as zero.
+    """
+
+    match = re.search(
+        r"(?<!\d)(\d{2,4})\.(\d{1,2})\.(\d{1,2})-(\d{2,4})\.(\d{1,2})\.(\d{1,2})(?!\d)",
+        path.stem,
+    )
+    if not match:
+        return False
+    start_year, start_month, start_day, end_year, end_month, end_day = (int(value) for value in match.groups())
+    if start_year < 100:
+        start_year += 2000
+    if end_year < 100:
+        end_year += 2000
+    try:
+        start = date(start_year, start_month, start_day)
+        end = date(end_year, end_month, end_day)
+        target = date.fromisoformat(target_date)
+    except ValueError:
+        return False
+    return start <= target <= end
+
+
+def read_text(path: Path) -> str:
+    last_error: Exception | None = None
+    for encoding in ENCODINGS:
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    raise UnicodeDecodeError("unknown", b"", 0, 1, f"could not decode {path}: {last_error}")
+
+
+def split_header(line: str) -> tuple[str, list[str]]:
+    delimiter = "\t" if line.count("\t") >= line.count(",") else ","
+    return delimiter, next(csv.reader([line], delimiter=delimiter))
+
+
+def csv_rows(path: Path, required_headers: set[str]) -> list[dict[str, str]]:
+    text = read_text(path)
+    lines = [line for line in text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        delimiter, headers = split_header(line)
+        clean_headers = {header.strip() for header in headers}
+        if required_headers.issubset(clean_headers):
+            reader = csv.DictReader(lines[index:], delimiter=delimiter)
+            return [dict(row) for row in reader]
+    raise ValueError(f"could not find headers {sorted(required_headers)} in {path.name}")
+
+
+def xlsx_rows(path: Path) -> list[dict[str, Any]]:
+    try:
+        from openpyxl import load_workbook
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "openpyxl is required for XLSX ad exports. Use the Codex bundled Python from "
+            "load_workspace_dependencies or install openpyxl for this Python."
+        ) from exc
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    rows = sheet.iter_rows(values_only=True)
+    headers = [str(value).strip() if value is not None else "" for value in next(rows)]
+    output: list[dict[str, Any]] = []
+    for values in rows:
+        row = {headers[i]: values[i] if i < len(values) else None for i in range(len(headers))}
+        output.append(row)
+    workbook.close()
+    return output
+
+
+def rows_for_file(path: Path, required_headers: set[str]) -> list[dict[str, Any]]:
+    if path.suffix.lower() in {".xlsx", ".xlsm"}:
+        return xlsx_rows(path)
+    return csv_rows(path, required_headers)
+
+
+def shopify_store_and_channel(path: Path) -> tuple[str, str] | None:
+    name = path.name.lower()
+    if not name.startswith("shopify_") or path.name.startswith("~$"):
+        return None
+    store_key = next((key for key in SHOPIFY_STORES if f"_{key}_" in name), None)
+    if not store_key:
+        return None
+    if "_ad_pin_" in name:
+        channel = "pin"
+    elif "_ad_goo_" in name:
+        channel = "google"
+    elif "_ad_fb_" in name or "_fb_ad_" in name:
+        channel = "fb"
+    elif "_ad_tk_" in name:
+        channel = "tiktok"
+    else:
+        return None
+    return SHOPIFY_STORES[store_key], channel
+
+
+def preferred_file(files: list[Path]) -> Path:
+    def score(path: Path) -> tuple[int, int, str]:
+        name = path.name.lower()
+        canonical_name = (
+            1
+            if "_ad_fb_" in name or "_ad_goo_" in name or "_ad_pin_" in name or "_ad_tk_" in name
+            else 0
+        )
+        return canonical_name, path.stat().st_size, path.name
+
+    return sorted(files, key=score, reverse=True)[0]
+
+
+def spend_for_rows(
+    rows: list[dict[str, Any]], target_date: str, date_keys: list[str], spend_keys: list[str]
+) -> tuple[float, bool]:
+    total = 0.0
+    matched_date = False
+    for row in rows:
+        row_date = ""
+        for key in date_keys:
+            if key in row:
+                row_date = normalize_date(row.get(key))
+                if row_date:
+                    break
+        if row_date != target_date:
+            continue
+        matched_date = True
+        for key in spend_keys:
+            if key in row:
+                total += money(row.get(key))
+                break
+    return round(total, 2), matched_date
+
+
+def shopify_file_spend(path: Path, target_date: str, channel: str) -> tuple[float, bool]:
+    if channel == "pin":
+        rows = rows_for_file(path, {"Date", "Spend in account currency"})
+        return spend_for_rows(rows, target_date, ["Date"], ["Spend in account currency"])
+    if channel == "google":
+        rows = rows_for_file(path, {"天"})
+        return spend_for_rows(rows, target_date, ["天"], ["投放费用", "费用", "Cost", "Spend"])
+    if channel == "tiktok":
+        rows = rows_for_file(path, {"按天", "消耗"})
+        return spend_for_rows(rows, target_date, ["按天"], ["消耗", "Cost", "Spend"])
+    rows = rows_for_file(path, {"单日"})
+    return spend_for_rows(rows, target_date, ["单日"], ["已花费金额 (USD)", "Amount spent (USD)", "Spend"])
+
+
+def summarize_shopify(ad_dir: Path, target_date: str, warnings: list[str]) -> dict[str, dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[Path]] = defaultdict(list)
+    for path in ad_dir.iterdir():
+        if not path.is_file() or path.name.startswith("~$"):
+            continue
+        parsed = shopify_store_and_channel(path)
+        if parsed:
+            grouped[parsed].append(path)
+
+    output = {
+        store: {"ad_spend": 0.0, "original_ad_spend": 0.0, "ad_breakdown": {}, "ad_sources": {}, "missing_channels": []}
+        for store in SHOPIFY_STORES.values()
+    }
+    expected = {
+        (store, channel)
+        for store, channels in ACTIVE_SHOPIFY_CHANNELS.items()
+        for channel in channels
+    }
+    for key in sorted(expected):
+        files = grouped.get(key, [])
+        store, channel = key
+        if not files:
+            warnings.append(f"missing Shopify {store} {channel} ad export")
+            output[store]["missing_channels"].append(channel)
+            continue
+        chosen = preferred_file(files)
+        if len(files) > 1:
+            warnings.append(
+                f"multiple Shopify {store} {channel} ad exports; used {chosen.name}, ignored "
+                + ", ".join(path.name for path in files if path != chosen)
+            )
+        spend, has_target_date = shopify_file_spend(chosen, target_date, channel)
+        if not has_target_date:
+            warnings.append(
+                f"Shopify {store} {channel} export {chosen.name} does not cover {target_date}"
+            )
+            output[store]["missing_channels"].append(channel)
+            continue
+        output[store]["ad_breakdown"][channel] = spend
+        output[store]["ad_sources"][channel] = chosen.name
+        output[store]["ad_spend"] = round(output[store]["ad_spend"] + spend, 2)
+        output[store]["original_ad_spend"] = output[store]["ad_spend"]
+    for metrics in output.values():
+        # A numeric zero is accepted only when the export contains the target
+        # date.  If any required channel is absent or its export does not cover
+        # the target date, the whole-store advertising total is unknown; a
+        # partial channel total must never be presented as the complete value.
+        if metrics["missing_channels"] or not metrics["ad_sources"]:
+            metrics["ad_spend"] = None
+            metrics["original_ad_spend"] = None
+    return output
+
+
+def summarize_wayfair(
+    ad_dir: Path,
+    target_date: str,
+    warnings: list[str],
+    *,
+    store_filter: str = "linhe",
+    exclude_patterns: list[str] | None = None,
+) -> dict[str, Any]:
+    all_files = sorted(path for path in ad_dir.glob("way*_ad*.csv") if path.is_file() and not path.name.startswith("~$"))
+    if store_filter == "linhe":
+        files = [path for path in all_files if "linhe" in path.name.lower()]
+    else:
+        files = all_files
+    patterns = [pattern.lower() for pattern in (exclude_patterns or ["tsc", "lm"]) if pattern]
+    if not files:
+        warnings.append(f"missing Wayfair ad export for filter={store_filter}")
+        return {
+            "ad_spend": None,
+            "original_ad_spend": None,
+            "excluded_ad_spend": 0.0,
+            "excluded_by_pattern": {pattern: 0.0 for pattern in patterns},
+            "ad_sources": [],
+            "wayfair_store_filter": store_filter,
+            "wayfair_exclude_patterns": patterns,
+        }
+    total = 0.0
+    kept = 0.0
+    excluded = 0.0
+    excluded_by_pattern = {pattern: 0.0 for pattern in patterns}
+    matched_rows = 0
+    kept_rows = 0
+    excluded_rows = 0
+    for path in files:
+        range_start_key: str | None = None
+        range_end_key: str | None = None
+        try:
+            rows = rows_for_file(path, {"预估日期", "广告活动名称", "支出_USD"})
+            date_key = "预估日期"
+        except ValueError:
+            try:
+                rows = rows_for_file(path, {"预估起始日期", "预估结束日期", "广告活动名称", "支出_USD"})
+                date_key = ""
+                range_start_key = "预估起始日期"
+                range_end_key = "预估结束日期"
+            except ValueError:
+                rows = rows_for_file(path, {"日期", "广告活动名称", "支出_USD"})
+                date_key = "日期"
+        for row in rows:
+            if range_start_key and range_end_key:
+                start = normalize_date(row.get(range_start_key))
+                end = normalize_date(row.get(range_end_key))
+                if not start or not end or not (start <= target_date <= end):
+                    continue
+                if start != end:
+                    raise ValueError("Wayfair interval-total row cannot establish single-day spend")
+            elif normalize_date(row.get(date_key)) != target_date:
+                continue
+            spend = money(row.get("支出_USD"))
+            matched_rows += 1
+            total += spend
+            campaign = str(row.get("广告活动名称") or "").lower()
+            matched_patterns = [pattern for pattern in patterns if pattern in campaign]
+            if matched_patterns:
+                excluded += spend
+                excluded_rows += 1
+                for pattern in matched_patterns:
+                    excluded_by_pattern[pattern] = round(excluded_by_pattern[pattern] + spend, 2)
+            else:
+                kept += spend
+                kept_rows += 1
+    return {
+        "ad_spend": round(kept, 2) if matched_rows else None,
+        "original_ad_spend": round(total, 2) if matched_rows else None,
+        "excluded_ad_spend": round(excluded, 2),
+        "excluded_tsc_ad_spend": round(excluded_by_pattern.get("tsc", 0.0), 2),
+        "excluded_lm_ad_spend": round(excluded_by_pattern.get("lm", 0.0), 2),
+        "excluded_by_pattern": {pattern: round(value, 2) for pattern, value in excluded_by_pattern.items()},
+        "ad_breakdown": {"wayfair_kept": round(kept, 2), "wayfair_excluded": round(excluded, 2)},
+        "ad_sources": [path.name for path in files],
+        "wayfair_store_filter": store_filter,
+        "wayfair_exclude_patterns": patterns,
+        "matched_rows": matched_rows,
+        "kept_rows": kept_rows,
+        "excluded_rows": excluded_rows,
+    }
+
+
+def ad_summary(ad_dir: Path, target_date: str, *, wayfair_store_filter: str, wayfair_exclude_patterns: list[str]) -> dict[str, Any]:
+    if not ad_dir.exists() or not ad_dir.is_dir():
+        raise FileNotFoundError(f"ad directory not found: {ad_dir}")
+    warnings: list[str] = []
+    summary = {
+        "report_date": target_date,
+        "ad_dir": str(ad_dir),
+        "shopify": summarize_shopify(ad_dir, target_date, warnings),
+        "wayfair": summarize_wayfair(
+            ad_dir,
+            target_date,
+            warnings,
+            store_filter=wayfair_store_filter,
+            exclude_patterns=wayfair_exclude_patterns,
+        ),
+        "warnings": warnings,
+    }
+    return summary
+
+
+def merge_summary(input_path: Path, summary: dict[str, Any]) -> dict[str, Any]:
+    data = json.loads(input_path.read_text(encoding="utf-8"))
+    shopify = data.setdefault("shopify", {})
+    for store, ad_metrics in summary["shopify"].items():
+        metrics = shopify.setdefault(store, {})
+        if ad_metrics["ad_spend"] is None:
+            metrics.pop("ad_spend", None)
+            metrics.pop("original_ad_spend", None)
+        else:
+            metrics["ad_spend"] = ad_metrics["ad_spend"]
+            metrics["original_ad_spend"] = ad_metrics["original_ad_spend"]
+        metrics.pop("roi", None)
+
+    wayfair_ad = summary["wayfair"]
+    wayfair = data.setdefault("wayfair", {})
+    wayfair["ad_spend"] = wayfair_ad["ad_spend"]
+    wayfair["original_ad_spend"] = wayfair_ad["original_ad_spend"]
+    wayfair["excluded_ad_spend"] = wayfair_ad["excluded_ad_spend"]
+    wayfair["excluded_tsc_ad_spend"] = wayfair_ad.get("excluded_tsc_ad_spend", 0.0)
+    wayfair["excluded_lm_ad_spend"] = wayfair_ad.get("excluded_lm_ad_spend", 0.0)
+    wayfair.pop("roi", None)
+
+    diagnostics = data.setdefault("diagnostics", {})
+    diagnostics["ad_spend_summary"] = summary
+    return data
+
+
+def main() -> None:
+    args = parse_args()
+    target_date = normalize_date(args.date)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", target_date):
+        raise SystemExit("--date must resolve to YYYY-MM-DD")
+    ad_dir = local_path(args.ad_dir)
+    patterns = [item.strip() for item in args.wayfair_exclude_patterns.split(",") if item.strip()]
+    summary = ad_summary(
+        ad_dir,
+        target_date,
+        wayfair_store_filter=args.wayfair_store_filter,
+        wayfair_exclude_patterns=patterns,
+    )
+
+    output_data = merge_summary(Path(args.input), summary) if args.input else summary
+    text = json.dumps(output_data, ensure_ascii=False, indent=2 if args.pretty else None)
+    if args.output:
+        Path(args.output).write_text(text + "\n", encoding="utf-8")
+    print(text)
+
+
+if __name__ == "__main__":
+    main()

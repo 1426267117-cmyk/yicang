@@ -1,0 +1,93 @@
+query ErpOrderDetails($id: ID!, $lineItemsFirst: Int!) {
+  order(id: $id) {
+    id
+    name
+    createdAt
+    updatedAt
+    processedAt
+    cancelledAt
+    closedAt
+    test
+    displayFinancialStatus
+    displayFulfillmentStatus
+    currencyCode
+    subtotalPriceSet { shopMoney { amount currencyCode } }
+    currentSubtotalPriceSet { shopMoney { amount currencyCode } }
+    totalDiscountsSet { shopMoney { amount currencyCode } }
+    totalShippingPriceSet { shopMoney { amount currencyCode } }
+    totalTaxSet { shopMoney { amount currencyCode } }
+    totalPriceSet { shopMoney { amount currencyCode } }
+    currentTotalPriceSet { shopMoney { amount currencyCode } }
+    totalReceivedSet { shopMoney { amount currencyCode } }
+    totalRefundedSet { shopMoney { amount currencyCode } }
+    lineItems(first: $lineItemsFirst) {
+      nodes {
+        id
+        sku
+        title
+        name
+        quantity
+        currentQuantity
+        unfulfilledQuantity
+        originalUnitPriceSet { shopMoney { amount currencyCode } }
+        originalTotalSet { shopMoney { amount currencyCode } }
+        discountedTotalSet { shopMoney { amount currencyCode } }
+        totalDiscountSet { shopMoney { amount currencyCode } }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+    refunds(first: 250) {
+      id
+      createdAt
+      updatedAt
+      note
+      totalRefundedSet { shopMoney { amount currencyCode } }
+      refundLineItems(first: 100) {
+        nodes {
+          id
+          quantity
+          restockType
+          subtotalSet { shopMoney { amount currencyCode } }
+          totalTaxSet { shopMoney { amount currencyCode } }
+          lineItem { id }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+      transactions(first: 100) {
+        nodes {
+          id
+          kind
+          status
+          gateway
+          createdAt
+          processedAt
+          test
+          amountSet { shopMoney { amount currencyCode } }
+          parentTransaction { id }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    fulfillments(first: 250) {
+      id
+      status
+      createdAt
+      updatedAt
+      deliveredAt
+      estimatedDeliveryAt
+      trackingInfo(first: 100) {
+        company
+        number
+        url
+      }
+      fulfillmentLineItems(first: 100) {
+        nodes {
+          id
+          quantity
+          lineItem { id }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}

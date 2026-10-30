@@ -1,0 +1,409 @@
+import { env } from "cloudflare:workers";
+import { ensureDatabase } from "../../../../db/bootstrap";
+import { requireApiAuth } from "../../../../lib/auth";
+import {
+  type AmazonSkuSalesItem,
+  type AmazonSkuSalesPayload,
+  latestCompleteAmazonBusinessDate,
+  loadAmazonSkuSales,
+  normalizeSkuKey,
+} from "../../../../lib/channel-sku-sales";
+
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 50;
+const MAX_QUERY_LENGTH = 120;
+const MAX_WAREHOUSE_LENGTH = 80;
+const MAX_ALIAS_ROWS = 400;
+const DAY_MS = 86_400_000;
+
+type InventoryRow = {
+  sku: string;
+  warehouse_code: string;
+  warehouse_name: string;
+  region: string;
+  available: number | string | null;
+  locked: number | string | null;
+  inbound: number | string | null;
+  age_days: number | string | null;
+  last_updated_at: string | null;
+};
+
+type SalesCandidateRow = {
+  source_sku: string;
+  sku_key: string;
+};
+
+type AliasRow = {
+  sku: string;
+  package_barcode: string | null;
+};
+
+type SearchResult = {
+  sku: string;
+  inventoryAvailable: boolean;
+  amazonSales30d: number | null;
+  amazonSales: AmazonSkuSalesItem | null;
+  warehouses: Array<{
+    code: string;
+    name: string;
+    region: string;
+    available: number;
+    locked: number;
+    inbound: number;
+    ageDays: number | null;
+    lastUpdatedAt: string | null;
+  }>;
+  totals: {
+    available: number;
+    locked: number;
+    inbound: number;
+    ageDays: number | null;
+  };
+};
+
+function numberValue(value: unknown) {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function ageValue(value: unknown) {
+  if (value === null || value === undefined) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function escapeLike(value: string) {
+  return value.replace(/[\\%_]/g, "\\$&");
+}
+
+function normalizeSearchQuery(value: string) {
+  return value
+    .normalize("NFKC")
+    .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, "-")
+    .trim()
+    .toLocaleLowerCase("en-US");
+}
+
+function orderedSegmentPattern(value: string) {
+  const segments = value
+    .split(/[-/\s]+/u)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  if (segments.length < 2) return null;
+  return `%${segments.map(escapeLike).join("%")}%`;
+}
+
+function dateOffset(date: string, days: number) {
+  return new Date(Date.parse(`${date}T00:00:00.000Z`) + days * DAY_MS).toISOString().slice(0, 10);
+}
+
+function json(body: unknown, status = 200) {
+  return Response.json(body, {
+    status,
+    headers: { "Cache-Control": "no-store" },
+  });
+}
+
+function emptyPayload(query: string, warehouse: string | null, limit: number) {
+  return {
+    query,
+    warehouse,
+    source: null,
+    limit,
+    count: 0,
+    hasMore: false,
+    amazonSales: null,
+    results: [] as SearchResult[],
+  };
+}
+
+export async function GET(request: Request) {
+  const authResponse = await requireApiAuth(request);
+  if (authResponse) return authResponse;
+  const url = new URL(request.url);
+  const query = (url.searchParams.get("q") ?? "").trim();
+  const warehouseValue = (url.searchParams.get("warehouse") ?? "").trim();
+  const warehouse = warehouseValue || null;
+  const limitValue = url.searchParams.get("limit");
+
+  if (query.length > MAX_QUERY_LENGTH) {
+    return json({ error: { code: "invalid_query", message: `q 最多 ${MAX_QUERY_LENGTH} 个字符` } }, 400);
+  }
+  if (warehouse && warehouse.length > MAX_WAREHOUSE_LENGTH) {
+    return json({ error: { code: "invalid_warehouse", message: `warehouse 最多 ${MAX_WAREHOUSE_LENGTH} 个字符` } }, 400);
+  }
+
+  let limit = DEFAULT_LIMIT;
+  if (limitValue !== null) {
+    if (!/^\d+$/.test(limitValue)) {
+      return json({ error: { code: "invalid_limit", message: `limit 必须是 1–${MAX_LIMIT} 的整数` } }, 400);
+    }
+    limit = Number(limitValue);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
+      return json({ error: { code: "invalid_limit", message: `limit 必须是 1–${MAX_LIMIT} 的整数` } }, 400);
+    }
+  }
+
+  if (!query) return json(emptyPayload(query, warehouse, limit));
+
+  try {
+    await ensureDatabase();
+
+    const fileSource = await env.DB.prepare(`SELECT
+      (SELECT COUNT(*) FROM file_inventory_records WHERE active=1) AS active_count,
+      (SELECT status FROM connector_state WHERE source='files') AS status`)
+      .first<{ active_count: number | string; status: string | null }>();
+    const useFiles = numberValue(fileSource?.active_count) > 0 || fileSource?.status === "healthy";
+    const normalizedQuery = normalizeSearchQuery(query);
+    const normalized = escapeLike(normalizedQuery);
+    const containsPattern = `%${normalized}%`;
+    const prefixPattern = `${normalized}%`;
+    const aliasPattern = orderedSegmentPattern(normalizedQuery) ?? containsPattern;
+    const warehousePredicate = warehouse ? "AND warehouse_code=?" : "";
+    const inventoryWarehousePredicate = warehouse ? "AND i.warehouse_code=?" : "";
+    const detailWarehousePredicate = warehouse ? "AND d.warehouse_code=?" : "";
+
+    const statement = useFiles
+      ? env.DB.prepare(`WITH sku_candidates AS (
+          SELECT sku,
+            CASE WHEN LOWER(TRIM(sku)) LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END AS match_rank
+          FROM file_inventory_records
+          WHERE active=1 AND LOWER(TRIM(sku)) LIKE ? ESCAPE '\\' ${warehousePredicate}
+          UNION ALL
+          SELECT d.sku,
+            CASE
+              WHEN LOWER(TRIM(COALESCE(d.package_barcode, ''))) LIKE ? ESCAPE '\\'
+                OR LOWER(TRIM(COALESCE(d.parent_spu, ''))) LIKE ? ESCAPE '\\'
+                OR LOWER(TRIM(COALESCE(d.parent_record, ''))) LIKE ? ESCAPE '\\'
+              THEN 2 ELSE 3
+            END AS match_rank
+          FROM file_inventory_detail_records d
+          WHERE d.active=1 AND (
+            LOWER(TRIM(COALESCE(d.package_barcode, ''))) LIKE ? ESCAPE '\\'
+            OR LOWER(TRIM(COALESCE(d.parent_spu, ''))) LIKE ? ESCAPE '\\'
+            OR LOWER(TRIM(COALESCE(d.parent_record, ''))) LIKE ? ESCAPE '\\'
+            OR LOWER(TRIM(COALESCE(d.package_barcode, ''))) LIKE ? ESCAPE '\\'
+          ) ${detailWarehousePredicate}
+        ), matching_skus AS (
+          SELECT sku, MIN(match_rank) AS prefix_rank
+          FROM sku_candidates
+          WHERE TRIM(COALESCE(sku, '')) <> ''
+          GROUP BY sku
+          ORDER BY prefix_rank, LOWER(sku), sku
+          LIMIT ?
+        )
+        SELECT i.sku, i.warehouse_code, i.warehouse_name, MAX(i.region) AS region,
+          COALESCE(SUM(i.available_qty), 0) AS available,
+          COALESCE(SUM(i.locked_qty), 0) AS locked,
+          COALESCE(SUM(i.inbound_qty), 0) AS inbound,
+          MAX(CASE WHEN i.age_days >= 0 THEN i.age_days ELSE NULL END) AS age_days,
+          MAX(i.source_updated_at) AS last_updated_at
+        FROM file_inventory_records i
+        INNER JOIN matching_skus m ON m.sku=i.sku
+        WHERE i.active=1 ${inventoryWarehousePredicate}
+        GROUP BY i.sku, i.warehouse_code, i.warehouse_name, m.prefix_rank
+        HAVING COALESCE(SUM(i.available_qty + i.locked_qty + i.inbound_qty), 0) > 0
+        ORDER BY m.prefix_rank, LOWER(i.sku), i.sku, LOWER(i.warehouse_name), i.warehouse_code`)
+      : env.DB.prepare(`WITH matching_skus AS (
+          SELECT sku,
+            MIN(CASE WHEN LOWER(TRIM(sku)) LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END) AS prefix_rank
+          FROM inventory_snapshots
+          WHERE LOWER(TRIM(sku)) LIKE ? ESCAPE '\\' ${warehousePredicate}
+          GROUP BY sku
+          ORDER BY prefix_rank, LOWER(sku), sku
+          LIMIT ?
+        )
+        SELECT i.sku, i.warehouse_code, i.warehouse_name, MAX(i.region) AS region,
+          COALESCE(SUM(i.available_qty), 0) AS available,
+          COALESCE(SUM(i.locked_qty), 0) AS locked,
+          COALESCE(SUM(i.inbound_qty), 0) AS inbound,
+          MAX(CASE WHEN i.age_days >= 0 THEN i.age_days ELSE NULL END) AS age_days,
+          MAX(i.source_updated_at) AS last_updated_at
+        FROM inventory_snapshots i
+        INNER JOIN matching_skus m ON m.sku=i.sku
+        WHERE 1=1 ${inventoryWarehousePredicate}
+        GROUP BY i.sku, i.warehouse_code, i.warehouse_name, m.prefix_rank
+        HAVING COALESCE(SUM(i.available_qty + i.locked_qty + i.inbound_qty), 0) > 0
+        ORDER BY m.prefix_rank, LOWER(i.sku), i.sku, LOWER(i.warehouse_name), i.warehouse_code`);
+    const parameters: Array<string | number> = [prefixPattern, containsPattern];
+    if (warehouse) parameters.push(warehouse);
+    if (useFiles) {
+      parameters.push(
+        containsPattern,
+        containsPattern,
+        containsPattern,
+        containsPattern,
+        containsPattern,
+        containsPattern,
+        aliasPattern,
+      );
+      if (warehouse) parameters.push(warehouse);
+    }
+    parameters.push(limit + 1);
+    if (warehouse) parameters.push(warehouse);
+
+    const rows = await statement.bind(...parameters).all<InventoryRow>();
+    const bySku = new Map<string, SearchResult>();
+    for (const row of rows.results) {
+      let result = bySku.get(row.sku);
+      if (!result) {
+        result = {
+          sku: row.sku,
+          inventoryAvailable: true,
+          amazonSales30d: null,
+          amazonSales: null,
+          warehouses: [],
+          totals: { available: 0, locked: 0, inbound: 0, ageDays: null },
+        };
+        bySku.set(row.sku, result);
+      }
+      const available = numberValue(row.available);
+      const locked = numberValue(row.locked);
+      const inbound = numberValue(row.inbound);
+      const ageDays = ageValue(row.age_days);
+      result.warehouses.push({
+        code: row.warehouse_code,
+        name: row.warehouse_name,
+        region: row.region,
+        available,
+        locked,
+        inbound,
+        ageDays,
+        lastUpdatedAt: row.last_updated_at,
+      });
+      result.totals.available += available;
+      result.totals.locked += locked;
+      result.totals.inbound += inbound;
+      if (ageDays !== null && (result.totals.ageDays === null || ageDays > result.totals.ageDays)) {
+        result.totals.ageDays = ageDays;
+      }
+    }
+
+    let amazonSalesWindow: { from: string; to: string } | null = null;
+    try {
+      const anchor = await latestCompleteAmazonBusinessDate(env.DB);
+      if (anchor) {
+        amazonSalesWindow = { from: dateOffset(anchor, -29), to: anchor };
+        if (!warehouse) {
+          const queryKey = normalizeSkuKey(query);
+          const salesCandidates = await env.DB.prepare(`
+            SELECT MIN(metric.source_sku) AS source_sku, metric.sku_key
+            FROM channel_sku_daily_current current
+            JOIN channel_sku_daily_runs run
+              ON run.sku_snapshot_id=current.sku_snapshot_id
+              AND run.channel_snapshot_id=current.channel_snapshot_id
+              AND run.report_date=current.report_date
+              AND run.platform=current.platform
+            JOIN channel_sku_daily_metrics metric
+              ON metric.sku_snapshot_id=current.sku_snapshot_id
+              AND metric.channel_snapshot_id=current.channel_snapshot_id
+              AND metric.report_date=current.report_date
+              AND metric.platform=current.platform
+              AND metric.store=current.store
+              AND metric.currency=current.currency
+            JOIN channel_daily_metrics parent
+              ON parent.report_date=current.report_date
+              AND parent.platform=current.platform
+              AND parent.store=current.store
+              AND parent.currency=current.currency
+              AND parent.snapshot_id=current.channel_snapshot_id
+            WHERE current.platform='amazon' AND current.status='complete'
+              AND run.completeness='complete' AND parent.business_status='included'
+              AND current.store IN ('genji','kagu','senyu','zhongcheng')
+              AND current.report_date BETWEEN ? AND ?
+              AND INSTR(metric.sku_key, ?) > 0
+            GROUP BY metric.sku_key
+            ORDER BY
+              CASE
+                WHEN metric.sku_key=? THEN 0
+                WHEN SUBSTR(metric.sku_key, 1, LENGTH(?))=? THEN 1
+                ELSE 2
+              END,
+              metric.sku_key
+            LIMIT ?
+          `).bind(
+            amazonSalesWindow.from, amazonSalesWindow.to, queryKey,
+            queryKey, queryKey, queryKey, limit + 1,
+          ).all<SalesCandidateRow>();
+          const normalizedInventoryKeys = new Set(Array.from(bySku.keys()).map(normalizeSkuKey));
+          for (const candidate of salesCandidates.results ?? []) {
+            if (normalizedInventoryKeys.has(candidate.sku_key)) continue;
+            const sku = candidate.source_sku || candidate.sku_key;
+            bySku.set(sku, {
+              sku,
+              inventoryAvailable: false,
+              amazonSales30d: null,
+              amazonSales: null,
+              warehouses: [],
+              totals: { available: 0, locked: 0, inbound: 0, ageDays: null },
+            });
+            normalizedInventoryKeys.add(candidate.sku_key);
+          }
+        }
+      }
+    } catch {
+      // Inventory search remains useful when the optional SKU-sales index is unavailable.
+    }
+
+    const allResults = Array.from(bySku.values());
+    const hasMore = allResults.length > limit;
+    const results = allResults.slice(0, limit);
+    let amazonSalesSummary: Omit<AmazonSkuSalesPayload, "items"> | null = null;
+    try {
+      if (!amazonSalesWindow) throw new Error("Amazon SKU sales window is unavailable");
+      const aliases = new Map<string, Set<string>>();
+      if (useFiles && results.length > 0) {
+        const inventorySkus = results.filter((result) => result.inventoryAvailable).map((result) => result.sku);
+        if (inventorySkus.length > 0) {
+          const placeholders = inventorySkus.map(() => "?").join(", ");
+          const aliasRows = await env.DB.prepare(`
+            SELECT DISTINCT sku, package_barcode
+            FROM file_inventory_detail_records
+            WHERE active=1 AND sku IN (${placeholders})
+              AND TRIM(COALESCE(package_barcode, '')) <> ''
+            LIMIT ?
+          `).bind(...inventorySkus, MAX_ALIAS_ROWS + 1).all<AliasRow>();
+          if ((aliasRows.results ?? []).length > MAX_ALIAS_ROWS) {
+            throw new Error("Inventory SKU aliases exceed the query budget");
+          }
+          for (const row of aliasRows.results ?? []) {
+            if (row.package_barcode?.trim()) {
+              if (!aliases.has(row.sku)) aliases.set(row.sku, new Set());
+              aliases.get(row.sku)!.add(row.package_barcode.trim());
+            }
+          }
+        }
+      }
+      const amazonSales = await loadAmazonSkuSales(env.DB, results.map((result) => ({
+        sku: result.sku,
+        keys: [...(aliases.get(result.sku) ?? [])],
+      })), amazonSalesWindow);
+      const salesBySku = new Map(amazonSales.items.map((item) => [item.sku, item]));
+      for (const result of results) {
+        const sales = salesBySku.get(result.sku) ?? null;
+        result.amazonSales = sales;
+        result.amazonSales30d = sales?.totals?.units ?? null;
+      }
+      amazonSalesSummary = {
+        platform: amazonSales.platform,
+        source: amazonSales.source,
+        cadence: amazonSales.cadence,
+        coverage: amazonSales.coverage,
+      };
+    } catch {
+      // A SKU-sales failure must not discard an otherwise valid inventory lookup.
+    }
+    return json({
+      query,
+      warehouse,
+      source: useFiles ? "files" : "erp",
+      limit,
+      count: results.length,
+      hasMore,
+      amazonSales: amazonSalesSummary,
+      results,
+    });
+  } catch {
+    return json({ error: { code: "search_unavailable", message: "库存搜索暂不可用" } }, 503);
+  }
+}

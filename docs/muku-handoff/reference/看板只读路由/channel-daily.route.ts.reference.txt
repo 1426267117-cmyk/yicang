@@ -1,0 +1,890 @@
+import { env } from "cloudflare:workers";
+import { ensureDatabase } from "../../../../db/bootstrap";
+import { requireApiAuth } from "../../../../lib/auth";
+import { mergeChannelBusinessStatus } from "../../../../lib/channel-business-rules";
+
+const DAY_MS = 86_400_000;
+const DEFAULT_RANGE_DAYS = 30;
+const MAX_RANGE_DAYS = 366;
+const MONETARY_FIELDS = [
+  "sales",
+  "refunds",
+  "net",
+  "adSpend",
+  "excludedSales",
+  "originalSales",
+  "originalAdSpend",
+] as const;
+const AGGREGATE_FIELDS = [...MONETARY_FIELDS, "units", "excludedQty", "originalQty"] as const;
+
+type AggregateField = typeof AGGREGATE_FIELDS[number];
+type Completeness = "complete" | "partial" | "failed";
+
+type ChannelMetricDbRow = {
+  report_date: string;
+  platform: string;
+  store: string;
+  currency: string;
+  sales: number | null;
+  refunds: number | null;
+  net: number | null;
+  units: number | null;
+  ad_spend: number | null;
+  roi: number | null;
+  excluded_sales: number | null;
+  excluded_qty: number | null;
+  original_qty: number | null;
+  original_sales: number | null;
+  original_ad_spend: number | null;
+  business_status: string;
+  source_updated_at: string;
+  snapshot_id: string;
+};
+
+type WorkbookMetricDbRow = {
+  snapshot_id: string;
+  report_date: string;
+  platform: string;
+  store: string;
+  store_label: string;
+  currency: string;
+  sales: number | null;
+  refunds: number | null;
+  net: number | null;
+  ad_spend: number | null;
+  roi: number | null;
+  excluded_sales: number | null;
+  excluded_qty: number | null;
+  original_sales: number | null;
+  original_ad_spend: number | null;
+  business_status: string;
+  source_name: string;
+  source_sha256: string;
+  source_updated_at: string;
+  ingested_at: string;
+  snapshot_row_count: number;
+};
+
+type ShopifyFinanceDbRow = {
+  date: string;
+  store_id: string;
+  store_name: string;
+  currency: string;
+  orders: number;
+  units: number | null;
+  units_source_updated_at: string | null;
+  gross_sales: number;
+  discounts: number;
+  sales_reversals: number;
+  net_sales: number;
+  shipping_charges: number;
+  return_fees: number;
+  taxes: number;
+  duties: number;
+  additional_fees: number;
+  total_sales: number;
+  metric_version: string;
+  source_updated_at: string;
+};
+
+type ReportRunDbRow = {
+  snapshot_id: string;
+  report_date: string;
+  completeness: Completeness;
+  quality_correction: number;
+  la_business_date: string;
+  biz_included: number;
+  warnings_json: string;
+  payload_hash: string;
+  generated_at: string;
+  ingested_at: string;
+};
+
+type SourceStateDbRow = {
+  report_date: string;
+  source: string;
+  status: string;
+  message: string | null;
+  source_updated_at: string | null;
+  report_generated_at: string;
+  snapshot_id: string;
+  snapshot_at: string;
+};
+
+type ApiMetricRow = {
+  reportDate: string;
+  platform: string;
+  store: string;
+  storeName: string | null;
+  currency: string;
+  sales: number | null;
+  refunds: number | null;
+  net: number | null;
+  units: number | null;
+  adSpend: number | null;
+  roi: number | null;
+  excludedSales: number | null;
+  excludedQty: number | null;
+  originalQty: number | null;
+  originalSales: number | null;
+  originalAdSpend: number | null;
+  businessStatus: string;
+  sourceUpdatedAt: string;
+  snapshotId: string | null;
+  quantityAuthority: "channel_daily_metrics" | "store_daily_sales" | null;
+  quantitySourceUpdatedAt: string | null;
+  authority: "channel_daily_metrics" | "shopify_ql_finance"
+    | "shopify_finance_unavailable" | "channel_workbook";
+  finance?: {
+    orders: number;
+    grossSales: number;
+    discounts: number;
+    salesReversals: number;
+    netSales: number;
+    shippingCharges: number;
+    returnFees: number;
+    taxes: number;
+    duties: number;
+    additionalFees: number;
+    totalSales: number;
+    metricVersion: string;
+  };
+};
+
+function response(body: unknown, status = 200) {
+  return Response.json(body, {
+    status,
+    headers: { "Cache-Control": "private, no-store" },
+  });
+}
+
+function invalid(code: string, message: string) {
+  return response({ error: { code, message } }, 400);
+}
+
+function strictDate(value: string | null) {
+  if (value === null || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value ? parsed : null;
+}
+
+function formattedDate(value: Date) {
+  return value.toISOString().slice(0, 10);
+}
+
+function shiftedDate(value: Date, days: number) {
+  return new Date(value.getTime() + days * DAY_MS);
+}
+
+function strictFilter(value: string | null, max: number, pattern: RegExp) {
+  if (value === null || value === "" || value.toLowerCase() === "all") return "all";
+  const normalized = value.trim().toLowerCase();
+  return normalized.length <= max && pattern.test(normalized) ? normalized : null;
+}
+
+function safeNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function money(value: number) {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+function safeWarnings(value: string) {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((warning): warning is string => typeof warning === "string").slice(0, 100)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function metricFromDb(row: ChannelMetricDbRow): ApiMetricRow {
+  return {
+    reportDate: row.report_date,
+    platform: row.platform,
+    store: row.store,
+    storeName: null,
+    currency: row.currency,
+    sales: safeNumber(row.sales),
+    refunds: safeNumber(row.refunds),
+    net: safeNumber(row.net),
+    units: safeNumber(row.units),
+    adSpend: safeNumber(row.ad_spend),
+    roi: safeNumber(row.roi),
+    excludedSales: safeNumber(row.excluded_sales),
+    excludedQty: safeNumber(row.excluded_qty),
+    originalQty: safeNumber(row.original_qty),
+    originalSales: safeNumber(row.original_sales),
+    originalAdSpend: safeNumber(row.original_ad_spend),
+    businessStatus: row.business_status,
+    sourceUpdatedAt: row.source_updated_at,
+    snapshotId: row.snapshot_id,
+    quantityAuthority: row.units === null && row.original_qty === null ? null : "channel_daily_metrics",
+    quantitySourceUpdatedAt: row.units === null && row.original_qty === null ? null : row.source_updated_at,
+    authority: "channel_daily_metrics",
+  };
+}
+
+function mergeWorkbookMetric(base: ApiMetricRow, workbook: WorkbookMetricDbRow | undefined): ApiMetricRow {
+  if (!workbook) return base;
+  const workbookExcludedQty = safeNumber(workbook.excluded_qty);
+  const originalQty = base.originalQty ?? (
+    base.units !== null && workbookExcludedQty !== null
+      ? money(base.units + workbookExcludedQty)
+      : null
+  );
+  return {
+    ...base,
+    storeName: workbook.store_label,
+    sales: safeNumber(workbook.sales),
+    refunds: safeNumber(workbook.refunds),
+    net: safeNumber(workbook.net),
+    adSpend: safeNumber(workbook.ad_spend),
+    roi: safeNumber(workbook.roi),
+    excludedSales: safeNumber(workbook.excluded_sales),
+    excludedQty: workbookExcludedQty,
+    originalQty,
+    originalSales: safeNumber(workbook.original_sales),
+    originalAdSpend: safeNumber(workbook.original_ad_spend),
+    businessStatus: mergeChannelBusinessStatus(base.businessStatus, workbook.business_status),
+    sourceUpdatedAt: workbook.source_updated_at,
+    snapshotId: workbook.snapshot_id,
+    authority: "channel_workbook",
+  };
+}
+
+function mergeShopifyEnrichment(
+  base: ApiMetricRow,
+  workbook: WorkbookMetricDbRow | undefined,
+): ApiMetricRow {
+  if (!workbook) return base;
+  const excludedSales = safeNumber(workbook.excluded_sales);
+  const excludedQty = safeNumber(workbook.excluded_qty);
+  // A canonical channel snapshot with a null advertising value is an explicit
+  // "unknown", not an invitation to restore an older partial workbook sum.
+  const channelAdvertisingUnavailable = base.snapshotId !== null && base.adSpend === null;
+  const adSpend = channelAdvertisingUnavailable ? null : safeNumber(workbook.ad_spend);
+  const originalAdSpend = channelAdvertisingUnavailable
+    ? null
+    : safeNumber(workbook.original_ad_spend);
+  const originalQty = base.units !== null && excludedQty !== null
+    ? money(base.units + excludedQty)
+    : null;
+  return {
+    ...base,
+    storeName: workbook.store_label,
+    adSpend,
+    roi: base.net === null || adSpend === null || adSpend === 0
+      ? null
+      : Math.round((base.net / adSpend) * 10_000) / 10_000,
+    excludedSales,
+    excludedQty,
+    originalQty,
+    originalSales: base.sales === null || excludedSales === null
+      ? null
+      : money(base.sales + excludedSales),
+    originalAdSpend,
+    businessStatus: mergeChannelBusinessStatus(base.businessStatus, workbook.business_status),
+    sourceUpdatedAt: workbook.source_updated_at > base.sourceUpdatedAt
+      ? workbook.source_updated_at
+      : base.sourceUpdatedAt,
+    snapshotId: workbook.snapshot_id,
+  };
+}
+
+function workbookMetricFromDb(row: WorkbookMetricDbRow): ApiMetricRow {
+  return {
+    reportDate: row.report_date,
+    platform: row.platform,
+    store: row.store,
+    storeName: row.store_label,
+    currency: row.currency,
+    sales: safeNumber(row.sales),
+    refunds: safeNumber(row.refunds),
+    net: safeNumber(row.net),
+    units: null,
+    adSpend: safeNumber(row.ad_spend),
+    roi: safeNumber(row.roi),
+    excludedSales: safeNumber(row.excluded_sales),
+    excludedQty: safeNumber(row.excluded_qty),
+    originalQty: null,
+    originalSales: safeNumber(row.original_sales),
+    originalAdSpend: safeNumber(row.original_ad_spend),
+    businessStatus: row.business_status,
+    sourceUpdatedAt: row.source_updated_at,
+    snapshotId: row.snapshot_id,
+    quantityAuthority: null,
+    quantitySourceUpdatedAt: null,
+    authority: "channel_workbook",
+  };
+}
+
+function shopifyMetricFromDb(
+  row: ShopifyFinanceDbRow,
+  bizIncluded: boolean | null,
+  enrichment: ChannelMetricDbRow | undefined,
+  workbook: WorkbookMetricDbRow | undefined,
+): ApiMetricRow {
+  const excludedByReportRule = row.store_id === "bizfurniz"
+    && (bizIncluded === false || enrichment?.business_status === "excluded");
+  const sales = money(row.gross_sales + row.discounts + row.shipping_charges);
+  const refunds = safeNumber(row.sales_reversals);
+  const net = money(row.net_sales + row.shipping_charges);
+  const adSpend = enrichment ? safeNumber(enrichment.ad_spend) : null;
+  const excludedSales = enrichment ? safeNumber(enrichment.excluded_sales) : null;
+  const excludedQty = enrichment ? safeNumber(enrichment.excluded_qty) : null;
+  const synchronizedUnits = safeNumber(row.units);
+  const channelUnits = enrichment ? safeNumber(enrichment.units) : null;
+  const units = synchronizedUnits ?? channelUnits;
+  const originalQty = synchronizedUnits !== null
+    ? (excludedQty === null ? null : money(synchronizedUnits + excludedQty))
+    : (enrichment ? safeNumber(enrichment.original_qty) : null);
+  const sourceUpdatedAt = enrichment && enrichment.source_updated_at > row.source_updated_at
+    ? enrichment.source_updated_at
+    : row.source_updated_at;
+  return mergeShopifyEnrichment({
+    reportDate: row.date,
+    platform: "shopify",
+    store: row.store_id,
+    storeName: row.store_name,
+    currency: row.currency,
+    sales,
+    refunds,
+    net,
+    units,
+    adSpend,
+    roi: adSpend === null || adSpend === 0 ? null : Math.round((net / adSpend) * 10_000) / 10_000,
+    excludedSales,
+    excludedQty,
+    originalQty,
+    originalSales: excludedSales === null ? sales : money(sales + excludedSales),
+    originalAdSpend: enrichment ? safeNumber(enrichment.original_ad_spend) : null,
+    businessStatus: excludedByReportRule ? "excluded" : "included",
+    sourceUpdatedAt,
+    snapshotId: enrichment?.snapshot_id ?? null,
+    quantityAuthority: synchronizedUnits !== null
+      ? "store_daily_sales"
+      : channelUnits !== null ? "channel_daily_metrics" : null,
+    quantitySourceUpdatedAt: synchronizedUnits !== null
+      ? row.units_source_updated_at
+      : channelUnits !== null ? enrichment?.source_updated_at ?? null : null,
+    authority: "shopify_ql_finance",
+    finance: {
+      orders: row.orders,
+      grossSales: row.gross_sales,
+      discounts: row.discounts,
+      salesReversals: row.sales_reversals,
+      netSales: row.net_sales,
+      shippingCharges: row.shipping_charges,
+      returnFees: row.return_fees,
+      taxes: row.taxes,
+      duties: row.duties,
+      additionalFees: row.additional_fees,
+      totalSales: row.total_sales,
+      metricVersion: row.metric_version,
+    },
+  }, workbook);
+}
+
+function shopifyMetricWithoutFinance(
+  row: ChannelMetricDbRow,
+  bizIncluded: boolean | null,
+  workbook: WorkbookMetricDbRow | undefined,
+): ApiMetricRow {
+  const excludedByReportRule = row.store === "bizfurniz"
+    && (bizIncluded === false || row.business_status === "excluded");
+  const base = mergeShopifyEnrichment({
+    reportDate: row.report_date,
+    platform: "shopify",
+    store: row.store,
+    storeName: null,
+    currency: row.currency,
+    sales: null,
+    refunds: null,
+    net: null,
+    units: safeNumber(row.units),
+    adSpend: safeNumber(row.ad_spend),
+    roi: null,
+    excludedSales: safeNumber(row.excluded_sales),
+    excludedQty: safeNumber(row.excluded_qty),
+    originalQty: safeNumber(row.original_qty),
+    originalSales: null,
+    originalAdSpend: safeNumber(row.original_ad_spend),
+    businessStatus: excludedByReportRule ? "excluded" : "included",
+    sourceUpdatedAt: row.source_updated_at,
+    snapshotId: row.snapshot_id,
+    quantityAuthority: row.units === null && row.original_qty === null ? null : "channel_daily_metrics",
+    quantitySourceUpdatedAt: row.units === null && row.original_qty === null ? null : row.source_updated_at,
+    authority: "shopify_finance_unavailable",
+  }, workbook);
+  return {
+    ...base,
+    sales: null,
+    refunds: null,
+    net: null,
+    roi: null,
+    originalSales: null,
+    authority: "shopify_finance_unavailable",
+  };
+}
+
+function aggregateRows(rows: ApiMetricRow[]) {
+  const included = rows.filter((row) => row.businessStatus === "included");
+  const available = rows.filter((row) => row.businessStatus !== "unavailable");
+  const currencies = [...new Set(available.map((row) => row.currency))].sort();
+  const sums = {} as Record<AggregateField, number | null>;
+  const metricCoverage = {} as Record<AggregateField | "roi", {
+    knownRows: number;
+    totalRows: number;
+    status: "complete" | "partial" | "unavailable";
+  }>;
+
+  for (const field of AGGREGATE_FIELDS) {
+    const cohort = field === "excludedSales" || field === "excludedQty"
+      || field === "originalSales" || field === "originalAdSpend" || field === "adSpend"
+      ? available
+      : included;
+    const known = cohort.map((row) => row[field]).filter((value): value is number => value !== null);
+    const requiresCompleteCoverage = field === "sales" || field === "refunds" || field === "net"
+      || field === "originalSales" || field === "units" || field === "originalQty"
+      || field === "adSpend" || field === "originalAdSpend";
+    sums[field] = known.length === 0 || (requiresCompleteCoverage && known.length !== cohort.length)
+      ? null
+      : money(known.reduce((sum, value) => sum + value, 0));
+    metricCoverage[field] = {
+      knownRows: known.length,
+      totalRows: cohort.length,
+      status: known.length === 0 ? "unavailable" : known.length === cohort.length ? "complete" : "partial",
+    };
+  }
+
+  const roiNetRows = included.filter((row) => row.net !== null);
+  const roiSpendRows = available.filter((row) => row.adSpend !== null);
+  const roiNet = roiNetRows.reduce((sum, row) => sum + (row.net ?? 0), 0);
+  const roiSpend = roiSpendRows.reduce((sum, row) => sum + (row.adSpend ?? 0), 0);
+  const roiCoverageComplete = roiNetRows.length === included.length && roiSpendRows.length === available.length;
+  const roi = !roiCoverageComplete || roiNetRows.length === 0 || roiSpendRows.length === 0 || roiSpend === 0
+    ? null
+    : Math.round((roiNet / roiSpend) * 10_000) / 10_000;
+  metricCoverage.roi = {
+    knownRows: roiNetRows.length + roiSpendRows.length,
+    totalRows: included.length + available.length,
+    status: roiNetRows.length === 0 || roiSpendRows.length === 0
+      ? "unavailable"
+      : roiNetRows.length === included.length && roiSpendRows.length === available.length
+        ? "complete"
+        : "partial",
+  };
+
+  const mixedCurrencies = currencies.length > 1;
+  if (mixedCurrencies) {
+    for (const field of MONETARY_FIELDS) sums[field] = null;
+  }
+
+  return {
+    currency: currencies.length === 1 ? currencies[0] : null,
+    mixedCurrencies,
+    sales: sums.sales,
+    refunds: sums.refunds,
+    net: sums.net,
+    units: sums.units,
+    adSpend: sums.adSpend,
+    roi: mixedCurrencies ? null : roi,
+    excludedSales: sums.excludedSales,
+    excludedQty: sums.excludedQty,
+    originalQty: sums.originalQty,
+    originalSales: sums.originalSales,
+    originalAdSpend: sums.originalAdSpend,
+    includedRows: included.length,
+    excludedRows: rows.filter((row) => row.businessStatus === "excluded").length,
+    unavailableRows: rows.filter((row) => row.businessStatus === "unavailable").length,
+    metricCoverage,
+  };
+}
+
+function byCurrency(rows: ApiMetricRow[]) {
+  const currencies = [...new Set(rows.map((row) => row.currency))].sort();
+  return currencies.map((currency) => ({ currency, totals: aggregateRows(rows.filter((row) => row.currency === currency)) }));
+}
+
+export async function GET(request: Request) {
+  const authResponse = await requireApiAuth(request);
+  if (authResponse) return authResponse;
+
+  const url = new URL(request.url);
+  const rawDate = url.searchParams.get("date");
+  const rawFrom = url.searchParams.get("from");
+  const rawTo = url.searchParams.get("to");
+  if (rawDate !== null && (rawFrom !== null || rawTo !== null)) {
+    return invalid("ambiguous_range", "date 不能与 from 或 to 同时使用");
+  }
+  const date = rawDate === null ? null : strictDate(rawDate);
+  const explicitFrom = rawFrom === null ? null : strictDate(rawFrom);
+  const explicitTo = rawTo === null ? null : strictDate(rawTo);
+  if (rawDate !== null && !date) return invalid("invalid_date", "date 必须是有效的 YYYY-MM-DD 日期");
+  if (rawFrom !== null && !explicitFrom) return invalid("invalid_from", "from 必须是有效的 YYYY-MM-DD 日期");
+  if (rawTo !== null && !explicitTo) return invalid("invalid_to", "to 必须是有效的 YYYY-MM-DD 日期");
+  const platform = strictFilter(url.searchParams.get("platform"), 40, /^[a-z0-9][a-z0-9_-]*$/);
+  const store = strictFilter(url.searchParams.get("store"), 100, /^[a-z0-9][a-z0-9_.-]*$/);
+  if (!platform) return invalid("invalid_platform", "platform 格式无效");
+  if (!store) return invalid("invalid_store", "store 格式无效");
+
+  try {
+    await ensureDatabase();
+    const [latestChannel, latestShopify, latestWorkbook, latestCompleteReport] = await Promise.all([
+      env.DB.prepare("SELECT MAX(report_date) AS max_date FROM channel_report_runs")
+        .first<{ max_date: string | null }>(),
+      env.DB.prepare("SELECT MAX(date) AS max_date FROM store_daily_finance")
+        .first<{ max_date: string | null }>(),
+      env.DB.prepare("SELECT MAX(report_date) AS max_date FROM channel_workbook_metrics")
+        .first<{ max_date: string | null }>(),
+      env.DB.prepare(`SELECT report_date
+        FROM (
+          SELECT run.report_date, run.completeness,
+            ROW_NUMBER() OVER (
+              PARTITION BY run.report_date
+              ORDER BY (
+                  SELECT COUNT(*) FROM channel_daily_metrics metric
+                  WHERE metric.report_date=run.report_date
+                    AND metric.snapshot_id=run.snapshot_id
+                ) DESC,
+                run.quality_correction DESC,
+                CASE run.completeness
+                WHEN 'complete' THEN 2 WHEN 'partial' THEN 1 ELSE 0 END DESC,
+                run.generated_at DESC, run.ingested_at DESC, run.snapshot_id DESC
+            ) AS canonical_rank
+          FROM channel_report_runs run
+        )
+        WHERE canonical_rank=1 AND completeness='complete'
+        ORDER BY report_date DESC
+        LIMIT 1`)
+        .first<{ report_date: string | null }>(),
+    ]);
+    const latestDateValue = [latestChannel?.max_date, latestShopify?.max_date, latestWorkbook?.max_date]
+      .filter((value): value is string => Boolean(value)).sort().at(-1) ?? formattedDate(new Date());
+    const latestDate = strictDate(latestDateValue) ?? new Date();
+    const toDate = date ?? explicitTo ?? latestDate;
+    const fromDate = date ?? explicitFrom ?? shiftedDate(toDate, -(DEFAULT_RANGE_DAYS - 1));
+    if (fromDate.getTime() > toDate.getTime()) return invalid("invalid_range", "from 不能晚于 to");
+    const requestedDays = Math.floor((toDate.getTime() - fromDate.getTime()) / DAY_MS) + 1;
+    if (requestedDays > MAX_RANGE_DAYS) {
+      return invalid("range_too_large", `日期范围最多 ${MAX_RANGE_DAYS} 天`);
+    }
+    const from = formattedDate(fromDate);
+    const to = formattedDate(toDate);
+
+    const metricFilters = ["report_date>=?", "report_date<=?"];
+    const metricParameters: Array<string> = [from, to];
+    if (platform !== "all") {
+      metricFilters.push("platform=?");
+      metricParameters.push(platform);
+    }
+    if (store !== "all") {
+      metricFilters.push("store=?");
+      metricParameters.push(store);
+    }
+
+    const financeFilters = ["date>=?", "date<=?"];
+    const financeParameters: Array<string> = [from, to];
+    if (store !== "all") {
+      financeFilters.push("store_id=?");
+      financeParameters.push(store);
+    }
+    const includeShopify = platform === "all" || platform === "shopify";
+
+    const [metricResult, workbookResult, financeResult, reportResult, sourceResult] = await Promise.all([
+      env.DB.prepare(`SELECT report_date, platform, store, currency, sales, refunds, net, units,
+          ad_spend, roi, excluded_sales, excluded_qty, original_qty, original_sales, original_ad_spend,
+          business_status, source_updated_at, snapshot_id
+        FROM channel_daily_metrics
+        WHERE ${metricFilters.join(" AND ")}
+        ORDER BY report_date, platform, store, currency`)
+        .bind(...metricParameters).all<ChannelMetricDbRow>(),
+      env.DB.prepare(`SELECT m.snapshot_id, m.report_date, m.platform, m.store, m.store_label,
+          m.currency, m.sales, m.refunds, m.net, m.ad_spend, m.roi, m.excluded_sales,
+          m.excluded_qty, m.original_sales, m.original_ad_spend, m.business_status,
+          m.source_name, m.source_sha256, m.source_updated_at, m.ingested_at,
+          (SELECT COUNT(*) FROM channel_workbook_metrics tally
+            WHERE tally.snapshot_id=m.snapshot_id) AS snapshot_row_count
+        FROM channel_workbook_metrics m
+        WHERE ${metricFilters.map((filter) => `m.${filter}`).join(" AND ")}
+          AND m.snapshot_id = (
+            SELECT candidate.snapshot_id
+            FROM channel_workbook_metrics candidate
+            WHERE candidate.report_date=m.report_date
+            ORDER BY candidate.source_updated_at DESC, candidate.ingested_at DESC,
+              candidate.snapshot_id DESC
+            LIMIT 1
+          )
+        ORDER BY m.report_date, m.platform, m.store, m.currency`)
+        .bind(...metricParameters).all<WorkbookMetricDbRow>(),
+      includeShopify
+        ? env.DB.prepare(`SELECT f.date, f.store_id, f.store_name, f.currency, f.orders,
+            s.units AS units, s.source_updated_at AS units_source_updated_at,
+            f.gross_sales, f.discounts, f.sales_reversals, f.net_sales,
+            f.shipping_charges, f.return_fees, f.taxes, f.duties, f.additional_fees,
+            f.total_sales, f.metric_version, f.source_updated_at
+          FROM store_daily_finance f
+          LEFT JOIN store_daily_sales s ON s.store_id=f.store_id AND s.date=f.date
+          WHERE ${financeFilters.map((filter) => `f.${filter}`).join(" AND ")}
+          ORDER BY f.date, f.store_id`)
+          .bind(...financeParameters).all<ShopifyFinanceDbRow>()
+        : Promise.resolve({ results: [] as ShopifyFinanceDbRow[] }),
+      env.DB.prepare(`SELECT snapshot_id, report_date, completeness, quality_correction, la_business_date,
+          biz_included, warnings_json, payload_hash, generated_at, ingested_at
+        FROM channel_report_runs run
+        WHERE run.report_date>=? AND run.report_date<=?
+        ORDER BY run.report_date,
+          (
+            SELECT COUNT(*) FROM channel_daily_metrics metric
+            WHERE metric.report_date=run.report_date AND metric.snapshot_id=run.snapshot_id
+          ) DESC,
+          run.quality_correction DESC,
+          CASE run.completeness WHEN 'complete' THEN 2 WHEN 'partial' THEN 1 ELSE 0 END DESC,
+          run.generated_at DESC, run.ingested_at DESC, run.snapshot_id DESC`)
+        .bind(from, to).all<ReportRunDbRow>(),
+      env.DB.prepare(`SELECT report_date, source, status, message, source_updated_at,
+          report_generated_at, snapshot_id, snapshot_at
+        FROM channel_source_state
+        WHERE report_date>=? AND report_date<=?
+        ORDER BY report_date, source`)
+        .bind(from, to).all<SourceStateDbRow>(),
+    ]);
+
+    const latestRunByDate = new Map<string, ReportRunDbRow>();
+    for (const run of reportResult.results) {
+      if (!latestRunByDate.has(run.report_date)) latestRunByDate.set(run.report_date, run);
+    }
+    const workbookByKey = new Map(workbookResult.results.map((row) => [
+      `${row.report_date}\u0000${row.platform}\u0000${row.store}\u0000${row.currency}`,
+      row,
+    ]));
+    const consumedWorkbookRows = new Set<WorkbookMetricDbRow>();
+    const channelShopifyRows = metricResult.results.filter((row) => row.platform === "shopify");
+    const channelRows = metricResult.results.filter((row) => row.platform !== "shopify").map((row) => {
+      const workbook = workbookByKey.get(`${row.report_date}\u0000${row.platform}\u0000${row.store}\u0000${row.currency}`);
+      if (workbook) consumedWorkbookRows.add(workbook);
+      return mergeWorkbookMetric(metricFromDb(row), workbook);
+    });
+    const shopifyEnrichmentByKey = new Map(channelShopifyRows.map((row) => [
+      `${row.report_date}\u0000${row.store}\u0000${row.currency}`,
+      row,
+    ]));
+    const matchedShopifyEnrichment = new Set<ChannelMetricDbRow>();
+    const shopifyRows = financeResult.results.map((row) => {
+      const reportRun = latestRunByDate.get(row.date);
+      const exactKey = `${row.date}\u0000${row.store_id}\u0000${row.currency}`;
+      const enrichment = shopifyEnrichmentByKey.get(exactKey);
+      const workbook = workbookByKey.get(`${row.date}\u0000shopify\u0000${row.store_id}\u0000${row.currency}`);
+      if (enrichment) matchedShopifyEnrichment.add(enrichment);
+      if (workbook) consumedWorkbookRows.add(workbook);
+      return shopifyMetricFromDb(
+        row,
+        reportRun ? Boolean(reportRun.biz_included) : null,
+        enrichment,
+        workbook,
+      );
+    });
+    const unmatchedShopifyEnrichment = channelShopifyRows
+      .filter((row) => !matchedShopifyEnrichment.has(row));
+    const shopifyRowsWithoutFinance = unmatchedShopifyEnrichment.map((row) => {
+      const reportRun = latestRunByDate.get(row.report_date);
+      const workbook = workbookByKey.get(`${row.report_date}\u0000shopify\u0000${row.store}\u0000${row.currency}`);
+      if (workbook) consumedWorkbookRows.add(workbook);
+      return shopifyMetricWithoutFinance(
+        row,
+        reportRun ? Boolean(reportRun.biz_included) : null,
+        workbook,
+      );
+    });
+    const workbookOnlyRows = workbookResult.results
+      .filter((row) => row.platform !== "shopify" && !consumedWorkbookRows.has(row))
+      .map(workbookMetricFromDb);
+    const rows = [...channelRows, ...shopifyRows, ...shopifyRowsWithoutFinance, ...workbookOnlyRows]
+      .sort((left, right) => (
+      left.reportDate.localeCompare(right.reportDate)
+      || left.platform.localeCompare(right.platform)
+      || left.store.localeCompare(right.store)
+      || left.currency.localeCompare(right.currency)
+      ));
+
+    const sourceStates = sourceResult.results.map((source) => ({
+      reportDate: source.report_date,
+      source: source.source,
+      status: source.status,
+      message: source.message,
+      sourceUpdatedAt: source.source_updated_at,
+      reportGeneratedAt: source.report_generated_at,
+      snapshotId: source.snapshot_id,
+      snapshotAt: source.snapshot_at,
+    }));
+    const sourcesByDate = new Map<string, typeof sourceStates>();
+    for (const source of sourceStates) {
+      const daySources = sourcesByDate.get(source.reportDate) ?? [];
+      daySources.push(source);
+      sourcesByDate.set(source.reportDate, daySources);
+    }
+    const workbookDates = new Set(workbookResult.results.map((row) => row.report_date));
+
+    const dates = Array.from({ length: requestedDays }, (_, index) => formattedDate(shiftedDate(fromDate, index)));
+    const daily = dates.map((reportDate) => {
+      const dayRows = rows.filter((row) => row.reportDate === reportDate);
+      const run = latestRunByDate.get(reportDate);
+      const daySources = sourcesByDate.get(reportDate) ?? [];
+      return {
+        date: reportDate,
+        totals: aggregateRows(dayRows),
+        byCurrency: byCurrency(dayRows),
+        coverage: {
+          status: run?.completeness
+            ?? (workbookDates.has(reportDate)
+              ? "complete"
+              : dayRows.length > 0 ? "data_without_report_run" : "missing"),
+          rowCount: dayRows.length,
+          sourceCount: daySources.length,
+          completeSources: daySources.filter((source) => source.status === "complete").length,
+          partialSources: daySources.filter((source) => source.status === "partial").length,
+          missingSources: daySources.filter((source) => source.status === "missing" || source.status === "error").length,
+        },
+      };
+    });
+
+    const reports = [...latestRunByDate.values()].sort((left, right) => left.report_date.localeCompare(right.report_date))
+      .map((run) => ({
+        snapshotId: run.snapshot_id,
+        reportDate: run.report_date,
+        completeness: run.completeness,
+        qualityCorrection: Boolean(run.quality_correction),
+        laBusinessDate: run.la_business_date,
+        bizIncluded: Boolean(run.biz_included),
+        warnings: safeWarnings(run.warnings_json),
+        payloadHash: run.payload_hash,
+        generatedAt: run.generated_at,
+        ingestedAt: run.ingested_at,
+      }));
+    const workbookSnapshotById = new Map<string, {
+      snapshotId: string;
+      reportDate: string;
+      sourceName: string;
+      sourceSha256: string;
+      sourceUpdatedAt: string;
+      ingestedAt: string;
+      rowCount: number;
+      returnedRowCount: number;
+    }>();
+    for (const row of workbookResult.results) {
+      const snapshot = workbookSnapshotById.get(row.snapshot_id);
+      if (snapshot) {
+        snapshot.returnedRowCount += 1;
+      } else {
+        workbookSnapshotById.set(row.snapshot_id, {
+          snapshotId: row.snapshot_id,
+          reportDate: row.report_date,
+          sourceName: row.source_name,
+          sourceSha256: row.source_sha256,
+          sourceUpdatedAt: row.source_updated_at,
+          ingestedAt: row.ingested_at,
+          rowCount: row.snapshot_row_count,
+          returnedRowCount: 1,
+        });
+      }
+    }
+    const workbookSnapshots = [...workbookSnapshotById.values()]
+      .sort((left, right) => left.reportDate.localeCompare(right.reportDate));
+    const warnings = [...new Set(reports.flatMap((run) => run.warnings))];
+    const reportByDate = new Map(reports.map((run) => [run.reportDate, run]));
+    const coveredDateSet = new Set([...reportByDate.keys(), ...workbookDates]);
+    const workbookOnlyDates = new Set(
+      [...workbookDates].filter((reportDate) => !reportByDate.has(reportDate)),
+    );
+    const completeDateSet = new Set([
+      ...reports.filter((run) => run.completeness === "complete").map((run) => run.reportDate),
+      ...workbookOnlyDates,
+    ]);
+    const partialDays = dates.filter((item) => reportByDate.get(item)?.completeness === "partial").length;
+    const failedDays = dates.filter((item) => reportByDate.get(item)?.completeness === "failed").length;
+    const completeDays = dates.filter((item) => completeDateSet.has(item)).length;
+    const coveredDays = dates.filter((item) => coveredDateSet.has(item)).length;
+    const latestWorkbookDate = [...workbookOnlyDates].sort().at(-1) ?? null;
+    const latestReportDate = [...coveredDateSet].sort().at(-1) ?? null;
+    const latestCompleteReportDate = [latestCompleteReport?.report_date ?? null, latestWorkbookDate]
+      .filter((value): value is string => value !== null)
+      .sort().at(-1) ?? null;
+    const channelDailyShopifyFallbackRows = 0;
+    const channelDailyShopifyFinancialsIncluded = false;
+
+    return response({
+      ok: true,
+      range: { from, to },
+      filters: { platform, store },
+      authority: {
+        shopify: "shopify_ql_finance",
+        workbook: workbookSnapshots.length > 0 ? "latest_append_only_snapshot_per_business_day" : "not_available",
+        channelDailyShopifyIncluded: channelDailyShopifyFinancialsIncluded,
+        channelDailyShopifySalesIncluded: channelDailyShopifyFinancialsIncluded,
+        channelDailyShopifyUnitsIncluded: true,
+        channelDailyShopifyEnrichmentIncluded: true,
+        crossCurrencyFallback: false,
+        channelDailyShopifyRows: channelShopifyRows.length,
+        matchedShopifyEnrichmentRows: matchedShopifyEnrichment.size,
+        orphanShopifyEnrichmentRows: unmatchedShopifyEnrichment.length,
+        retainedShopifyEnrichmentWithoutFinanceRows: unmatchedShopifyEnrichment.length,
+        channelDailyShopifyFallbackRows,
+        financeRowsWithoutChannelEnrichment: financeResult.results.length - matchedShopifyEnrichment.size,
+        deduplication: "Shopify sales, refunds and net use exactly one ShopifyQL finance row per date/store/currency; workbook and channel rows enrich ads, exclusions and quantities only",
+        missingFinancePolicy: "when ShopifyQL finance is unavailable, sales, refunds, net, ROI and original sales remain null; no other financial source is substituted",
+        shopifyMetricMapping: {
+          sales: "store_daily_finance only (ShopifyQL gross_sales + discounts + shipping_charges)",
+          refunds: "store_daily_finance only (ShopifyQL sales_reversals)",
+          net: "store_daily_finance only (ShopifyQL net_sales + shipping_charges)",
+          units: "store_daily_sales.units when synchronized, otherwise channel_daily_metrics.units from the same Shopify daily source; null means neither source has a verified quantity",
+          adSpend: "latest channel_workbook_metrics.ad_spend when available; otherwise channel_daily_metrics.ad_spend",
+          roi: "recalculated from included net and all reported advertising spend",
+          originalAdSpend: "latest channel_workbook_metrics.original_ad_spend when available; otherwise channel_daily_metrics.original_ad_spend",
+          exclusions: "latest channel_workbook_metrics exclusions when available; otherwise channel_daily_metrics exclusions",
+          financialDetail: "store_daily_finance is the sole Shopify financial authority and remains attached as drill-down detail",
+        },
+        roiFormula: "sum(included net) / sum(all reported adSpend, including business-excluded advertising cost)",
+        nullPolicy: "null means unavailable; totals sum known values and expose metricCoverage instead of coercing null to zero",
+      },
+      totals: aggregateRows(rows),
+      byCurrency: byCurrency(rows),
+      rows,
+      daily,
+      reports,
+      workbookSnapshots,
+      sourceStates,
+      coverage: {
+        status: completeDays === requestedDays
+          ? "complete"
+          : coveredDays === 0 ? "empty" : "partial",
+        requestedDays,
+        coveredDays,
+        completeDays,
+        partialDays,
+        failedDays,
+        missingDays: requestedDays - coveredDays,
+        missingDates: dates.filter((item) => !coveredDateSet.has(item)),
+        latestReportDate,
+        latestCompleteReportDate,
+        warnings,
+      },
+    });
+  } catch (error) {
+    const requestId = crypto.randomUUID();
+    console.error("channel daily query failed", {
+      requestId,
+      errorType: error instanceof Error ? error.name : "UnknownError",
+    });
+    return response({
+      error: {
+        code: "channel_daily_query_failed",
+        message: "全渠道日报暂不可用，请稍后重试",
+        requestId,
+      },
+    }, 503);
+  }
+}

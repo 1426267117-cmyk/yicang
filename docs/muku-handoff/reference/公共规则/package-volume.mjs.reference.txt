@@ -1,0 +1,45 @@
+const UNIT_TO_METERS = {
+  mm: 0.001,
+  cm: 0.01,
+  m: 1,
+  in: 0.0254,
+};
+
+function normalizedUnit(value) {
+  const unit = String(value ?? "").trim().toLowerCase();
+  if (!unit) return "cm";
+  if (unit === "毫米") return "mm";
+  if (unit === "厘米") return "cm";
+  if (unit === "米") return "m";
+  if (unit === "英寸" || unit === "inch" || unit === "inches" || unit === '"') return "in";
+  return unit;
+}
+
+/**
+ * Convert one package dimension string to cubic metres.
+ * The warehouse workbook uses centimetres when the unit is omitted.
+ */
+export function packageVolumeCbm(value) {
+  if (typeof value !== "string") return null;
+
+  const match = value.normalize("NFKC").trim().match(
+    /^(\d+(?:\.\d+)?)\s*(mm|cm|m|in|inch|inches|毫米|厘米|米|英寸|")?\s*(?:\*|x|×)\s*(\d+(?:\.\d+)?)\s*(mm|cm|m|in|inch|inches|毫米|厘米|米|英寸|")?\s*(?:\*|x|×)\s*(\d+(?:\.\d+)?)\s*(mm|cm|m|in|inch|inches|毫米|厘米|米|英寸|")?$/i,
+  );
+  if (!match) return null;
+
+  const dimensions = [Number(match[1]), Number(match[3]), Number(match[5])];
+  if (dimensions.some((dimension) => !Number.isFinite(dimension) || dimension <= 0)) return null;
+
+  const sourceUnits = [match[2], match[4], match[6]].map((unit) => unit ? normalizedUnit(unit) : null);
+  const fallbackUnit = sourceUnits.find(Boolean) ?? "cm";
+  const factors = sourceUnits.map((unit) => UNIT_TO_METERS[unit ?? fallbackUnit]);
+  if (factors.some((factor) => !factor)) return null;
+
+  return dimensions.reduce((volume, dimension, index) => volume * dimension * factors[index], 1);
+}
+
+export function totalPackageVolumeCbm(value, setCount) {
+  const unitVolume = packageVolumeCbm(value);
+  if (unitVolume === null || typeof setCount !== "number" || !Number.isFinite(setCount) || setCount < 0) return null;
+  return unitVolume * setCount;
+}
