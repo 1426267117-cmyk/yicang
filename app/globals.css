@@ -111,8 +111,8 @@ nav { display:grid; gap:4px; }
 .muku-operations li strong { margin-bottom:3px; color:#405148; font-size:8px; }
 .muku-operations li small { color:#8c9891; font-size:7px; }
 .muku-operations li>b { flex:none; padding:3px 6px; border-radius:8px; background:#f0f2f1; color:#758079; font-size:7px; }
-.muku-operations li>b.muku-run-succeeded,.muku-operations li>b.muku-run-unchanged { background:#e7f4ed; color:#277258; }
-.muku-operations li>b.muku-run-running { background:#fff0e5; color:#b96135; }
+.muku-operations li>b.muku-run-succeeded,.muku-operations li>b.muku-run-unchanged,.muku-operations li>b.muku-run-ready { background:#e7f4ed; color:#277258; }
+.muku-operations li>b.muku-run-running,.muku-operations li>b.muku-run-delayed { background:#fff0e5; color:#b96135; }
 .muku-operations li>b.muku-run-failed { background:#fdece9; color:#c84f3c; }
 .muku-operations>div>p { margin:0; color:#87948d; font-size:8px; }
 .muku-connector-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; padding-top:14px; border-top:1px solid #edf1ee; }

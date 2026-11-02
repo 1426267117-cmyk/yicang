@@ -1407,9 +1407,13 @@ function normalizeMukuStatus(value: unknown): MukuStatus {
     ? 'running'
     : datasetStatuses.some((status) => status === 'failed')
       ? 'failed'
-      : datasetStatuses.length && datasetStatuses.every((status) => status === 'succeeded' || status === 'unchanged')
-        ? 'succeeded'
-        : null;
+      : datasetStatuses.some((status) => status === 'delayed')
+        ? 'delayed'
+        : datasetStatuses.length && datasetStatuses.every((status) => status === 'ready')
+          ? 'ready'
+          : datasetStatuses.length && datasetStatuses.every((status) => ['succeeded', 'unchanged', 'ready'].includes(status))
+            ? 'succeeded'
+            : null;
   const rawStatus = (readString(run.status, statusObject.status, connector.status, typeof root.status === 'string' ? root.status : null, data.status, aggregateStatus) ?? 'unknown').toLowerCase();
   const status: MukuSyncStatus = rawStatus.includes('run') || rawStatus.includes('progress')
     ? 'running'
@@ -1417,7 +1421,7 @@ function normalizeMukuStatus(value: unknown): MukuStatus {
       ? 'succeeded'
       : rawStatus.includes('fail') || rawStatus.includes('error')
         ? 'failed'
-        : rawStatus.includes('stale')
+        : rawStatus.includes('stale') || rawStatus.includes('delayed')
           ? 'stale'
           : rawStatus.includes('idle') || rawStatus.includes('ready')
             ? 'idle'
@@ -1474,7 +1478,7 @@ function normalizeMukuInventory(value: unknown): MukuInventoryPayload {
   const pagination = normalizePagination(root.pagination ?? data.pagination ?? root.meta ?? data.meta, records.length);
   return {
     ok: true,
-    stale: readBoolean(root.stale, data.stale, snapshot.stale) ?? readString(state.status) === 'failed',
+    stale: readBoolean(root.stale, data.stale, snapshot.stale) ?? ['failed', 'delayed'].includes(readString(state.status) ?? ''),
     snapshotId: readString(root.snapshotId, root.snapshot_id, data.snapshotId, snapshot.id, snapshot.snapshotId, state.activeSnapshotId),
     generatedAt: readString(root.generatedAt, root.generated_at, data.generatedAt, snapshot.generatedAt, snapshot.generated_at, state.generatedAt),
     sourceUpdatedAt: readString(root.sourceUpdatedAt, root.source_updated_at, data.sourceUpdatedAt, snapshot.sourceUpdatedAt, state.sourceUpdatedAt),
@@ -1513,7 +1517,7 @@ function normalizeMukuRisk(value: unknown): MukuRiskPayload {
   });
   return {
     ok: true,
-    stale: readBoolean(root.stale, data.stale, snapshot.stale) ?? readString(state.status) === 'failed',
+    stale: readBoolean(root.stale, data.stale, snapshot.stale) ?? ['failed', 'delayed'].includes(readString(state.status) ?? ''),
     generatedAt: readString(root.generatedAt, root.generated_at, data.generatedAt, snapshot.generatedAt, snapshot.generated_at, state.generatedAt),
     sourceUpdatedAt: readString(root.sourceUpdatedAt, root.source_updated_at, data.sourceUpdatedAt, snapshot.sourceUpdatedAt, state.sourceUpdatedAt),
     syncedAt: readString(root.syncedAt, root.synced_at, data.syncedAt, snapshot.syncedAt, snapshot.ingestedAt, state.lastSuccessAt, state.updatedAt),
@@ -1549,7 +1553,7 @@ function mukuStatusPresentation(status: MukuStatus | null) {
   if (!status.configured || status.status === 'unconfigured') return { label: '未配置', className: '' };
   if (status.status === 'running') return { label: '同步中', className: 'pending' };
   if (status.status === 'failed') return { label: '最近同步失败', className: 'error' };
-  if (status.status === 'stale') return { label: '快照已过时', className: 'pending' };
+  if (status.status === 'stale') return { label: '数据源延迟', className: 'pending' };
   if (status.connected || status.status === 'succeeded' || status.status === 'idle') return { label: '只读连接正常', className: 'ready' };
   return { label: '状态未知', className: 'pending' };
 }
@@ -1573,6 +1577,8 @@ function mukuDatasetLabel(dataset: string) {
 }
 
 function mukuRunStatusLabel(status: string) {
+  if (status === 'ready') return '正常';
+  if (status === 'delayed') return '延迟';
   if (status === 'succeeded') return '成功';
   if (status === 'unchanged') return '无变化';
   if (status === 'running') return '进行中';
