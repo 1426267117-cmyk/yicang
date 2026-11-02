@@ -113,7 +113,7 @@ npm run build
 
 真实试采还需业务负责人明确：首家店、允许回补的起止日期、正式域名和预期 Shop GID。凭证只通过 Sites 后端密钥配置提供。
 
-真实同步还必须先设置 `ERP_ALLOWED_EMAILS` 或 `ERP_ALLOWED_EMAIL_DOMAINS`。没有公司访问名单时同步接口会拒绝启动；一旦数据库已有平台店铺，名单缺失会让全部 ERP 数据接口直接拒绝访问，避免配置丢失后恢复为公开读取。全新数据库应先只填精确 owner 邮箱，确认该 owner 已初始化为 admin 后再按需要扩大到公司域名。启动真实同步的人每次都必须同时是 admin 且命中 `ERP_ALLOWED_EMAILS` 精确邮箱；公司域名仅提供普通访问，不能单独取得同步权限。
+真实同步还必须先设置 `ERP_ALLOWED_EMAILS` 或 `ERP_ALLOWED_EMAIL_DOMAINS`。没有公司访问名单时同步接口会拒绝启动；一旦数据库已有平台店铺，名单缺失会让全部 ERP 数据接口直接拒绝访问，避免配置丢失后恢复为公开读取。`ERP_ALLOWED_EMAILS` 的第一位精确邮箱固定作为 bootstrap owner；应先由该 owner 初始化为 admin，再增加其他精确邮箱或公司域名，且不要随意调整首位邮箱。启动真实同步的人每次都必须同时是 admin 且命中 `ERP_ALLOWED_EMAILS` 精确邮箱；公司域名仅提供普通访问，不能单独取得同步权限。
 
 ## 7. 当前发布状态
 
