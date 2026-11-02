@@ -360,7 +360,8 @@ type OAuthFailureNotice = { message: string; retryUrl: string };
 
 const shopifyOAuthFailureMessages: Record<string, string> = {
   AUTH_REQUIRED: 'ERP 登录状态已失效，请重新登录后再授权 Shopify。',
-  ERP_ACCESS_NOT_ALLOWED: '当前站点版本仍启用了旧访问名单，请刷新后重试。',
+  ERP_ACCESS_POLICY_REQUIRED: 'ERP 正式访问名单尚未配置，请先由管理员完成上线配置。',
+  ERP_ACCESS_NOT_ALLOWED: '当前账号不在 ERP 正式访问名单中，请联系管理员添加后重试。',
   ERP_SYNC_OPERATOR_EMAIL_REQUIRED: '请使用 ERP 指定管理员账号重新发起 Shopify 授权。',
   SHOPIFY_OAUTH_SESSION_MISSING: '授权会话已失效。请从这里重新授权，并尽快完成 Shopify 页面确认。',
   SHOPIFY_OAUTH_CALLBACK_INVALID: 'Shopify 返回的授权校验未通过，请从这里重新授权。',
