@@ -155,6 +155,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0000_wooden_deathstrike.sql', '../drizzle/0001_premium_the_stranger.sql',
     '../drizzle/0002_organic_titanium_man.sql', '../drizzle/0003_fancy_jane_foster.sql',
     '../drizzle/0004_illegal_black_panther.sql', '../drizzle/0005_chilly_obadiah_stane.sql',
+    '../drizzle/0006_soft_wither.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

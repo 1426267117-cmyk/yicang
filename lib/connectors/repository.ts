@@ -427,17 +427,23 @@ export class PlatformOrderRepository {
       'SELECT raw_hash, source_updated_at FROM platform_orders WHERE id = ? AND tenant_id = ? LIMIT 1',
     ).bind(orderId, this.tenantId).first<{ raw_hash: string; source_updated_at: string }>();
     if (existing && Date.parse(existing.source_updated_at) > Date.parse(input.graph.sourceUpdatedAt)) {
-      await this.db.prepare(`
-        UPDATE platform_orders SET fetched_at = ?, last_seen_at = ?
-        WHERE id = ? AND tenant_id = ?
-      `).bind(input.fetchedAt, input.fetchedAt, orderId, this.tenantId).run();
+      await this.db.batch([
+        this.db.prepare(`
+          UPDATE platform_orders SET fetched_at = ?, last_seen_at = ?
+          WHERE id = ? AND tenant_id = ?
+        `).bind(input.fetchedAt, input.fetchedAt, orderId, this.tenantId),
+        this.purchaseDemandRefreshStatement(orderId, input.fetchedAt),
+      ]);
       return 'unchanged';
     }
     if (existing?.raw_hash === rawHash) {
-      await this.db.prepare(`
-        UPDATE platform_orders SET fetched_at = ?, last_seen_at = ?
-        WHERE id = ? AND tenant_id = ?
-      `).bind(input.fetchedAt, input.fetchedAt, orderId, this.tenantId).run();
+      await this.db.batch([
+        this.db.prepare(`
+          UPDATE platform_orders SET fetched_at = ?, last_seen_at = ?
+          WHERE id = ? AND tenant_id = ?
+        `).bind(input.fetchedAt, input.fetchedAt, orderId, this.tenantId),
+        this.purchaseDemandRefreshStatement(orderId, input.fetchedAt),
+      ]);
       return 'unchanged';
     }
 
@@ -626,6 +632,7 @@ export class PlatformOrderRepository {
     }
 
     const snapshotId = await stableId('posnapshot', orderId, rawHash);
+    statements.push(this.purchaseDemandRefreshStatement(orderId, input.fetchedAt));
     statements.push(this.db.prepare(`
       INSERT OR IGNORE INTO platform_order_snapshots (
         id, tenant_id, order_id, sync_run_id, source_updated_at, raw_hash, raw_json, fetched_at
@@ -710,6 +717,110 @@ export class PlatformOrderRepository {
       'platform_fulfillment_lines',
       'platform_fulfillment_tracking',
     ].map((table) => this.db.prepare(`UPDATE ${table} SET is_current = 0 WHERE order_id = ? AND is_current = 1`).bind(orderId));
+  }
+
+  private purchaseDemandRefreshStatement(orderId: string, refreshedAt: string) {
+    return this.db.prepare(`
+      WITH demand_source AS (
+        SELECT
+          'pdemand_' || l.id AS id,
+          po.tenant_id,
+          po.platform_store_id,
+          po.id AS order_id,
+          l.id AS order_line_id,
+          po.platform,
+          po.source_order_id,
+          l.source_order_line_id,
+          l.raw_sku,
+          l.normalized_sku,
+          CASE
+            WHEN l.mapping_status = 'mapped' AND l.mapped_sku_id IS NOT NULL THEN l.mapped_sku_id
+            WHEN pm.status = 'mapped' AND pm.sku_id IS NOT NULL THEN pm.sku_id
+            ELSE NULL
+          END AS effective_sku_id,
+          CASE
+            WHEN (l.mapping_status = 'mapped' AND l.mapped_sku_id IS NOT NULL)
+              OR (pm.status = 'mapped' AND pm.sku_id IS NOT NULL) THEN 'mapped'
+            WHEN l.mapping_status = 'ambiguous' OR pm.status = 'ambiguous' THEN 'ambiguous'
+            ELSE 'unmapped'
+          END AS effective_mapping_status,
+          l.ordered_quantity,
+          l.current_quantity,
+          l.unfulfilled_quantity,
+          CASE
+            WHEN l.current_quantity IS NOT NULL AND l.unfulfilled_quantity IS NOT NULL
+              THEN MAX(0, MIN(l.current_quantity, l.unfulfilled_quantity))
+            ELSE MAX(0, COALESCE(l.unfulfilled_quantity, l.current_quantity, l.ordered_quantity, 0))
+          END AS candidate_quantity,
+          l.is_current,
+          po.test,
+          po.source_cancelled_at,
+          po.fulfillment_status,
+          po.source_updated_at
+        FROM platform_order_lines l
+        JOIN platform_orders po
+          ON po.id = l.order_id AND po.tenant_id = l.tenant_id
+        LEFT JOIN platform_sku_mappings pm
+          ON pm.tenant_id = l.tenant_id
+          AND pm.platform_store_id = po.platform_store_id
+          AND pm.raw_sku = l.raw_sku
+        WHERE po.id = ? AND po.tenant_id = ?
+      )
+      INSERT INTO purchase_demands (
+        id, tenant_id, platform_store_id, order_id, order_line_id, platform,
+        source_order_id, source_order_line_id, raw_sku, normalized_sku, mapped_sku_id,
+        status, ordered_quantity, current_quantity, unfulfilled_quantity, required_quantity,
+        reason_code, source_updated_at, first_seen_at, last_refreshed_at, updated_at
+      )
+      SELECT
+        id, tenant_id, platform_store_id, order_id, order_line_id, platform,
+        source_order_id, source_order_line_id, raw_sku, normalized_sku, effective_sku_id,
+        CASE
+          WHEN is_current = 0 OR test = 1 OR source_cancelled_at IS NOT NULL
+            OR UPPER(COALESCE(fulfillment_status, '')) = 'FULFILLED'
+            OR candidate_quantity <= 0 THEN 'not_required'
+          WHEN effective_sku_id IS NULL OR effective_mapping_status <> 'mapped' THEN 'needs_mapping'
+          ELSE 'open'
+        END,
+        ordered_quantity, current_quantity, unfulfilled_quantity,
+        CASE
+          WHEN is_current = 0 OR test = 1 OR source_cancelled_at IS NOT NULL
+            OR UPPER(COALESCE(fulfillment_status, '')) = 'FULFILLED'
+            OR candidate_quantity <= 0 THEN 0
+          ELSE candidate_quantity
+        END,
+        CASE
+          WHEN is_current = 0 THEN 'line_removed'
+          WHEN test = 1 THEN 'test_order'
+          WHEN source_cancelled_at IS NOT NULL THEN 'cancelled_order'
+          WHEN UPPER(COALESCE(fulfillment_status, '')) = 'FULFILLED' THEN 'fulfilled_order'
+          WHEN candidate_quantity <= 0 THEN 'no_unfulfilled_quantity'
+          WHEN effective_sku_id IS NULL AND (raw_sku IS NULL OR TRIM(raw_sku) = '') THEN 'sku_missing'
+          WHEN effective_mapping_status = 'ambiguous' THEN 'sku_ambiguous'
+          WHEN effective_sku_id IS NULL OR effective_mapping_status <> 'mapped' THEN 'sku_unmapped'
+          ELSE NULL
+        END,
+        source_updated_at, ?, ?, ?
+      FROM demand_source
+      WHERE 1 = 1
+      ON CONFLICT(tenant_id, platform_store_id, source_order_id, source_order_line_id)
+      DO UPDATE SET
+        order_id = excluded.order_id,
+        order_line_id = excluded.order_line_id,
+        platform = excluded.platform,
+        raw_sku = excluded.raw_sku,
+        normalized_sku = excluded.normalized_sku,
+        mapped_sku_id = excluded.mapped_sku_id,
+        status = excluded.status,
+        ordered_quantity = excluded.ordered_quantity,
+        current_quantity = excluded.current_quantity,
+        unfulfilled_quantity = excluded.unfulfilled_quantity,
+        required_quantity = excluded.required_quantity,
+        reason_code = excluded.reason_code,
+        source_updated_at = excluded.source_updated_at,
+        last_refreshed_at = excluded.last_refreshed_at,
+        updated_at = excluded.updated_at
+    `).bind(orderId, this.tenantId, refreshedAt, refreshedAt, refreshedAt);
   }
 }
 

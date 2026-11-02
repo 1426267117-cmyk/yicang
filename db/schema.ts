@@ -285,6 +285,41 @@ export const platformOrderLines = sqliteTable('platform_order_lines', {
   index('idx_platform_order_lines_order').on(table.orderId, table.isCurrent),
 ]);
 
+export const purchaseDemands = sqliteTable('purchase_demands', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  platformStoreId: text('platform_store_id').notNull().references(() => platformStores.id),
+  orderId: text('order_id').notNull().references(() => platformOrders.id),
+  orderLineId: text('order_line_id').notNull().references(() => platformOrderLines.id),
+  platform: text('platform').notNull(),
+  sourceOrderId: text('source_order_id').notNull(),
+  sourceOrderLineId: text('source_order_line_id').notNull(),
+  rawSku: text('raw_sku'),
+  normalizedSku: text('normalized_sku'),
+  mappedSkuId: text('mapped_sku_id').references(() => skus.id),
+  status: text('status', { enum: ['needs_mapping', 'open', 'not_required'] }).notNull(),
+  orderedQuantity: integer('ordered_quantity').notNull(),
+  currentQuantity: integer('current_quantity'),
+  unfulfilledQuantity: integer('unfulfilled_quantity'),
+  requiredQuantity: integer('required_quantity').notNull().default(0),
+  reasonCode: text('reason_code'),
+  sourceUpdatedAt: text('source_updated_at').notNull(),
+  firstSeenAt: text('first_seen_at').notNull(),
+  lastRefreshedAt: text('last_refreshed_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_purchase_demands_source').on(
+    table.tenantId,
+    table.platformStoreId,
+    table.sourceOrderId,
+    table.sourceOrderLineId,
+  ),
+  index('idx_purchase_demands_status').on(table.tenantId, table.status, table.updatedAt),
+  index('idx_purchase_demands_order').on(table.orderId),
+  index('idx_purchase_demands_mapped_sku').on(table.tenantId, table.mappedSkuId),
+  check('ck_purchase_demands_required_non_negative', sql`${table.requiredQuantity} >= 0`),
+]);
+
 export const platformRefunds = sqliteTable('platform_refunds', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),

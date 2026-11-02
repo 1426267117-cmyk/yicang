@@ -30,6 +30,28 @@ type PlatformOrder = {
   fulfillmentCount: number;
 };
 
+type PurchaseDemandStatus = 'needs_mapping' | 'open' | 'not_required';
+
+type PurchaseDemand = {
+  id: string; platform: string; storeKey: string; storeName: string; sourceOrderId: string;
+  sourceOrderName: string | null; sourceOrderLineId: string; rawSku: string | null;
+  normalizedSku: string | null; mappedSkuId: string | null; mappedSkuCode: string | null;
+  mappedSkuName: string | null; title: string | null; name: string | null;
+  orderedQuantity: number; currentQuantity: number | null; unfulfilledQuantity: number | null;
+  requiredQuantity: number; status: PurchaseDemandStatus; reasonCode: string | null;
+  sourceUpdatedAt: string; firstSeenAt: string; lastRefreshedAt: string; updatedAt: string;
+};
+
+type PurchaseDemandsPayload = {
+  ok: true;
+  readOnly: true;
+  demands: PurchaseDemand[];
+  summary: {
+    total: number; open: number; needsMapping: number; notRequired: number;
+    openQuantity: number; needsMappingQuantity: number;
+  };
+};
+
 type ShopifyStatus = {
   ok: true; apiVersion: string; readOnly: true;
   stores: Array<{
@@ -95,6 +117,16 @@ const actionLabel: Record<string, string> = {
   CREATE_ORDER: '创建订单', APPROVE_ORDER: '审核并预占', SHIP_ORDER: '确认发货', CANCEL_ORDER: '取消订单',
 };
 
+const purchaseDemandStatusLabel: Record<PurchaseDemandStatus, string> = {
+  needs_mapping: '待 SKU 映射', open: '开放需求', not_required: '无需采购',
+};
+
+const purchaseDemandReasonLabel: Record<string, string> = {
+  line_removed: '订单行已移除', test_order: '测试订单', cancelled_order: '订单已取消',
+  fulfilled_order: '订单已履约', no_unfulfilled_quantity: '无未履约数量', sku_missing: '订单行缺少 SKU',
+  sku_ambiguous: 'SKU 映射存在歧义', sku_unmapped: 'SKU 尚未映射',
+};
+
 const plannedModules: Record<Exclude<ModuleKey, 'dashboard' | 'platform' | 'orders' | 'inventory'>, {
   title: string; desc: string; source: string;
 }> = {
@@ -105,9 +137,14 @@ const plannedModules: Record<Exclude<ModuleKey, 'dashboard' | 'platform' | 'orde
   reports: { title: '数据报表', desc: '基于可信业务明细生成统一口径报表', source: '已入库的真实业务明细' },
 };
 
+const emptyPurchaseSummary: PurchaseDemandsPayload['summary'] = {
+  total: 0, open: 0, needsMapping: 0, notRequired: 0, openQuantity: 0, needsMappingQuantity: 0,
+};
+
 export default function ErpClient() {
   const [active, setActive] = useState<ModuleKey>('dashboard');
   const [payload, setPayload] = useState<ErpPayload | null>(null);
+  const [purchasePayload, setPurchasePayload] = useState<PurchaseDemandsPayload | null>(null);
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatus | null>(null);
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(true);
@@ -128,6 +165,13 @@ export default function ErpClient() {
       if (response.status === 401) { setAuthRequired(true); return; }
       if (!response.ok || !('ok' in body) || body.ok !== true) throw new Error('message' in body ? body.message : '业务数据加载失败');
       setPayload(body);
+      const purchaseResponse = await fetch('/api/purchase/demands', { cache: 'no-store' });
+      const purchaseBody = await purchaseResponse.json() as PurchaseDemandsPayload | { message?: string };
+      if (purchaseResponse.status === 401) { setAuthRequired(true); return; }
+      if (!purchaseResponse.ok || !('ok' in purchaseBody) || purchaseBody.ok !== true) {
+        throw new Error('message' in purchaseBody ? purchaseBody.message : '采购需求加载失败');
+      }
+      setPurchasePayload(purchaseBody);
       const connectorResponse = await fetch('/api/connectors/shopify/status', { cache: 'no-store' });
       if (connectorResponse.ok) setShopifyStatus(await connectorResponse.json() as ShopifyStatus);
       setAuthRequired(false);
@@ -198,6 +242,22 @@ export default function ErpClient() {
       order.fulfillmentStatus ?? '',
     ].some((value) => value.toLowerCase().includes(term)));
   }, [payload, query]);
+  const filteredPurchaseDemands = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    if (!term) return purchasePayload?.demands ?? [];
+    return (purchasePayload?.demands ?? []).filter((demand) => [
+      demand.sourceOrderName ?? demand.sourceOrderId,
+      demand.sourceOrderId,
+      demand.sourceOrderLineId,
+      demand.storeName,
+      demand.rawSku ?? '',
+      demand.normalizedSku ?? '',
+      demand.mappedSkuCode ?? '',
+      demand.title ?? demand.name ?? '',
+      purchaseDemandStatusLabel[demand.status],
+      demand.reasonCode ? (purchaseDemandReasonLabel[demand.reasonCode] ?? demand.reasonCode) : '',
+    ].some((value) => value.toLowerCase().includes(term)));
+  }, [purchasePayload, query]);
 
   function switchModule(key: ModuleKey) { setActive(key); setQuery(''); }
   function flash(message: string) { setToast(message); window.setTimeout(() => setToast(''), 2800); }
@@ -309,7 +369,8 @@ export default function ErpClient() {
             {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}
             {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
             {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} />}
-            {!['dashboard','platform','orders','inventory'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
+            {active === 'purchase' && <PurchaseDemandView demands={filteredPurchaseDemands} summary={purchasePayload?.summary ?? emptyPurchaseSummary} hasQuery={Boolean(query.trim())} />}
+            {!['dashboard','platform','orders','inventory','purchase'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
           </>
         ) : <LoadingState message={error || '暂时无法加载业务数据'} />}
       </section>
@@ -379,6 +440,22 @@ function InventoryView({ inventory, summary, hasInventoryData, hasQuery }: { inv
   </div>;
 }
 
+function PurchaseDemandView({ demands, summary, hasQuery }: {
+  demands: PurchaseDemand[];
+  summary: PurchaseDemandsPayload['summary'];
+  hasQuery: boolean;
+}) {
+  const stats = [
+    ['开放采购数量', String(summary.openQuantity), '仅已映射且未履约'],
+    ['开放需求行', String(summary.open), '可进入后续采购流程'],
+    ['待 SKU 映射', String(summary.needsMapping), `涉及 ${summary.needsMappingQuantity} 件，不可下单`],
+    ['无需采购', String(summary.notRequired), '取消、测试或已履约'],
+  ];
+  return <div className="content module-content"><div className="module-head"><div><p>Shopify 订单事实 / 自动采购投影</p><h1>采购需求池</h1><span>由同步后的真实订单行自动维护；当前仅供核对，不会向 Shopify 写入，也不会生成供应商采购单。</span></div><div className="ledger-chip">服务端只读维护</div></div><StatCards stats={stats} />
+    <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active" disabled>全部需求</button></div><span>共 {summary.total} 条历史保留记录；当前显示 {demands.length} 条</span></div><div className="table-wrap module-table"><table><thead><tr><th>店铺 / 订单</th><th>订单行</th><th>平台 SKU / ERP SKU</th><th>商品</th><th>当前 / 未履约</th><th>采购数量</th><th>需求状态</th><th>原因</th><th>订单更新时间</th></tr></thead><tbody>{demands.length ? demands.map((demand) => <tr key={demand.id}><td><strong>{demand.storeName}</strong><small className="cell-sub">{demand.sourceOrderName ?? demand.sourceOrderId}</small></td><td>{demand.sourceOrderLineId}</td><td><strong>{demand.rawSku?.trim() || '缺少 SKU'}</strong><small className="cell-sub">{demand.mappedSkuCode ? `已映射：${demand.mappedSkuCode}` : '未映射到 ERP SKU'}</small></td><td>{demand.title ?? demand.name ?? '未提供商品名'}{demand.mappedSkuName && <small className="cell-sub">{demand.mappedSkuName}</small>}</td><td>{formatOptionalQuantity(demand.currentQuantity)} / {formatOptionalQuantity(demand.unfulfilledQuantity)}</td><td><strong>{demand.requiredQuantity}</strong></td><td><span className={`status-pill ${demand.status === 'open' ? 'success' : demand.status === 'not_required' ? 'status-cancelled' : ''}`}>{purchaseDemandStatusLabel[demand.status]}</span>{demand.status === 'needs_mapping' && <small className="cell-sub">映射前不可下单</small>}</td><td>{demand.reasonCode ? (purchaseDemandReasonLabel[demand.reasonCode] ?? demand.reasonCode) : '已满足开放条件'}</td><td>{formatTime(demand.sourceUpdatedAt)}</td></tr>) : <tr><td className="empty-cell" colSpan={9}>{hasQuery ? '没有符合当前搜索条件的采购需求' : '暂无由真实平台订单生成的采购需求；系统不会填充模拟记录'}</td></tr>}</tbody></table></div><div className="pagination"><span>订单同步或 webhook 完整落库后自动幂等刷新，历史记录不会删除</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div></article>
+  </div>;
+}
+
 function PlannedModule({ module }: { module: (typeof plannedModules)[keyof typeof plannedModules] }) {
   return <div className="content module-content"><div className="module-head"><div><p>业务规划 / 数据源待接入</p><h1>{module.title}</h1><span>{module.desc}</span></div><div className="source-chip">当前无业务数据</div></div>
     <article className="card source-empty"><div className="source-empty-mark">0</div><p>真实数据源尚未接入</p><h2>这里不会展示虚构记录</h2><span>接入{module.source}后，本模块才会生成指标和明细。</span></article>
@@ -425,4 +502,8 @@ function formatExactMoney(amount: string | null, currency: string | null) {
 
 function formatTime(value: string) {
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value));
+}
+
+function formatOptionalQuantity(value: number | null) {
+  return value === null ? '未知' : String(value);
 }
