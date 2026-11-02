@@ -515,7 +515,7 @@ describe('真实订单 + MUKU 库存采购计划', () => {
         purchaseOrderLineId: purchaseOrder.purchaseOrder.lines[0].id,
         quantity: 3,
       }],
-    }, 'receive-plan-po-0001');
+    }, 'receive-plan-po-0001', { now });
     await db.prepare(`
       UPDATE purchase_receipts SET created_at = '2026-11-02T10:07:00.000Z'
       WHERE tenant_id = ? AND id = ?

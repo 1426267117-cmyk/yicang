@@ -11,6 +11,8 @@ import { sha256Hex, stableJson } from './connectors/stable';
 
 type PurchaseOrderStatus = 'draft' | 'issued' | 'partially_received' | 'received' | 'closed_short' | 'cancelled';
 
+const PURCHASE_RECEIPT_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
+
 type SupplierRow = {
   id: string;
   code: string;
@@ -206,38 +208,82 @@ export async function getProcurementWorkspaceData(db: D1Database, user: UserCont
     `).bind(user.tenantId).all<WarehouseRow>(),
     db.prepare(`${PURCHASE_ORDER_SELECT}
       WHERE po.tenant_id = ?
+        AND (
+          po.status IN ('draft', 'issued', 'partially_received')
+          OR po.id IN (
+            SELECT recent.id
+            FROM purchase_orders recent
+            WHERE recent.tenant_id = ?
+              AND recent.status NOT IN ('draft', 'issued', 'partially_received')
+            ORDER BY recent.created_at DESC, recent.id DESC
+            LIMIT 500
+          )
+        )
       GROUP BY po.id
-      ORDER BY po.created_at DESC, po.id DESC
-      LIMIT 500
-    `).bind(user.tenantId).all<PurchaseOrderRow>(),
+      ORDER BY
+        CASE WHEN po.status IN ('draft', 'issued', 'partially_received') THEN 0 ELSE 1 END,
+        CASE WHEN po.status IN ('draft', 'issued', 'partially_received') THEN po.created_at END ASC,
+        CASE WHEN po.status NOT IN ('draft', 'issued', 'partially_received') THEN po.created_at END DESC,
+        po.id DESC
+    `).bind(user.tenantId, user.tenantId).all<PurchaseOrderRow>(),
     db.prepare(`${PURCHASE_ORDER_LINE_SELECT}
       WHERE po.tenant_id = ?
-        AND po.id IN (
-          SELECT recent.id
-          FROM purchase_orders recent
-          WHERE recent.tenant_id = ?
-          ORDER BY recent.created_at DESC, recent.id DESC
-          LIMIT 500
+        AND (
+          po.status IN ('draft', 'issued', 'partially_received')
+          OR po.id IN (
+            SELECT recent.id
+            FROM purchase_orders recent
+            WHERE recent.tenant_id = ?
+              AND recent.status NOT IN ('draft', 'issued', 'partially_received')
+            ORDER BY recent.created_at DESC, recent.id DESC
+            LIMIT 500
+          )
         )
-      ORDER BY po.created_at DESC, po.id DESC, line.created_at ASC, line.id ASC
+      ORDER BY
+        CASE WHEN po.status IN ('draft', 'issued', 'partially_received') THEN 0 ELSE 1 END,
+        CASE WHEN po.status IN ('draft', 'issued', 'partially_received') THEN po.created_at END ASC,
+        CASE WHEN po.status NOT IN ('draft', 'issued', 'partially_received') THEN po.created_at END DESC,
+        po.id DESC,
+        line.created_at ASC,
+        line.id ASC
     `).bind(user.tenantId, user.tenantId).all<PurchaseOrderLineRow>(),
     db.prepare(`${PURCHASE_RECEIPT_SELECT}
       WHERE receipt.tenant_id = ?
+        AND (
+          po.status IN ('draft', 'issued', 'partially_received')
+          OR receipt.id IN (
+            SELECT recent.id
+            FROM purchase_receipts recent
+            WHERE recent.tenant_id = ?
+            ORDER BY recent.created_at DESC, recent.id DESC
+            LIMIT 500
+          )
+        )
       GROUP BY receipt.id
-      ORDER BY receipt.created_at DESC, receipt.id DESC
-      LIMIT 500
-    `).bind(user.tenantId).all<PurchaseReceiptRow>(),
+      ORDER BY
+        CASE WHEN po.status IN ('draft', 'issued', 'partially_received') THEN 0 ELSE 1 END,
+        receipt.created_at DESC,
+        receipt.id DESC
+    `).bind(user.tenantId, user.tenantId).all<PurchaseReceiptRow>(),
     db.prepare(`${PURCHASE_RECEIPT_LINE_SELECT}
       WHERE receipt.tenant_id = ?
-        AND receipt.id IN (
-          SELECT recent.id
-          FROM purchase_receipts recent
-          WHERE recent.tenant_id = ?
-          ORDER BY recent.created_at DESC, recent.id DESC
-          LIMIT 500
+        AND (
+          receipt.purchase_order_id IN (
+            SELECT active_order.id
+            FROM purchase_orders active_order
+            WHERE active_order.tenant_id = ?
+              AND active_order.status IN ('draft', 'issued', 'partially_received')
+          )
+          OR receipt.id IN (
+            SELECT recent.id
+            FROM purchase_receipts recent
+            WHERE recent.tenant_id = ?
+            ORDER BY recent.created_at DESC, recent.id DESC
+            LIMIT 500
+          )
         )
       ORDER BY receipt.created_at DESC, receipt.id DESC, line.created_at ASC, line.id ASC
-    `).bind(user.tenantId, user.tenantId).all<PurchaseReceiptLineRow>(),
+    `).bind(user.tenantId, user.tenantId, user.tenantId).all<PurchaseReceiptLineRow>(),
     db.prepare(`
       WITH tenant_scope AS (SELECT ? AS tenant_id)
       SELECT
@@ -854,13 +900,18 @@ export async function createPurchaseReceipt(
   purchaseOrderId: string,
   input: CreatePurchaseReceiptInput,
   idempotencyKey: string,
+  options: { now?: Date } = {},
 ) {
   requirePermission(user, 'inventory:receive');
   validateIdempotencyKey(idempotencyKey);
+  const clock = options.now ?? new Date();
+  if (Number.isNaN(clock.getTime())) {
+    throw new HttpError(500, '系统时间无效，暂不能登记到货', 'PURCHASE_RECEIPT_CLOCK_INVALID');
+  }
   const normalized = {
     purchaseOrderId,
     warehouseId: input.warehouseId.trim(),
-    receivedAt: input.receivedAt ? new Date(input.receivedAt).toISOString() : null,
+    receivedAt: normalizePurchaseReceiptTime(input.receivedAt, clock),
     note: input.note?.trim() || null,
     lines: [...input.lines]
       .map((line) => ({ purchaseOrderLineId: line.purchaseOrderLineId.trim(), quantity: line.quantity }))
@@ -912,7 +963,7 @@ export async function createPurchaseReceipt(
     }
   }
 
-  const now = new Date().toISOString();
+  const now = clock.toISOString();
   const receivedAt = normalized.receivedAt ?? now;
   const receiptId = crypto.randomUUID();
   const receiptNo = createDocumentNumber('SH');
@@ -1876,6 +1927,22 @@ function validateIdempotencyKey(key: string) {
   if (!key || key.length < 8 || key.length > 128) {
     throw new HttpError(400, '缺少有效的 Idempotency-Key', 'INVALID_IDEMPOTENCY_KEY');
   }
+}
+
+function normalizePurchaseReceiptTime(value: string | undefined, now: Date) {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    throw new HttpError(400, '实际到货时间格式无效', 'PURCHASE_RECEIPT_TIME_INVALID');
+  }
+  if (parsed > now.getTime() + PURCHASE_RECEIPT_FUTURE_TOLERANCE_MS) {
+    throw new HttpError(
+      400,
+      '实际到货时间不能晚于当前时间；请检查设备时间后重试',
+      'PURCHASE_RECEIPT_TIME_IN_FUTURE',
+    );
+  }
+  return new Date(parsed).toISOString();
 }
 
 async function hashPayload(input: unknown) {

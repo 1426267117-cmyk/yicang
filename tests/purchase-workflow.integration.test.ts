@@ -99,6 +99,64 @@ describe('采购申请闭环', () => {
     expect(JSON.stringify(created.request)).not.toContain(user.email);
   });
 
+  it('历史超过展示上限时仍返回全部活跃申请及完整明细，汇总保持全量', async () => {
+    const active = await createPurchaseRequest(db, user, {
+      demandIds: [demandId],
+      purchaserMemberId: 'member-buyer',
+      reviewerMemberId: 'member-reviewer',
+      note: '这张旧草稿不能被较新的历史记录挤出工作台',
+    }, 'create-request-visible-active-0001');
+    await db.prepare(`
+      UPDATE purchase_requests
+      SET created_at = '2020-01-01T00:00:00.000Z', updated_at = '2020-01-01T00:00:00.000Z'
+      WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, active.request.id).run();
+
+    await db.prepare(`
+      WITH RECURSIVE sequence(number) AS (
+        SELECT 1
+        UNION ALL
+        SELECT number + 1 FROM sequence WHERE number < 205
+      )
+      INSERT INTO purchase_requests (
+        id, tenant_id, request_no, status, purchaser_member_id, reviewer_member_id,
+        created_by_member_id, note, review_note, version, idempotency_key, request_hash,
+        last_action_key, submitted_at, reviewed_at, created_at, updated_at
+      )
+      SELECT
+        printf('request-history-%03d', number),
+        ?,
+        printf('CG-HISTORY-%03d', number),
+        'cancelled',
+        'member-buyer',
+        'member-reviewer',
+        'member-creator',
+        '历史申请',
+        NULL,
+        1,
+        printf('request-history-key-%03d', number),
+        printf('request-history-hash-%03d', number),
+        printf('request-history-action-%03d', number),
+        NULL,
+        NULL,
+        '2026-11-02T00:00:00.000Z',
+        '2026-11-02T00:00:00.000Z'
+      FROM sequence
+    `).bind(tenantId).run();
+
+    const workspace = await getPurchaseWorkspace(db, user);
+    const visibleActive = workspace.requests.find((request) => request.id === active.request.id);
+    expect(visibleActive).toEqual(expect.objectContaining({ status: 'draft', lineCount: 1 }));
+    expect(visibleActive?.lines).toHaveLength(1);
+    expect(workspace.requests.filter((request) => request.status === 'cancelled')).toHaveLength(200);
+    expect(workspace.requests).toHaveLength(201);
+    expect(workspace.requestSummary).toEqual(expect.objectContaining({
+      total: 206,
+      draft: 1,
+      cancelled: 205,
+    }));
+  });
+
   it('草稿可提交和批准，源需求后续变化会保留申请并标记关注', async () => {
     const created = await createPurchaseRequest(db, user, {
       demandIds: [demandId], purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer',

@@ -131,7 +131,15 @@ export async function getPurchaseWorkspace(
 ) {
   requirePermission(user, 'purchase:read');
   const demandPayload = await getPurchaseDemands(db, user);
-  const [allocations, requestRows, lineRows, members, skuOptions, availability] = await Promise.all([
+  const [
+    allocations,
+    requestRows,
+    lineRows,
+    requestSummaryRow,
+    members,
+    skuOptions,
+    availability,
+  ] = await Promise.all([
     db.prepare(`
       WITH active_allocations AS (
         SELECT purchase_demand_id, SUM(requested_quantity) AS quantity
@@ -164,15 +172,81 @@ export async function getPurchaseWorkspace(
       .all<{ purchase_demand_id: string; allocated_quantity: number }>(),
     db.prepare(`${PURCHASE_REQUEST_SELECT}
       WHERE pr.tenant_id = ?
+        AND (
+          pr.status IN ('draft', 'pending_review', 'approved')
+          OR pr.id IN (
+            SELECT recent.id
+            FROM purchase_requests recent
+            WHERE recent.tenant_id = ?
+              AND recent.status NOT IN ('draft', 'pending_review', 'approved')
+            ORDER BY recent.created_at DESC, recent.id DESC
+            LIMIT 200
+          )
+        )
       GROUP BY pr.id
-      ORDER BY pr.created_at DESC
-      LIMIT 200
-    `).bind(user.tenantId).all<PurchaseRequestRow>(),
+      ORDER BY
+        CASE WHEN pr.status IN ('draft', 'pending_review', 'approved') THEN 0 ELSE 1 END,
+        CASE WHEN pr.status IN ('draft', 'pending_review', 'approved') THEN pr.created_at END ASC,
+        CASE WHEN pr.status NOT IN ('draft', 'pending_review', 'approved') THEN pr.created_at END DESC,
+        pr.id DESC
+    `).bind(user.tenantId, user.tenantId).all<PurchaseRequestRow>(),
     db.prepare(`${PURCHASE_REQUEST_LINE_SELECT}
       WHERE pr.tenant_id = ?
-      ORDER BY pr.created_at DESC, line.created_at ASC
-      LIMIT 2000
-    `).bind(user.tenantId).all<PurchaseRequestLineRow>(),
+        AND (
+          pr.status IN ('draft', 'pending_review', 'approved')
+          OR pr.id IN (
+            SELECT recent.id
+            FROM purchase_requests recent
+            WHERE recent.tenant_id = ?
+              AND recent.status NOT IN ('draft', 'pending_review', 'approved')
+            ORDER BY recent.created_at DESC, recent.id DESC
+            LIMIT 200
+          )
+        )
+      ORDER BY
+        CASE WHEN pr.status IN ('draft', 'pending_review', 'approved') THEN 0 ELSE 1 END,
+        CASE WHEN pr.status IN ('draft', 'pending_review', 'approved') THEN pr.created_at END ASC,
+        CASE WHEN pr.status NOT IN ('draft', 'pending_review', 'approved') THEN pr.created_at END DESC,
+        pr.id DESC,
+        line.created_at ASC,
+        line.id ASC
+    `).bind(user.tenantId, user.tenantId).all<PurchaseRequestLineRow>(),
+    db.prepare(`
+      SELECT
+        COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN pr.status = 'draft' THEN 1 ELSE 0 END), 0) AS draft,
+        COALESCE(SUM(CASE WHEN pr.status = 'pending_review' THEN 1 ELSE 0 END), 0) AS pending_review,
+        COALESCE(SUM(CASE WHEN pr.status = 'approved' THEN 1 ELSE 0 END), 0) AS approved,
+        COALESCE(SUM(CASE WHEN pr.status = 'rejected' THEN 1 ELSE 0 END), 0) AS rejected,
+        COALESCE(SUM(CASE WHEN pr.status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled,
+        COALESCE(SUM(CASE WHEN pr.status = 'approved' AND EXISTS (
+          SELECT 1
+          FROM purchase_request_lines summary_line
+          LEFT JOIN purchase_demands summary_demand
+            ON summary_demand.id = summary_line.purchase_demand_id
+            AND summary_demand.tenant_id = summary_line.tenant_id
+          WHERE summary_line.tenant_id = pr.tenant_id
+            AND summary_line.request_id = pr.id
+            AND summary_line.active = 1
+            AND (
+              summary_demand.id IS NULL
+              OR summary_demand.status <> 'open'
+              OR summary_demand.mapped_sku_id <> summary_line.sku_id
+              OR summary_demand.required_quantity < summary_line.requested_quantity
+              OR summary_demand.source_updated_at <> summary_line.source_updated_at
+            )
+        ) THEN 1 ELSE 0 END), 0) AS needs_attention
+      FROM purchase_requests pr
+      WHERE pr.tenant_id = ?
+    `).bind(user.tenantId).first<{
+      total: number;
+      draft: number;
+      pending_review: number;
+      approved: number;
+      rejected: number;
+      cancelled: number;
+      needs_attention: number;
+    }>(),
     db.prepare(`
       SELECT id, auth_user_id, display_name, role
       FROM members
@@ -240,13 +314,13 @@ export async function getPurchaseWorkspace(
   const requests = requestRows.results.map((row) => mapRequest(row, linesByRequest.get(row.id) ?? []));
   const demandSummary = demandPayload.summary;
   const requestSummary = {
-    total: requests.length,
-    draft: requests.filter((request) => request.status === 'draft').length,
-    pendingReview: requests.filter((request) => request.status === 'pending_review').length,
-    approved: requests.filter((request) => request.status === 'approved').length,
-    rejected: requests.filter((request) => request.status === 'rejected').length,
-    cancelled: requests.filter((request) => request.status === 'cancelled').length,
-    needsAttention: requests.filter((request) => request.needsAttention).length,
+    total: Number(requestSummaryRow?.total ?? 0),
+    draft: Number(requestSummaryRow?.draft ?? 0),
+    pendingReview: Number(requestSummaryRow?.pending_review ?? 0),
+    approved: Number(requestSummaryRow?.approved ?? 0),
+    rejected: Number(requestSummaryRow?.rejected ?? 0),
+    cancelled: Number(requestSummaryRow?.cancelled ?? 0),
+    needsAttention: Number(requestSummaryRow?.needs_attention ?? 0),
   };
   const procurement = await getProcurementWorkspaceData(db, user);
 

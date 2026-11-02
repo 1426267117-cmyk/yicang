@@ -183,6 +183,69 @@ describe('正式采购单与到货入库闭环', () => {
     expect(workspace.procurementSummary.suppliers).toBe(501);
   });
 
+  it('历史采购单超过上限时仍返回全部活跃采购单及完整明细', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-VISIBILITY', name: '活跃单据可见性供应商',
+    }, 'supplier-visibility-0001');
+    const active = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      currency: 'USD',
+      lineCosts: [{
+        purchaseRequestLineId: await requestLineId(db, approvedRequestId),
+        unitCostMinor: 100,
+      }],
+    }, 'purchase-order-visible-active-0001');
+    await db.prepare(`
+      UPDATE purchase_orders
+      SET created_at = '2020-01-01T00:00:00.000Z', updated_at = '2020-01-01T00:00:00.000Z'
+      WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, active.purchaseOrder.id).run();
+
+    await db.prepare(`
+      WITH RECURSIVE sequence(number) AS (
+        SELECT 1
+        UNION ALL
+        SELECT number + 1 FROM sequence WHERE number < 505
+      )
+      INSERT INTO purchase_orders (
+        id, tenant_id, order_no, purchase_request_id, supplier_id, status,
+        currency, note, action_note, version, idempotency_key, request_hash,
+        last_action_key, created_by_member_id, issued_at, closed_at, cancelled_at,
+        created_at, updated_at
+      )
+      SELECT
+        printf('purchase-order-history-%03d', number),
+        ?,
+        printf('CGD-HISTORY-%03d', number),
+        ?,
+        ?,
+        'cancelled',
+        'USD',
+        '历史采购单',
+        '历史已取消',
+        1,
+        printf('purchase-order-history-key-%03d', number),
+        printf('purchase-order-history-hash-%03d', number),
+        printf('purchase-order-history-action-%03d', number),
+        'member-creator',
+        NULL,
+        NULL,
+        '2026-11-02T00:00:00.000Z',
+        '2026-11-02T00:00:00.000Z',
+        '2026-11-02T00:00:00.000Z'
+      FROM sequence
+    `).bind(tenantId, approvedRequestId, supplier.supplier.id).run();
+
+    const workspace = await getProcurementWorkspaceData(db, user);
+    const visibleActive = workspace.purchaseOrders.find((order) => order.id === active.purchaseOrder.id);
+    expect(visibleActive).toEqual(expect.objectContaining({ status: 'draft', lineCount: 1 }));
+    expect(visibleActive?.lines).toHaveLength(1);
+    expect(workspace.purchaseOrders.filter((order) => order.status === 'cancelled')).toHaveLength(500);
+    expect(workspace.purchaseOrders).toHaveLength(501);
+    expect(workspace.procurementSummary.draftOrders).toBe(1);
+  });
+
   it('供应商和采购单幂等创建，且同一批准申请不能重复转单', async () => {
     const supplier = await createSupplier(db, user, {
       code: ' sup-01 ', name: '测试供应商', note: '真实供应商主数据',
@@ -693,6 +756,49 @@ describe('正式采购单与到货入库闭环', () => {
       otherTenantViewer,
       created.purchaseOrder.id,
     )).rejects.toMatchObject({ code: 'PURCHASE_ORDER_NOT_FOUND' });
+  });
+
+  it('收货时间无效或明显在未来时拒绝，历史补录会规范为 UTC', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-RECEIPT-TIME', name: '收货时间测试供应商',
+    }, 'supplier-receipt-time-0001');
+    const created = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
+    }, 'purchase-order-receipt-time-0001');
+    const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'issue', note: '收货时间校验测试',
+    }, 'purchase-order-receipt-time-issue-0001');
+    const lineId = issued.purchaseOrder.lines[0].id;
+    const clock = new Date('2026-11-02T10:00:00.000Z');
+
+    await expect(createPurchaseReceipt(db, user, created.purchaseOrder.id, {
+      warehouseId: 'warehouse-main',
+      receivedAt: 'not-a-date',
+      lines: [{ purchaseOrderLineId: lineId, quantity: 1 }],
+    }, 'purchase-receipt-invalid-time-0001', { now: clock })).rejects.toMatchObject({
+      status: 400,
+      code: 'PURCHASE_RECEIPT_TIME_INVALID',
+    });
+
+    await expect(createPurchaseReceipt(db, user, created.purchaseOrder.id, {
+      warehouseId: 'warehouse-main',
+      receivedAt: '2026-11-02T10:05:01.000Z',
+      lines: [{ purchaseOrderLineId: lineId, quantity: 1 }],
+    }, 'purchase-receipt-future-time-0001', { now: clock })).rejects.toMatchObject({
+      status: 400,
+      code: 'PURCHASE_RECEIPT_TIME_IN_FUTURE',
+    });
+
+    const historical = await createPurchaseReceipt(db, user, created.purchaseOrder.id, {
+      warehouseId: 'warehouse-main',
+      receivedAt: '2026-10-01T08:30:00+08:00',
+      note: '按真实送货单补录',
+      lines: [{ purchaseOrderLineId: lineId, quantity: 1 }],
+    }, 'purchase-receipt-historical-time-0001', { now: clock });
+    expect(historical.receipt.receivedAt).toBe('2026-10-01T00:30:00.000Z');
+    expect(historical.receipt.createdAt).toBe(clock.toISOString());
   });
 
   it('确认下单后支持分批收货，幂等重放不重复增加库存', async () => {
