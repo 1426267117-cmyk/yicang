@@ -77,28 +77,57 @@ export async function requestContext(request: Request) {
      FROM members WHERE tenant_id = ? AND auth_user_id = ? LIMIT 1`,
   ).bind(TENANT_ID, identity.id).first<{ auth_user_id: string; email: string; display_name: string; role: Role }>();
 
-  if (!member) {
-    let role: Role = 'admin';
-    if (!developmentOpenAccess) {
-      const bootstrapOwnerEmail = accessPolicy.bootstrapOwnerEmail;
-      const ownerAdmin = bootstrapOwnerEmail
-        ? await db.prepare(`
-            SELECT 1 AS present FROM members
-            WHERE tenant_id = ? AND role = 'admin' AND lower(email) = ?
-            LIMIT 1
-          `).bind(TENANT_ID, bootstrapOwnerEmail).first<{ present: number }>()
-        : null;
-      const needsOwnerBootstrap = !ownerAdmin;
+  let bootstrapOwnerNeedsCreation = false;
+  if (!developmentOpenAccess) {
+    const bootstrapOwnerEmail = accessPolicy.bootstrapOwnerEmail;
+    if (!bootstrapOwnerEmail) {
+      throw new HttpError(
+        403,
+        '正式管理员尚未配置，请先在 ERP 精确邮箱名单中设置首位 owner 账号',
+        'ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED',
+      );
+    }
+
+    const ownerAdmin = await db.prepare(`
+      SELECT 1 AS present FROM members
+      WHERE tenant_id = ? AND role = 'admin' AND lower(email) = ?
+      LIMIT 1
+    `).bind(TENANT_ID, bootstrapOwnerEmail).first<{ present: number }>();
+
+    if (!ownerAdmin) {
       const isBootstrapOwner = bootstrapOwnerEmail === identity.email.trim().toLowerCase();
-      if (needsOwnerBootstrap && !isBootstrapOwner) {
+      if (!isBootstrapOwner) {
         throw new HttpError(
           403,
           '正式管理员尚未初始化，请先使用 ERP 精确邮箱名单中的首位 owner 账号访问',
           'ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED',
         );
       }
-      role = needsOwnerBootstrap ? 'admin' : 'operator';
+      if (member) {
+        await db.prepare(`
+          UPDATE members SET email = ?, display_name = ?, role = 'admin'
+          WHERE tenant_id = ? AND auth_user_id = ?
+            AND (role <> 'admin' OR lower(email) <> ?)
+        `).bind(
+          identity.email,
+          identity.displayName,
+          TENANT_ID,
+          identity.id,
+          bootstrapOwnerEmail,
+        ).run();
+        member = await db.prepare(
+          `SELECT auth_user_id, email, display_name, role
+           FROM members WHERE tenant_id = ? AND auth_user_id = ? LIMIT 1`,
+        ).bind(TENANT_ID, identity.id)
+          .first<{ auth_user_id: string; email: string; display_name: string; role: Role }>();
+      } else if (!member) {
+        bootstrapOwnerNeedsCreation = true;
+      }
     }
+  }
+
+  if (!member) {
+    const role: Role = developmentOpenAccess || bootstrapOwnerNeedsCreation ? 'admin' : 'operator';
     await db.prepare(
       `INSERT OR IGNORE INTO members
        (id, tenant_id, auth_user_id, email, display_name, role, created_at)

@@ -111,12 +111,14 @@ describe('ERP 请求访问边界', () => {
 
   it('仅配置域名且尚无正式管理员时拒绝自动抢占管理员', async () => {
     runtimeEnv.ERP_ALLOWED_EMAIL_DOMAINS = '@muku.example';
+    await seedMember('existing-id', 'existing@muku.example', 'admin');
 
-    await expect(requestContext(erpRequest('staff-id', 'staff@muku.example'))).rejects.toMatchObject({
+    await expect(requestContext(erpRequest('existing-id', 'existing@muku.example'))).rejects.toMatchObject({
       status: 403,
       code: 'ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED',
     });
-    expect(await memberCount()).toBe(0);
+    expect(await memberCount()).toBe(1);
+    expect(await storedRole('existing-id')).toBe('admin');
   });
 
   it('允许公司域账号加入已有工作区并默认成为操作员', async () => {
@@ -150,6 +152,14 @@ describe('ERP 请求访问边界', () => {
     runtimeEnv.ERP_ALLOWED_EMAILS = 'owner@example.com';
     runtimeEnv.ERP_ALLOWED_EMAIL_DOMAINS = 'allowed.example';
 
+    await expect(requestContext(
+      erpRequest('domain-dev-id', 'staff@allowed.example'),
+    )).rejects.toMatchObject({
+      status: 403,
+      code: 'ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED',
+    });
+    expect(await storedRole('domain-dev-id')).toBe('admin');
+
     const owner = await requestContext(erpRequest('owner-id', 'owner@example.com'));
     expect(owner.user.role).toBe('admin');
     expect(await storedRole('owner-id')).toBe('admin');
@@ -161,8 +171,24 @@ describe('ERP 请求访问边界', () => {
     expect(await memberCount()).toBe(2);
   });
 
+  it('首位精确 owner 已有非管理员记录时原地幂等提升为管理员', async () => {
+    runtimeEnv.ERP_ALLOWED_EMAILS = 'owner@example.com';
+    await seedMember('owner-id', 'owner@example.com', 'viewer');
+
+    const [first, replay] = await Promise.all([
+      requestContext(erpRequest('owner-id', 'owner@example.com')),
+      requestContext(erpRequest('owner-id', 'OWNER@example.com')),
+    ]);
+
+    expect(first.user.role).toBe('admin');
+    expect(replay.user.role).toBe('admin');
+    expect(await storedRole('owner-id')).toBe('admin');
+    expect(await memberCount()).toBe(1);
+  });
+
   it('正式模式使用数据库中已有成员角色', async () => {
-    runtimeEnv.ERP_ALLOWED_EMAILS = 'viewer@example.com';
+    runtimeEnv.ERP_ALLOWED_EMAILS = 'owner@example.com,viewer@example.com';
+    await seedMember('owner-id', 'owner@example.com', 'admin');
     await seedMember('viewer-id', 'viewer@example.com', 'viewer');
 
     const { user } = await requestContext(erpRequest('viewer-id', 'viewer@example.com'));
