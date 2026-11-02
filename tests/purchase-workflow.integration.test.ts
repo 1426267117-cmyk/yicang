@@ -325,6 +325,12 @@ describe('采购申请闭环', () => {
       currency: 'CNY',
     }, 'purchase-order-withdraw-guard-0001');
 
+    await expect(db.prepare(`
+      UPDATE purchase_requests
+      SET status = 'cancelled', updated_at = '2026-11-02T12:00:00.000Z'
+      WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, created.request.id).run()).rejects.toThrow(/PURCHASE_REQUEST_HAS_ACTIVE_ORDER/);
+
     await expect(executePurchaseRequestAction(db, buyerUser, created.request.id, {
       action: 'withdraw', note: '不应允许撤回',
     }, 'withdraw-request-with-order-0001')).rejects.toMatchObject({
@@ -411,6 +417,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0009_shocking_iron_lad.sql',
     '../drizzle/0013_guarded_withdrawal.sql',
     '../drizzle/0014_clever_silvermane.sql',
+    '../drizzle/0015_true_tigra.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

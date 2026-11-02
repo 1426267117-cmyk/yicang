@@ -133,6 +133,38 @@ describe('正式采购单与到货入库闭环', () => {
     expect(Number(audit?.count)).toBe(1);
   });
 
+  it('工作台列表达到上限时汇总仍按全租户数据计算', async () => {
+    await db.prepare(`
+      WITH RECURSIVE sequence(number) AS (
+        SELECT 1
+        UNION ALL
+        SELECT number + 1 FROM sequence WHERE number < 501
+      )
+      INSERT INTO suppliers (
+        id, tenant_id, code, name, note, active, version,
+        idempotency_key, request_hash, created_by_member_id, created_at, updated_at
+      )
+      SELECT
+        printf('supplier-boundary-%03d', number),
+        ?,
+        printf('BOUNDARY-%03d', number),
+        printf('边界供应商 %03d', number),
+        NULL,
+        1,
+        1,
+        printf('supplier-boundary-key-%03d', number),
+        printf('supplier-boundary-hash-%03d', number),
+        'member-creator',
+        '2026-11-02T00:00:00.000Z',
+        '2026-11-02T00:00:00.000Z'
+      FROM sequence
+    `).bind(tenantId).run();
+
+    const workspace = await getProcurementWorkspaceData(db, user);
+    expect(workspace.suppliers).toHaveLength(500);
+    expect(workspace.procurementSummary.suppliers).toBe(501);
+  });
+
   it('供应商和采购单幂等创建，且同一批准申请不能重复转单', async () => {
     const supplier = await createSupplier(db, user, {
       code: ' sup-01 ', name: '测试供应商', note: '真实供应商主数据',
@@ -326,6 +358,124 @@ describe('正式采购单与到货入库闭环', () => {
       receivedOrders: 1, receiptCount: 2, receivedQuantity: 5, pendingReceiptQuantity: 0,
     }));
     expect(workspace.purchaseReceipts).toHaveLength(2);
+  });
+
+  it('指定采购负责人可追加式关闭未到余量，原因、数量和历史均保留', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-CLOSE-SHORT', name: '短到关闭测试供应商',
+    }, 'supplier-close-short-0001');
+    const created = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+    }, 'purchase-order-close-short-0001');
+    const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'issue', note: '已向供应商下单',
+    }, 'purchase-order-close-short-issue-0001');
+
+    await expect(executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'close', note: '   ',
+    }, 'purchase-order-close-short-empty-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_ORDER_CLOSE_REASON_REQUIRED',
+    });
+    await expect(executePurchaseOrderAction(db, user, created.purchaseOrder.id, {
+      action: 'close', note: '供应商缺货',
+    }, 'purchase-order-close-short-owner-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_ORDER_PURCHASER_REQUIRED',
+    });
+    await expect(db.prepare(`
+      UPDATE purchase_orders
+      SET status = 'closed_short', closed_at = ?, action_note = NULL, updated_at = ?
+      WHERE tenant_id = ? AND id = ?
+    `).bind(
+      '2026-11-02T11:00:00.000Z',
+      '2026-11-02T11:00:00.000Z',
+      tenantId,
+      created.purchaseOrder.id,
+    ).run()).rejects.toThrow(/PURCHASE_ORDER_CLOSE_REASON_REQUIRED/);
+
+    const closed = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'close', note: '供应商确认余下 5 件无法交付',
+    }, 'purchase-order-close-short-action-0001');
+    expect(closed.replayed).toBe(false);
+    expect(closed.purchaseOrder).toEqual(expect.objectContaining({
+      status: 'closed_short',
+      orderedQuantity: 5,
+      receivedQuantity: 0,
+      actionNote: '供应商确认余下 5 件无法交付',
+    }));
+    expect(closed.purchaseOrder.closedAt).toEqual(expect.any(String));
+
+    const replay = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'close', note: '供应商确认余下 5 件无法交付',
+    }, 'purchase-order-close-short-action-0001');
+    expect(replay.replayed).toBe(true);
+    expect(replay.purchaseOrder.status).toBe('closed_short');
+    await expect(createPurchaseReceipt(db, user, created.purchaseOrder.id, {
+      warehouseId: 'warehouse-main',
+      lines: [{ purchaseOrderLineId: issued.purchaseOrder.lines[0].id, quantity: 1 }],
+    }, 'purchase-receipt-after-close-short-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_ORDER_NOT_RECEIVABLE',
+    });
+
+    const facts = await db.prepare(`
+      SELECT
+        (SELECT active FROM purchase_request_lines
+          WHERE tenant_id = ? AND request_id = ? LIMIT 1) AS request_line_active,
+        (SELECT COUNT(*) FROM audit_logs
+          WHERE tenant_id = ? AND entity_id = ? AND action = 'CLOSE_PURCHASE_ORDER_REMAINDER') AS close_audits
+    `).bind(
+      tenantId,
+      approvedRequestId,
+      tenantId,
+      created.purchaseOrder.id,
+    ).first<{ request_line_active: number; close_audits: number }>();
+    expect(Number(facts?.request_line_active)).toBe(0);
+    expect(Number(facts?.close_audits)).toBe(1);
+
+    const workspace = await getProcurementWorkspaceData(db, user);
+    expect(workspace.procurementSummary).toEqual(expect.objectContaining({
+      closedShortOrders: 1,
+      pendingReceiptQuantity: 0,
+    }));
+  });
+
+  it('部分到货后关闭只释放未满足需求，后续冲正不重新打开采购单', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-CLOSE-CORRECT', name: '短到冲正测试供应商',
+    }, 'supplier-close-correct-0001');
+    const created = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+    }, 'purchase-order-close-correct-0001');
+    const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'issue',
+    }, 'purchase-order-close-correct-issue-0001');
+    const receipt = await createPurchaseReceipt(db, user, created.purchaseOrder.id, {
+      warehouseId: 'warehouse-main',
+      lines: [{ purchaseOrderLineId: issued.purchaseOrder.lines[0].id, quantity: 2 }],
+    }, 'purchase-order-close-correct-receipt-0001');
+    expect(receipt.purchaseOrder.status).toBe('partially_received');
+
+    const closed = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'close', note: '尾批取消，只保留实际到货',
+    }, 'purchase-order-close-correct-action-0001');
+    expect(closed.purchaseOrder).toEqual(expect.objectContaining({
+      status: 'closed_short', orderedQuantity: 5, receivedQuantity: 2,
+    }));
+
+    const corrected = await createPurchaseReceiptCorrection(db, user, receipt.receipt.id, {
+      reason: '已到货中有 1 件错录',
+      lines: [{ purchaseReceiptLineId: receipt.receipt.lines[0].id, quantity: 1 }],
+    }, 'purchase-order-close-correct-correction-0001');
+    expect(corrected.purchaseOrder).toEqual(expect.objectContaining({
+      status: 'closed_short', orderedQuantity: 5, receivedQuantity: 1,
+    }));
+    expect(await inventoryOnHand(db)).toBe(1);
+    const line = await db.prepare(`
+      SELECT active FROM purchase_request_lines
+      WHERE tenant_id = ? AND request_id = ? LIMIT 1
+    `).bind(tenantId, approvedRequestId).first<{ active: number }>();
+    expect(Number(line?.active)).toBe(0);
   });
 
   it('收货错录通过追加冲正恢复库存和采购单状态，原收货记录保持不变', async () => {
@@ -707,6 +857,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0008_nifty_mimic.sql',
     '../drizzle/0009_shocking_iron_lad.sql',
     '../drizzle/0014_clever_silvermane.sql',
+    '../drizzle/0015_true_tigra.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

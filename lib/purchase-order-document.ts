@@ -183,6 +183,7 @@ function statusLabel(status: PurchaseOrder['status']) {
     issued: '已确认下单',
     partially_received: '部分到货',
     received: '已全部到货',
+    closed_short: '短到关闭',
     cancelled: '已取消',
   } as const)[status];
 }

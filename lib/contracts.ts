@@ -137,8 +137,16 @@ export const createPurchaseOrderSchema = z.object({
 });
 
 export const purchaseOrderActionSchema = z.object({
-  action: z.enum(['issue', 'cancel']),
+  action: z.enum(['issue', 'cancel', 'close']),
   note: z.string().trim().max(500).optional(),
+}).superRefine((value, context) => {
+  if (value.action === 'close' && !value.note) {
+    context.addIssue({
+      code: 'custom',
+      message: '关闭采购单剩余量时必须填写原因',
+      path: ['note'],
+    });
+  }
 });
 
 const purchaseReceiptLineSchema = z.object({

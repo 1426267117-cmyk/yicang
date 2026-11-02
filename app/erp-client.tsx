@@ -75,7 +75,7 @@ type PurchaseSupplier = {
   version: number; createdAt: string; updatedAt: string;
 };
 type PurchaseWarehouse = { id: string; code: string; name: string };
-type PurchaseOrderStatus = 'draft' | 'issued' | 'partially_received' | 'received' | 'cancelled';
+type PurchaseOrderStatus = 'draft' | 'issued' | 'partially_received' | 'received' | 'closed_short' | 'cancelled';
 type PurchaseOrderLine = {
   id: string; purchaseRequestLineId: string; skuId: string; skuCode: string; skuName: string;
   orderedQuantity: number; receivedQuantity: number; remainingQuantity: number;
@@ -84,8 +84,8 @@ type PurchaseOrderLine = {
 type PurchaseOrder = {
   id: string; orderNo: string; purchaseRequestId: string; purchaseRequestNo: string;
   supplier: Pick<PurchaseSupplier, 'id' | 'code' | 'name'>; status: PurchaseOrderStatus;
-  currency: string | null; note: string | null; version: number; lineCount: number;
-  orderedQuantity: number; receivedQuantity: number; issuedAt: string | null; cancelledAt: string | null;
+  currency: string | null; note: string | null; actionNote: string | null; version: number; lineCount: number;
+  orderedQuantity: number; receivedQuantity: number; issuedAt: string | null; closedAt: string | null; cancelledAt: string | null;
   createdAt: string; updatedAt: string; lines: PurchaseOrderLine[];
 };
 type PurchaseReceiptLine = {
@@ -95,11 +95,13 @@ type PurchaseReceiptLine = {
 type PurchaseReceipt = {
   id: string; receiptNo: string; purchaseOrderId: string; purchaseOrderNo: string;
   warehouse: PurchaseWarehouse; status: 'posted'; note: string | null; receivedAt: string;
-  createdAt: string; lineCount: number; totalQuantity: number; lines: PurchaseReceiptLine[];
+  createdAt: string; lineCount: number; totalQuantity: number; originalQuantity?: number;
+  correctedQuantity?: number; netQuantity?: number; correctionCount?: number; lines: PurchaseReceiptLine[];
 };
 type ProcurementSummary = {
   suppliers: number; draftOrders: number; issuedOrders: number; partiallyReceivedOrders: number;
-  receivedOrders: number; pendingReceiptQuantity: number; receiptCount: number; receivedQuantity: number;
+  receivedOrders: number; closedShortOrders: number; pendingReceiptQuantity: number; receiptCount: number;
+  correctionCount: number; correctedQuantity: number; receivedQuantity: number;
 };
 
 type PurchaseDemandSummary = {
@@ -445,7 +447,8 @@ const purchaseRequestStatusLabel: Record<PurchaseRequestStatus, string> = {
 };
 
 const purchaseOrderStatusLabel: Record<PurchaseOrderStatus, string> = {
-  draft: '草稿', issued: '已下单', partially_received: '部分到货', received: '全部到货', cancelled: '已取消',
+  draft: '草稿', issued: '已下单', partially_received: '部分到货', received: '全部到货',
+  closed_short: '短到关闭', cancelled: '已取消',
 };
 
 type PurchaseTab = 'planning' | 'pending' | 'mapping' | 'requests' | 'approved' | 'orders' | 'received' | 'history';
@@ -470,7 +473,8 @@ const emptyPurchaseRequestSummary: PurchaseRequestSummary = {
 
 const emptyProcurementSummary: ProcurementSummary = {
   suppliers: 0, draftOrders: 0, issuedOrders: 0, partiallyReceivedOrders: 0,
-  receivedOrders: 0, pendingReceiptQuantity: 0, receiptCount: 0, receivedQuantity: 0,
+  receivedOrders: 0, closedShortOrders: 0, pendingReceiptQuantity: 0, receiptCount: 0,
+  correctionCount: 0, correctedQuantity: 0, receivedQuantity: 0,
 };
 
 export default function ErpClient() {
@@ -1328,22 +1332,32 @@ export default function ErpClient() {
     } finally { setPurchaseBusy(''); }
   }
 
-  async function runPurchaseOrderAction(order: PurchaseOrder, action: 'issue' | 'cancel') {
+  async function runPurchaseOrderAction(order: PurchaseOrder, action: 'issue' | 'cancel' | 'close') {
+    const closeReason = action === 'close'
+      ? window.prompt(`请输入关闭 ${order.orderNo} 剩余未到数量的原因（必填，历史会永久保留）：`)?.trim()
+      : undefined;
+    if (action === 'close' && !closeReason) return;
     const message = action === 'issue'
       ? `确认将 ${order.orderNo} 标记为已向 ${order.supplier.name} 下单？`
-      : `确认取消 ${order.orderNo}？采购单和操作历史会保留。`;
+      : action === 'close'
+        ? `确认关闭 ${order.orderNo} 的剩余未到数量？已到货、原采购数量和关闭原因都会保留。`
+        : `确认取消 ${order.orderNo}？采购单和操作历史会保留。`;
     if (!window.confirm(message)) return;
     setPurchaseBusy(`${order.id}:${action}`); setError('');
     try {
       const response = await fetch(`/api/purchase/orders/${order.id}/actions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
-        body: JSON.stringify({ action }),
+        body: JSON.stringify({ action, note: closeReason }),
       });
       const body = await response.json() as { message?: string };
       if (!response.ok) throw new Error(body.message ?? '采购单操作失败');
       await loadData();
-      flash(action === 'issue' ? '采购单已确认下单，等待到货' : '采购单已取消，历史仍然保留');
+      flash(action === 'issue'
+        ? '采购单已确认下单，等待到货'
+        : action === 'close'
+          ? '剩余未到数量已关闭，已到货和操作历史仍然保留'
+          : '采购单已取消，历史仍然保留');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '采购单操作失败');
     } finally { setPurchaseBusy(''); }
@@ -1591,7 +1605,7 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
   openPurchaseOrder: (request: PurchaseRequest) => void; openReceipt: (order: PurchaseOrder) => void;
   can: (permission: Permission) => boolean; busy: string;
   runAction: (request: PurchaseRequest, action: PurchaseRequestAction) => void;
-  runOrderAction: (order: PurchaseOrder, action: 'issue' | 'cancel') => void; hasQuery: boolean;
+  runOrderAction: (order: PurchaseOrder, action: 'issue' | 'cancel' | 'close') => void; hasQuery: boolean;
 }) {
   const summary = workspace?.summary ?? emptyPurchaseSummary;
   const requestSummary = workspace?.requestSummary ?? emptyPurchaseRequestSummary;
@@ -1608,7 +1622,7 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
   ]));
   const approvedRequests = requests.filter((request) => request.status === 'approved' && !activeRequestIds.has(request.id));
   const activeOrders = purchaseOrders.filter((order) => ['draft', 'issued', 'partially_received'].includes(order.status));
-  const closedOrders = purchaseOrders.filter((order) => ['received', 'cancelled'].includes(order.status));
+  const closedOrders = purchaseOrders.filter((order) => ['received', 'closed_short', 'cancelled'].includes(order.status));
   const historyRequests = requests.filter((request) => ['rejected', 'cancelled'].includes(request.status));
   const pendingDemandCount = (workspace?.demands ?? demands).filter(
     (demand) => demand.status === 'open' && demandAvailableQuantity(demand) > 0,
@@ -1768,7 +1782,7 @@ function PurchaseOrderTable({ orders, assignedPurchaseRequestIds, purchaserNames
   orders: PurchaseOrder[]; can: (permission: Permission) => boolean; busy: string;
   assignedPurchaseRequestIds: Set<string>; purchaserNamesByRequestId: Map<string, string>;
   openReceipt: (order: PurchaseOrder) => void;
-  runAction: (order: PurchaseOrder, action: 'issue' | 'cancel') => void; emptyMessage: string;
+  runAction: (order: PurchaseOrder, action: 'issue' | 'cancel' | 'close') => void; emptyMessage: string;
 }) {
   return <div className="table-wrap module-table"><table className="purchase-order-table"><thead><tr><th>正式采购单</th><th>供应商</th><th>申请单</th><th>采购 / 已到 / 未到</th><th>金额信息</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{orders.length ? orders.map((order) => {
     const remaining = Math.max(0, order.orderedQuantity - order.receivedQuantity);
@@ -1780,12 +1794,28 @@ function PurchaseOrderTable({ orders, assignedPurchaseRequestIds, purchaserNames
       return Number.isSafeInteger(lineAmount) && Number.isSafeInteger(nextTotal) ? nextTotal : null;
     }, order.lines.length ? 0 : null);
     const documentUrl = `/api/purchase/orders/${encodeURIComponent(order.id)}/document`;
-    return <tr key={order.id}><td><strong>{order.orderNo}</strong><small className="cell-sub">{order.lineCount} 行 · v{order.version}</small></td><td><strong>{order.supplier.name}</strong><small className="cell-sub">{order.supplier.code}</small></td><td>{order.purchaseRequestNo}</td><td><strong>{order.orderedQuantity} / {order.receivedQuantity} / {remaining}</strong><small className="cell-sub">采购 / 已到 / 未到</small></td><td>{totalMinor !== null && order.currency ? formatMoney(totalMinor, order.currency) : '单价待补齐'}<small className="cell-sub">{order.currency ?? '币种未指定'}</small></td><td><span className={`status-pill purchase-order-status-${order.status}`}>{purchaseOrderStatusLabel[order.status]}</span></td><td>{formatTime(order.updatedAt)}</td><td><div className="row-actions">{can('purchase:read') && <><a href={documentUrl} target="_blank" rel="noreferrer">打印采购单</a><a href={`${documentUrl}?format=csv`} download>导出 CSV</a></>}{order.status === 'draft' && assignedPurchaser && can('purchase:order:issue') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(order, 'issue')}>{busy === `${order.id}:issue` ? '处理中…' : '确认下单'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(order, 'cancel')}>取消采购单</button></>}{order.status === 'draft' && !assignedPurchaser && <span className="terminal-label">等待 {purchaserNamesByRequestId.get(order.purchaseRequestId) ?? '采购负责人'} 确认</span>}{['issued','partially_received'].includes(order.status) && can('inventory:receive') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openReceipt(order)}>登记到货</button>}{['received','cancelled'].includes(order.status) && <span className="terminal-label">历史已保留</span>}</div></td></tr>;
+    return <tr key={order.id}>
+      <td><strong>{order.orderNo}</strong><small className="cell-sub">{order.lineCount} 行 · v{order.version}</small></td>
+      <td><strong>{order.supplier.name}</strong><small className="cell-sub">{order.supplier.code}</small></td>
+      <td>{order.purchaseRequestNo}</td>
+      <td><strong>{order.orderedQuantity} / {order.receivedQuantity} / {remaining}</strong><small className="cell-sub">采购 / 已到 / 未到</small></td>
+      <td>{totalMinor !== null && order.currency ? formatMoney(totalMinor, order.currency) : '单价待补齐'}<small className="cell-sub">{order.currency ?? '币种未指定'}</small></td>
+      <td><span className={`status-pill purchase-order-status-${order.status}`}>{purchaseOrderStatusLabel[order.status]}</span>{order.status === 'closed_short' && <small className="cell-sub">原因：{order.actionNote ?? '未记录'}</small>}</td>
+      <td>{formatTime(order.updatedAt)}</td>
+      <td><div className="row-actions">
+        {can('purchase:read') && <><a href={documentUrl} target="_blank" rel="noreferrer">打印采购单</a><a href={`${documentUrl}?format=csv`} download>导出 CSV</a></>}
+        {order.status === 'draft' && assignedPurchaser && can('purchase:order:issue') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(order, 'issue')}>{busy === `${order.id}:issue` ? '处理中…' : '确认下单'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(order, 'cancel')}>取消采购单</button></>}
+        {order.status === 'draft' && !assignedPurchaser && <span className="terminal-label">等待 {purchaserNamesByRequestId.get(order.purchaseRequestId) ?? '采购负责人'} 确认</span>}
+        {['issued','partially_received'].includes(order.status) && can('inventory:receive') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openReceipt(order)}>登记到货</button>}
+        {['issued','partially_received'].includes(order.status) && assignedPurchaser && can('purchase:order:issue') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(order, 'close')}>{busy === `${order.id}:close` ? '关闭中…' : '关闭剩余量'}</button>}
+        {['received','closed_short','cancelled'].includes(order.status) && <span className="terminal-label">历史已保留</span>}
+      </div></td>
+    </tr>;
   }) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
 function PurchaseReceiptTable({ receipts, emptyMessage }: { receipts: PurchaseReceipt[]; emptyMessage: string }) {
-  return <div className="table-wrap module-table"><table className="purchase-receipt-table"><thead><tr><th>到货单</th><th>采购单</th><th>入库仓</th><th>明细 / 件数</th><th>SKU</th><th>到货时间</th><th>状态</th></tr></thead><tbody>{receipts.length ? receipts.map((receipt) => <tr key={receipt.id}><td><strong>{receipt.receiptNo}</strong><small className="cell-sub">{receipt.note ?? '不可变入库记录'}</small></td><td>{receipt.purchaseOrderNo}</td><td><strong>{receipt.warehouse.name}</strong><small className="cell-sub">{receipt.warehouse.code}</small></td><td>{receipt.lineCount} 行 / {receipt.totalQuantity} 件</td><td>{receipt.lines.slice(0, 2).map((line) => line.skuCode).join('、')}{receipt.lines.length > 2 ? ` 等 ${receipt.lines.length} 项` : ''}</td><td>{formatTime(receipt.receivedAt)}</td><td><span className="status-pill success">已入库</span></td></tr>) : <tr><td className="empty-cell" colSpan={7}>{emptyMessage}</td></tr>}</tbody></table></div>;
+  return <div className="table-wrap module-table"><table className="purchase-receipt-table"><thead><tr><th>到货单</th><th>采购单</th><th>入库仓</th><th>明细 / 件数</th><th>SKU</th><th>到货时间</th><th>状态</th></tr></thead><tbody>{receipts.length ? receipts.map((receipt) => <tr key={receipt.id}><td><strong>{receipt.receiptNo}</strong><small className="cell-sub">{receipt.note ?? '不可变入库记录'}</small></td><td>{receipt.purchaseOrderNo}</td><td><strong>{receipt.warehouse.name}</strong><small className="cell-sub">{receipt.warehouse.code}</small></td><td>{receipt.lineCount} 行 / 净 {receipt.netQuantity ?? receipt.totalQuantity} 件{Boolean(receipt.correctedQuantity) && <small className="cell-sub">原收 {receipt.originalQuantity ?? receipt.totalQuantity} · 已冲正 {receipt.correctedQuantity}</small>}</td><td>{receipt.lines.slice(0, 2).map((line) => line.skuCode).join('、')}{receipt.lines.length > 2 ? ` 等 ${receipt.lines.length} 项` : ''}</td><td>{formatTime(receipt.receivedAt)}</td><td><span className="status-pill success">已入库</span></td></tr>) : <tr><td className="empty-cell" colSpan={7}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
 function PlannedModule({ module }: { module: (typeof plannedModules)[keyof typeof plannedModules] }) {
@@ -2330,9 +2360,12 @@ function summarizeProcurement(orders: PurchaseOrder[], receipts: PurchaseReceipt
     issuedOrders: orders.filter((order) => order.status === 'issued').length,
     partiallyReceivedOrders: orders.filter((order) => order.status === 'partially_received').length,
     receivedOrders: orders.filter((order) => order.status === 'received').length,
+    closedShortOrders: orders.filter((order) => order.status === 'closed_short').length,
     pendingReceiptQuantity: orders.filter((order) => ['issued', 'partially_received'].includes(order.status)).reduce((sum, order) => sum + Math.max(0, order.orderedQuantity - order.receivedQuantity), 0),
     receiptCount: receipts.length,
-    receivedQuantity: receipts.reduce((sum, receipt) => sum + receipt.totalQuantity, 0),
+    correctionCount: receipts.reduce((sum, receipt) => sum + Number(receipt.correctionCount ?? 0), 0),
+    correctedQuantity: receipts.reduce((sum, receipt) => sum + Number(receipt.correctedQuantity ?? 0), 0),
+    receivedQuantity: receipts.reduce((sum, receipt) => sum + Number(receipt.netQuantity ?? receipt.totalQuantity), 0),
   };
 }
 

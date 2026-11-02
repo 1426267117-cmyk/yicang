@@ -1054,6 +1054,13 @@ function translatePurchaseDatabaseError(error: unknown) {
   if (message.includes('INVALID_PURCHASE_REQUEST_TRANSITION')) {
     return new HttpError(409, '当前采购申请状态不允许执行该操作', 'INVALID_PURCHASE_REQUEST_TRANSITION');
   }
+  if (message.includes('PURCHASE_REQUEST_HAS_ACTIVE_ORDER')) {
+    return new HttpError(
+      409,
+      '该申请已生成有效采购单，不能撤回；请先按真实供应商状态处理采购单',
+      'PURCHASE_REQUEST_HAS_ACTIVE_ORDER',
+    );
+  }
   if (message.includes('PURCHASE_REQUEST_HAS_NO_ACTIVE_LINES')) {
     return new HttpError(409, '采购申请没有可提交的需求', 'PURCHASE_REQUEST_EMPTY');
   }

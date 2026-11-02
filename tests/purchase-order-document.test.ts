@@ -168,6 +168,7 @@ function sourceOrder(overrides: Partial<SourceOrder> = {}): SourceOrder {
     orderedQuantity: 5,
     receivedQuantity: 1,
     issuedAt: '2026-11-02T08:30:00.000Z',
+    closedAt: null,
     cancelledAt: null,
     createdAt: '2026-11-02T08:00:00.000Z',
     updatedAt: '2026-11-02T09:00:00.000Z',

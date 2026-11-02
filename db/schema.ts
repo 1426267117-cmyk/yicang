@@ -466,7 +466,7 @@ export const purchaseOrders = sqliteTable('purchase_orders', {
   purchaseRequestId: text('purchase_request_id').notNull().references(() => purchaseRequests.id),
   supplierId: text('supplier_id').notNull().references(() => suppliers.id),
   status: text('status', {
-    enum: ['draft', 'issued', 'partially_received', 'received', 'cancelled'],
+    enum: ['draft', 'issued', 'partially_received', 'received', 'closed_short', 'cancelled'],
   }).notNull(),
   currency: text('currency'),
   note: text('note'),
@@ -477,6 +477,7 @@ export const purchaseOrders = sqliteTable('purchase_orders', {
   lastActionKey: text('last_action_key').notNull(),
   createdByMemberId: text('created_by_member_id').notNull().references(() => members.id),
   issuedAt: text('issued_at'),
+  closedAt: text('closed_at'),
   cancelledAt: text('cancelled_at'),
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),

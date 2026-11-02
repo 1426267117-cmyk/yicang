@@ -30,6 +30,7 @@ type DemandRow = {
 };
 type ActiveRequestLineRow = {
   id: string;
+  active: number;
   purchase_demand_id: string;
   sku_id: string;
   requested_quantity: number;
@@ -189,6 +190,7 @@ export async function getPurchasePlanning(
     db.prepare(`
       SELECT
         line.id,
+        line.active,
         line.purchase_demand_id,
         line.sku_id,
         line.requested_quantity,
@@ -226,7 +228,8 @@ export async function getPurchasePlanning(
       LEFT JOIN purchase_order_lines pol
         ON pol.purchase_order_id = po.id AND pol.purchase_request_line_id = line.id
         AND pol.tenant_id = line.tenant_id
-      WHERE line.tenant_id = ? AND line.active = 1
+      WHERE line.tenant_id = ?
+        AND (line.active = 1 OR po.status = 'closed_short')
         AND (? IS NULL OR line.request_id <> ?)
       ORDER BY line.id
     `).bind(
@@ -353,7 +356,11 @@ export async function getPurchasePlanning(
   const assignmentsBySku = groupBy(uniqueAssignments, (assignment) => assignment.skuId);
   const demandsBySku = groupBy(demandResult.results, (demand) => demand.mapped_sku_id);
   const activeLinesBySku = groupBy(activeLineResult.results, (line) => line.sku_id);
-  const activeLineByDemand = new Map(activeLineResult.results.map((line) => [line.purchase_demand_id, line]));
+  const activeLineByDemand = new Map(
+    activeLineResult.results
+      .filter((line) => line.active === 1)
+      .map((line) => [line.purchase_demand_id, line]),
+  );
   const policyBySku = new Map(policyResult.results.map((policy) => [policy.sku_id, policy]));
   const inventoryConfirmationBySku = new Map(
     inventoryConfirmationResult.results.map((confirmation) => [confirmation.sku_id, confirmation]),
@@ -532,7 +539,7 @@ async function buildPlanningRow(input: {
   const safetyDays = Number(policy?.safety_days ?? DEFAULT_SAFETY_DAYS);
   const orderDemandQty = input.demands.reduce((sum, demand) => sum + Number(demand.required_quantity), 0);
   const coveringRequestLines = input.activeLines.filter(
-    (line) => line.purchase_demand_status === 'open',
+    (line) => line.active === 1 && line.purchase_demand_status === 'open',
   );
   const erpPurchaseChainCoverageQty = coveringRequestLines.reduce(
     (sum, line) => sum + (line.purchase_order_status
@@ -758,6 +765,7 @@ async function buildPlanningRow(input: {
     })),
     purchaseChain: input.activeLines.map((line) => ({
       id: line.id,
+      active: line.active === 1,
       demandId: line.purchase_demand_id,
       requestedQuantity: Number(line.requested_quantity),
       purchaseDemandStatus: line.purchase_demand_status,
@@ -821,7 +829,7 @@ async function buildPlanningRow(input: {
     mukuInboundQty,
     inventoryScope: 'all_muku_warehouses' as const,
     erpPurchaseChainCoverageQty,
-    erpOpenPoQty: input.activeLines.reduce(
+    erpOpenPoQty: input.activeLines.filter((line) => line.active === 1).reduce(
       (sum, line) => sum + Math.max(0, Number(line.ordered_quantity ?? 0) - Number(line.received_quantity ?? 0)),
       0,
     ),

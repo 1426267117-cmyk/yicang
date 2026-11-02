@@ -527,6 +527,21 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     }));
     expect(afterFullCorrection.rows[0].sourceTimes.latestReceiptAt).toBeNull();
     expect(afterFullCorrection.rows[0].blockers).not.toContain('receipt_not_reflected_in_muku');
+
+    await executePurchaseOrderAction(db, buyerUser, purchaseOrder.purchaseOrder.id, {
+      action: 'close', note: '供应商无法继续交付，释放剩余需求重新安排',
+    }, 'close-plan-po-remainder-0001');
+    const afterClose = await getPurchasePlanning(db, user, { now });
+    expect(afterClose.rows[0]).toEqual(expect.objectContaining({
+      erpPurchaseChainCoverageQty: 0,
+      erpOpenPoQty: 0,
+      recommendedQty: 6,
+    }));
+    expect(afterClose.rows[0].conversion).toEqual(expect.objectContaining({
+      eligibleOrderQty: 6,
+      blockedRecommendationQty: 0,
+      conversionBlocked: false,
+    }));
   });
 
   it('人工库存确认过期后拒绝提交既有采购建议草稿', async () => {
@@ -1030,6 +1045,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0011_dazzling_menace.sql',
     '../drizzle/0012_square_slyde.sql',
     '../drizzle/0014_clever_silvermane.sql',
+    '../drizzle/0015_true_tigra.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

@@ -8,7 +8,7 @@ import type {
 import { HttpError, requirePermission, type UserContext } from './db';
 import { sha256Hex, stableJson } from './connectors/stable';
 
-type PurchaseOrderStatus = 'draft' | 'issued' | 'partially_received' | 'received' | 'cancelled';
+type PurchaseOrderStatus = 'draft' | 'issued' | 'partially_received' | 'received' | 'closed_short' | 'cancelled';
 
 type SupplierRow = {
   id: string;
@@ -44,6 +44,7 @@ type PurchaseOrderRow = {
   version: number;
   request_hash?: string;
   issued_at: string | null;
+  closed_at: string | null;
   cancelled_at: string | null;
   created_at: string;
   updated_at: string;
@@ -116,9 +117,31 @@ type ReceiptTargetLineRow = {
   received_quantity: number;
 };
 
+type ProcurementSummaryRow = {
+  suppliers: number;
+  draft_orders: number;
+  issued_orders: number;
+  partially_received_orders: number;
+  received_orders: number;
+  closed_short_orders: number;
+  pending_receipt_quantity: number;
+  receipt_count: number;
+  correction_count: number;
+  corrected_quantity: number;
+  received_quantity: number;
+};
+
 export async function getProcurementWorkspaceData(db: D1Database, user: UserContext) {
   requirePermission(user, 'purchase:read');
-  const [supplierRows, warehouseRows, orderRows, orderLineRows, receiptRows, receiptLineRows] = await Promise.all([
+  const [
+    supplierRows,
+    warehouseRows,
+    orderRows,
+    orderLineRows,
+    receiptRows,
+    receiptLineRows,
+    summaryRow,
+  ] = await Promise.all([
     db.prepare(`
       SELECT id, code, name, note, active, version, created_at, updated_at
       FROM suppliers
@@ -136,25 +159,76 @@ export async function getProcurementWorkspaceData(db: D1Database, user: UserCont
     db.prepare(`${PURCHASE_ORDER_SELECT}
       WHERE po.tenant_id = ?
       GROUP BY po.id
-      ORDER BY po.created_at DESC
+      ORDER BY po.created_at DESC, po.id DESC
       LIMIT 500
     `).bind(user.tenantId).all<PurchaseOrderRow>(),
     db.prepare(`${PURCHASE_ORDER_LINE_SELECT}
       WHERE po.tenant_id = ?
-      ORDER BY po.created_at DESC, line.created_at ASC
-      LIMIT 5000
-    `).bind(user.tenantId).all<PurchaseOrderLineRow>(),
+        AND po.id IN (
+          SELECT recent.id
+          FROM purchase_orders recent
+          WHERE recent.tenant_id = ?
+          ORDER BY recent.created_at DESC, recent.id DESC
+          LIMIT 500
+        )
+      ORDER BY po.created_at DESC, po.id DESC, line.created_at ASC, line.id ASC
+    `).bind(user.tenantId, user.tenantId).all<PurchaseOrderLineRow>(),
     db.prepare(`${PURCHASE_RECEIPT_SELECT}
       WHERE receipt.tenant_id = ?
       GROUP BY receipt.id
-      ORDER BY receipt.created_at DESC
+      ORDER BY receipt.created_at DESC, receipt.id DESC
       LIMIT 500
     `).bind(user.tenantId).all<PurchaseReceiptRow>(),
     db.prepare(`${PURCHASE_RECEIPT_LINE_SELECT}
       WHERE receipt.tenant_id = ?
-      ORDER BY receipt.created_at DESC, line.created_at ASC
-      LIMIT 5000
-    `).bind(user.tenantId).all<PurchaseReceiptLineRow>(),
+        AND receipt.id IN (
+          SELECT recent.id
+          FROM purchase_receipts recent
+          WHERE recent.tenant_id = ?
+          ORDER BY recent.created_at DESC, recent.id DESC
+          LIMIT 500
+        )
+      ORDER BY receipt.created_at DESC, receipt.id DESC, line.created_at ASC, line.id ASC
+    `).bind(user.tenantId, user.tenantId).all<PurchaseReceiptLineRow>(),
+    db.prepare(`
+      WITH tenant_scope AS (SELECT ? AS tenant_id)
+      SELECT
+        (SELECT COUNT(*) FROM suppliers supplier, tenant_scope scope
+          WHERE supplier.tenant_id = scope.tenant_id AND supplier.active = 1) AS suppliers,
+        (SELECT COUNT(*) FROM purchase_orders purchase_order, tenant_scope scope
+          WHERE purchase_order.tenant_id = scope.tenant_id AND purchase_order.status = 'draft') AS draft_orders,
+        (SELECT COUNT(*) FROM purchase_orders purchase_order, tenant_scope scope
+          WHERE purchase_order.tenant_id = scope.tenant_id AND purchase_order.status = 'issued') AS issued_orders,
+        (SELECT COUNT(*) FROM purchase_orders purchase_order, tenant_scope scope
+          WHERE purchase_order.tenant_id = scope.tenant_id AND purchase_order.status = 'partially_received') AS partially_received_orders,
+        (SELECT COUNT(*) FROM purchase_orders purchase_order, tenant_scope scope
+          WHERE purchase_order.tenant_id = scope.tenant_id AND purchase_order.status = 'received') AS received_orders,
+        (SELECT COUNT(*) FROM purchase_orders purchase_order, tenant_scope scope
+          WHERE purchase_order.tenant_id = scope.tenant_id AND purchase_order.status = 'closed_short') AS closed_short_orders,
+        (SELECT COALESCE(SUM(order_line.ordered_quantity - order_line.received_quantity), 0)
+          FROM purchase_order_lines order_line
+          JOIN purchase_orders purchase_order
+            ON purchase_order.id = order_line.purchase_order_id
+            AND purchase_order.tenant_id = order_line.tenant_id,
+          tenant_scope scope
+          WHERE order_line.tenant_id = scope.tenant_id
+            AND purchase_order.status IN ('issued', 'partially_received')) AS pending_receipt_quantity,
+        (SELECT COUNT(*) FROM purchase_receipts receipt, tenant_scope scope
+          WHERE receipt.tenant_id = scope.tenant_id) AS receipt_count,
+        (SELECT COUNT(*) FROM purchase_receipt_corrections correction, tenant_scope scope
+          WHERE correction.tenant_id = scope.tenant_id AND correction.status = 'posted') AS correction_count,
+        (SELECT COALESCE(SUM(correction_line.quantity), 0)
+          FROM purchase_receipt_correction_lines correction_line
+          JOIN purchase_receipt_corrections correction
+            ON correction.id = correction_line.correction_id
+            AND correction.tenant_id = correction_line.tenant_id,
+          tenant_scope scope
+          WHERE correction_line.tenant_id = scope.tenant_id
+            AND correction.status = 'posted') AS corrected_quantity,
+        (SELECT COALESCE(SUM(order_line.received_quantity), 0)
+          FROM purchase_order_lines order_line, tenant_scope scope
+          WHERE order_line.tenant_id = scope.tenant_id) AS received_quantity
+    `).bind(user.tenantId).first<ProcurementSummaryRow>(),
   ]);
 
   const linesByOrder = new Map<string, ReturnType<typeof mapPurchaseOrderLine>[]>();
@@ -178,18 +252,17 @@ export async function getProcurementWorkspaceData(db: D1Database, user: UserCont
     purchaseOrders,
     purchaseReceipts,
     procurementSummary: {
-      suppliers: supplierRows.results.filter((supplier) => supplier.active === 1).length,
-      draftOrders: purchaseOrders.filter((order) => order.status === 'draft').length,
-      issuedOrders: purchaseOrders.filter((order) => order.status === 'issued').length,
-      partiallyReceivedOrders: purchaseOrders.filter((order) => order.status === 'partially_received').length,
-      receivedOrders: purchaseOrders.filter((order) => order.status === 'received').length,
-      pendingReceiptQuantity: purchaseOrders
-        .filter((order) => order.status === 'issued' || order.status === 'partially_received')
-        .reduce((total, order) => total + order.lines.reduce((sum, line) => sum + line.remainingQuantity, 0), 0),
-      receiptCount: purchaseReceipts.length,
-      correctionCount: purchaseReceipts.reduce((total, receipt) => total + receipt.correctionCount, 0),
-      correctedQuantity: purchaseReceipts.reduce((total, receipt) => total + receipt.correctedQuantity, 0),
-      receivedQuantity: purchaseReceipts.reduce((total, receipt) => total + receipt.netQuantity, 0),
+      suppliers: Number(summaryRow?.suppliers ?? 0),
+      draftOrders: Number(summaryRow?.draft_orders ?? 0),
+      issuedOrders: Number(summaryRow?.issued_orders ?? 0),
+      partiallyReceivedOrders: Number(summaryRow?.partially_received_orders ?? 0),
+      receivedOrders: Number(summaryRow?.received_orders ?? 0),
+      closedShortOrders: Number(summaryRow?.closed_short_orders ?? 0),
+      pendingReceiptQuantity: Number(summaryRow?.pending_receipt_quantity ?? 0),
+      receiptCount: Number(summaryRow?.receipt_count ?? 0),
+      correctionCount: Number(summaryRow?.correction_count ?? 0),
+      correctedQuantity: Number(summaryRow?.corrected_quantity ?? 0),
+      receivedQuantity: Number(summaryRow?.received_quantity ?? 0),
     },
   };
 }
@@ -469,8 +542,15 @@ export async function executePurchaseOrderAction(
   requirePermission(user, 'purchase:order:issue');
   validateIdempotencyKey(idempotencyKey);
   const normalized = { action: input.action, note: input.note?.trim() || null };
+  if (normalized.action === 'close' && !normalized.note) {
+    throw new HttpError(400, '关闭采购单剩余量时必须填写原因', 'PURCHASE_ORDER_CLOSE_REASON_REQUIRED');
+  }
   const requestHash = await hashPayload(normalized);
-  const auditAction = input.action === 'issue' ? 'ISSUE_PURCHASE_ORDER' : 'CANCEL_PURCHASE_ORDER';
+  const auditAction = input.action === 'issue'
+    ? 'ISSUE_PURCHASE_ORDER'
+    : input.action === 'close'
+      ? 'CLOSE_PURCHASE_ORDER_REMAINDER'
+      : 'CANCEL_PURCHASE_ORDER';
   await assertPurchaseOrderPurchaser(db, user, purchaseOrderId);
   const replay = await readActionReplay(db, user.tenantId, purchaseOrderId, auditAction, requestHash, idempotencyKey);
   if (replay) return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: true };
@@ -489,7 +569,10 @@ export async function executePurchaseOrderAction(
     supplier_active: number;
   }>();
   if (!current) throw new HttpError(404, '采购单不存在或不在当前数据范围内', 'PURCHASE_ORDER_NOT_FOUND');
-  if (current.status !== 'draft') {
+  const validCurrentStatus = input.action === 'close'
+    ? current.status === 'issued' || current.status === 'partially_received'
+    : current.status === 'draft';
+  if (!validCurrentStatus) {
     throw new HttpError(409, '当前采购单状态不允许执行该操作', 'INVALID_PURCHASE_ORDER_TRANSITION');
   }
   if (input.action === 'issue') {
@@ -506,7 +589,11 @@ export async function executePurchaseOrderAction(
     assertRequestLinesCurrent(lines);
   }
 
-  const nextStatus: PurchaseOrderStatus = input.action === 'issue' ? 'issued' : 'cancelled';
+  const nextStatus: PurchaseOrderStatus = input.action === 'issue'
+    ? 'issued'
+    : input.action === 'close'
+      ? 'closed_short'
+      : 'cancelled';
   const now = new Date().toISOString();
   const beforeJson = stableJson({ status: current.status, version: current.version });
   const afterJson = stableJson({
@@ -515,17 +602,21 @@ export async function executePurchaseOrderAction(
     version: current.version + 1,
     note: normalized.note,
   });
-  let results: D1Result<unknown>[];
   try {
-    results = await db.batch([
+    await db.batch([
       db.prepare(`
         UPDATE purchase_orders
         SET status = ?, action_note = ?, version = version + 1,
             last_action_key = ?,
             issued_at = CASE WHEN ? = 'issued' THEN ? ELSE issued_at END,
+            closed_at = CASE WHEN ? = 'closed_short' THEN ? ELSE closed_at END,
             cancelled_at = CASE WHEN ? = 'cancelled' THEN ? ELSE cancelled_at END,
             updated_at = ?
-        WHERE id = ? AND tenant_id = ? AND status = 'draft' AND version = ?
+        WHERE id = ? AND tenant_id = ? AND version = ?
+          AND (
+            (? = 'close' AND status IN ('issued', 'partially_received'))
+            OR (? <> 'close' AND status = 'draft')
+          )
       `).bind(
         nextStatus,
         normalized.note,
@@ -534,10 +625,14 @@ export async function executePurchaseOrderAction(
         now,
         nextStatus,
         now,
+        nextStatus,
+        now,
         now,
         purchaseOrderId,
         user.tenantId,
         current.version,
+        input.action,
+        input.action,
       ),
       auditStatement(db, user, {
         action: auditAction,
@@ -563,7 +658,15 @@ export async function executePurchaseOrderAction(
     }
     throw translateProcurementError(error);
   }
-  if (Number(results[0]?.meta?.changes ?? 0) !== 1) {
+  const applied = await readActionReplay(
+    db,
+    user.tenantId,
+    purchaseOrderId,
+    auditAction,
+    requestHash,
+    idempotencyKey,
+  );
+  if (!applied) {
     throw new HttpError(409, '采购单已被其他操作更新，请刷新后重试', 'CONCURRENT_UPDATE');
   }
   return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: false };
@@ -797,6 +900,7 @@ const PURCHASE_ORDER_SELECT = `
     po.action_note,
     po.version,
     po.issued_at,
+    po.closed_at,
     po.cancelled_at,
     po.created_at,
     po.updated_at,
@@ -907,6 +1011,7 @@ function mapPurchaseOrder(row: PurchaseOrderRow, lines: ReturnType<typeof mapPur
     orderedQuantity: Number(row.ordered_quantity),
     receivedQuantity: Number(row.received_quantity),
     issuedAt: row.issued_at,
+    closedAt: row.closed_at,
     cancelledAt: row.cancelled_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -1063,7 +1168,7 @@ async function assertPurchaseOrderPurchaser(
   if (order.purchaser_member_id !== actorMemberId) {
     throw new HttpError(
       403,
-      '只有来源申请指定的采购负责人可以确认或取消采购单',
+      '只有来源申请指定的采购负责人可以确认、取消或关闭采购单剩余量',
       'PURCHASE_ORDER_PURCHASER_REQUIRED',
     );
   }
@@ -1222,6 +1327,9 @@ function translateProcurementError(error: unknown): unknown {
   }
   if (message.includes('INVALID_PURCHASE_ORDER_TRANSITION')) {
     return new HttpError(409, '当前采购单状态不允许执行该操作', 'INVALID_PURCHASE_ORDER_TRANSITION');
+  }
+  if (message.includes('PURCHASE_ORDER_CLOSE_REASON_REQUIRED')) {
+    return new HttpError(400, '关闭采购单剩余量时必须填写原因', 'PURCHASE_ORDER_CLOSE_REASON_REQUIRED');
   }
   if (message.includes('PURCHASE_ORDER_HAS_RECEIPTS')) {
     return new HttpError(409, '采购单已有收货记录，不能取消', 'PURCHASE_ORDER_HAS_RECEIPTS');
