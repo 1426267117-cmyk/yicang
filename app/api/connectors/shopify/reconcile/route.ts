@@ -77,7 +77,7 @@ export async function handleShopifyReconcileRequest(
         recommendedIntervalMinutes: 15,
       },
     }, {
-      status: result.ok ? 200 : 207,
+      status: result.noConfiguredStores ? 422 : result.ok ? 200 : 207,
       headers: NO_STORE_HEADERS,
     });
   } catch (error) {

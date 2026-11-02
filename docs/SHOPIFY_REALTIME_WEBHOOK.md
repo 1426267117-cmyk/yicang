@@ -77,7 +77,7 @@ Authorization: Bearer <ERP_INTERNAL_JOB_TOKEN>
 Content-Type: application/json
 ```
 
-空请求体或 `{}` 会处理 ERP D1 中已经保存授权的全部 Shopify 店铺；不会尝试未授权的候选店铺。需要限制本次店铺或页数时可传：
+空请求体或 `{}` 会处理 ERP D1 中已经保存 OAuth 授权的店铺，以及服务端已配置 `ADMIN_ACCESS_TOKEN` 的兼容店铺；不会尝试仅配置 Client ID/Secret 但尚未授权的候选店铺。同一店铺两种凭证同时存在时，租户绑定的 D1 OAuth 授权优先且只同步一次。需要限制本次店铺或页数时可传：
 
 ```json
 {
@@ -88,6 +88,6 @@ Content-Type: application/json
 
 首次同步没有完成水位时，任务会为该店返回 `SHOPIFY_INITIAL_RANGE_REQUIRED`，应先通过人工同步明确历史起始时间完成回补。已有水位后，每次定时任务按更新时间增量读取并自动重扫重叠窗口；重复运行由现有主键和内容哈希保证不重复制造订单。访问令牌临近或已经过期时，入口会复用加密刷新凭证和刷新租约自动轮换，响应、日志和文档均不得包含访问令牌或刷新令牌。
 
-任务逐店隔离：一家店失败不会抹掉其他店的成功结果。全成功返回 HTTP 200；存在失败或明确请求了尚未授权的店铺时返回 HTTP 207。响应只包含 `storeKey`、分页数、订单新增/更新/未变化计数、完成时间以及安全错误码和可重试标记，不包含租户 ID、店铺域名、客户资料或凭证。
+任务逐店隔离：一家店失败不会抹掉其他店的成功结果。全成功返回 HTTP 200；存在失败或明确请求了尚未授权的店铺时返回 HTTP 207。如果当前范围没有任何 D1 OAuth 或服务端 Token 目标，则返回 HTTP 422，并明确给出 `noConfiguredStores: true` 和 `skipReason: "SHOPIFY_NO_CONFIGURED_STORES"`，不会把空跑伪装成同步成功。响应只包含 `storeKey`、分页数、订单新增/更新/未变化计数、完成时间以及安全错误码和可重试标记，不包含租户 ID、店铺域名、客户资料或凭证。
 
 `ERP_SHOPIFY_RECONCILE_SCHEDULE_CONFIGURED=true` 只用于声明外部调度器已经实际配置并验证。端点代码存在并不代表平台已经自动调用；未配置时保持 `false`。调度器使用的 `ERP_INTERNAL_JOB_TOKEN` 必须作为服务端 Secret 管理，不能写入前端、仓库、命令历史或聊天。

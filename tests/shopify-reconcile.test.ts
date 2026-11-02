@@ -40,6 +40,8 @@ describe('Shopify 内部定时对账入口', () => {
   it('认证后接受店铺子集并返回无缓存的安全调度状态', async () => {
     const reconcile = vi.fn(async () => ({
       ok: true,
+      noConfiguredStores: false,
+      skipReason: null,
       storesChecked: 1,
       synced: [{
         storeKey: 'bizfurniz' as const,
@@ -76,6 +78,30 @@ describe('Shopify 内部定时对账入口', () => {
       scheduling: { externalScheduleConfigured: false, recommendedIntervalMinutes: 15 },
     });
     expect(JSON.stringify(payload)).not.toContain(internalToken);
+  });
+
+  it('没有任何可用授权时明确返回未配置状态', async () => {
+    const reconcile = vi.fn(async () => ({
+      ok: false,
+      noConfiguredStores: true,
+      skipReason: 'SHOPIFY_NO_CONFIGURED_STORES' as const,
+      storesChecked: 0,
+      synced: [],
+      skipped: [],
+      failed: [],
+    }));
+    const response = await handleShopifyReconcileRequest(
+      authorizedRequest({}),
+      { DB: {} as D1Database, ERP_INTERNAL_JOB_TOKEN: internalToken },
+      { ensureDatabase: async () => {}, reconcile },
+    );
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      noConfiguredStores: true,
+      skipReason: 'SHOPIFY_NO_CONFIGURED_STORES',
+      storesChecked: 0,
+    });
   });
 
   it('拒绝未知店铺、额外参数和未配置内部密钥', async () => {
@@ -131,6 +157,8 @@ describe('Shopify 已授权店铺定时对账编排', () => {
     });
     expect(result).toEqual({
       ok: false,
+      noConfiguredStores: false,
+      skipReason: null,
       storesChecked: 2,
       synced: [expect.objectContaining({ storeKey: 'bizfurniz', ordersUpdated: 1 })],
       skipped: [],
@@ -142,6 +170,87 @@ describe('Shopify 已授权店铺定时对账编排', () => {
     expect(serialized).not.toContain('secret-access-token');
     expect(serialized).not.toContain('myshopify.com');
     expect(serialized).not.toContain('customer');
+  });
+
+  it('默认把服务端 ADMIN_ACCESS_TOKEN 店铺纳入目标', async () => {
+    const resolveConfig = vi.fn(async () => config('bizfurniz'));
+    const runSync = vi.fn(async () => syncResult('bizfurniz'));
+    const result = await reconcileStoredShopifyOrders({
+      db: {} as D1Database,
+      runtimeEnv: {
+        SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'secret-environment-access-token',
+      },
+      requestUrl: 'https://erp.example/api/connectors/shopify/reconcile',
+      maxPages: 20,
+      dependencies: {
+        loadTargets: async () => [],
+        resolveConfig,
+        runSync: runSync as never,
+      },
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      noConfiguredStores: false,
+      skipReason: null,
+      storesChecked: 1,
+    });
+    expect(resolveConfig).toHaveBeenCalledWith(expect.objectContaining({
+      tenantId: 'tenant_yicang_primary',
+      storeKey: 'bizfurniz',
+    }));
+    expect(runSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('同店同时有 D1 OAuth 和环境 Token 时只同步一次且 D1 租户优先', async () => {
+    const resolveConfig = vi.fn(async () => config('bizfurniz'));
+    const runSync = vi.fn(async () => syncResult('bizfurniz'));
+    const result = await reconcileStoredShopifyOrders({
+      db: {} as D1Database,
+      runtimeEnv: {
+        SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'secret-environment-access-token',
+      },
+      requestUrl: 'https://erp.example/api/connectors/shopify/reconcile',
+      maxPages: 20,
+      dependencies: {
+        loadTargets: async () => [{ tenantId: 'tenant-oauth-owner', storeKey: 'bizfurniz' }],
+        resolveConfig,
+        runSync: runSync as never,
+      },
+    });
+    expect(result.storesChecked).toBe(1);
+    expect(resolveConfig).toHaveBeenCalledTimes(1);
+    expect(resolveConfig).toHaveBeenCalledWith(expect.objectContaining({
+      tenantId: 'tenant-oauth-owner',
+      storeKey: 'bizfurniz',
+    }));
+    expect(runSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('没有 D1 OAuth 或环境 Token 时不把空跑标记为成功', async () => {
+    const resolveConfig = vi.fn();
+    const runSync = vi.fn();
+    const result = await reconcileStoredShopifyOrders({
+      db: {} as D1Database,
+      runtimeEnv: {},
+      requestUrl: 'https://erp.example/api/connectors/shopify/reconcile',
+      maxPages: 20,
+      dependencies: {
+        loadTargets: async () => [],
+        resolveConfig,
+        runSync: runSync as never,
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      noConfiguredStores: true,
+      skipReason: 'SHOPIFY_NO_CONFIGURED_STORES',
+      storesChecked: 0,
+      synced: [],
+      skipped: [],
+      failed: [],
+    });
+    expect(resolveConfig).not.toHaveBeenCalled();
+    expect(runSync).not.toHaveBeenCalled();
   });
 
   it('每次运行都先解析运行时授权，使过期 Token 走统一刷新路径', async () => {

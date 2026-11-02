@@ -345,6 +345,8 @@ async function refreshShopifyTenants(
     });
     return {
       ok: result.ok,
+      noConfiguredStores: result.noConfiguredStores,
+      skipReason: result.skipReason,
       storesChecked: result.storesChecked,
       storesSynced: result.synced.length,
       storesSkipped: result.skipped.length,
@@ -361,6 +363,8 @@ async function refreshShopifyTenants(
     const failure = sanitizedConnectorError(error);
     return {
       ok: false,
+      noConfiguredStores: false,
+      skipReason: null,
       storesChecked: 0,
       storesSynced: 0,
       storesSkipped: 0,

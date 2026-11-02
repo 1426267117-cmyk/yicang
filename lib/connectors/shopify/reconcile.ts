@@ -1,6 +1,7 @@
 import { PlatformOrderRepository } from '../repository';
 import { ShopifyAdminClient } from './client';
 import {
+  configuredShopifyEnvironmentStoreKeys,
   hasShopifyCredentials,
   isShopifyStoreKey,
   type ShopifyCredentialConfig,
@@ -13,6 +14,10 @@ import { runShopifyOrderSync } from './sync-service';
 
 const MAX_RECONCILE_TARGETS = 100;
 const MAX_RECONCILE_TENANTS = 20;
+// The current ERP deployment has one fixed workspace tenant. Environment
+// ADMIN_ACCESS_TOKEN credentials belong only to that workspace and must never
+// be copied across arbitrary tenant scopes supplied by a caller.
+const ENVIRONMENT_CREDENTIAL_TENANT_ID = 'tenant_yicang_primary';
 
 type StoredReconcileTarget = {
   tenantId: string;
@@ -48,9 +53,16 @@ export async function reconcileStoredShopifyOrders(input: {
   const requestedTenantIds = input.tenantIds ? new Set(input.tenantIds) : null;
   const requestedKeys = input.storeKeys ? new Set(input.storeKeys) : null;
   const loaded = await dependencies.loadTargets(input.db, input.tenantIds);
-  const targets = loaded.filter((target) => (
-    (!requestedTenantIds || requestedTenantIds.has(target.tenantId))
-    && (!requestedKeys || requestedKeys.has(target.storeKey as ShopifyStoreKey))
+  const storedTargets = loaded.filter((target) => (
+    !requestedTenantIds || requestedTenantIds.has(target.tenantId)
+  ));
+  const configuredTargets = mergeEnvironmentTargets(
+    storedTargets,
+    input.runtimeEnv,
+    requestedTenantIds,
+  );
+  const targets = configuredTargets.filter((target) => (
+    !requestedKeys || requestedKeys.has(target.storeKey as ShopifyStoreKey)
   ));
   assertUnambiguousTargets(targets);
 
@@ -120,13 +132,37 @@ export async function reconcileStoredShopifyOrders(input: {
     }
   }
 
+  const noConfiguredStores = configuredTargets.length === 0;
   return {
-    ok: failed.length === 0 && skipped.length === 0,
+    ok: !noConfiguredStores && failed.length === 0 && skipped.length === 0,
+    noConfiguredStores,
+    skipReason: noConfiguredStores ? 'SHOPIFY_NO_CONFIGURED_STORES' as const : null,
     storesChecked: targets.length,
     synced,
     skipped,
     failed,
   };
+}
+
+function mergeEnvironmentTargets(
+  storedTargets: StoredReconcileTarget[],
+  runtimeEnv: Record<string, unknown>,
+  requestedTenantIds: Set<string> | null,
+) {
+  const targets = [...storedTargets];
+  const configuredStoreKeys = new Set(storedTargets.map((target) => target.storeKey));
+  const environmentTenantInScope = !requestedTenantIds
+    || requestedTenantIds.has(ENVIRONMENT_CREDENTIAL_TENANT_ID);
+  if (!environmentTenantInScope) return targets;
+
+  for (const storeKey of configuredShopifyEnvironmentStoreKeys(runtimeEnv)) {
+    // A stored OAuth credential is tenant-bound and takes precedence over the
+    // deployment-level legacy token for the same connector key.
+    if (configuredStoreKeys.has(storeKey)) continue;
+    targets.push({ tenantId: ENVIRONMENT_CREDENTIAL_TENANT_ID, storeKey });
+    configuredStoreKeys.add(storeKey);
+  }
+  return targets;
 }
 
 async function runIncrementalSync(input: {

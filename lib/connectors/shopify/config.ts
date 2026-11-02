@@ -85,6 +85,14 @@ export function hasShopifyCredentials(config: ShopifyCredentialConfig) {
   );
 }
 
+export function configuredShopifyEnvironmentStoreKeys(
+  runtimeEnv: Record<string, unknown>,
+): ShopifyStoreKey[] {
+  return SHOPIFY_STORE_CANDIDATES
+    .map((candidate) => candidate.key)
+    .filter((storeKey) => hasShopifyCredentials(resolveShopifyStoreConfig(runtimeEnv, storeKey)));
+}
+
 export function hasShopifyAppCredentials(config: ShopifyCredentialConfig) {
   return Boolean(config.clientId && config.clientSecret);
 }

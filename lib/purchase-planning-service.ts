@@ -173,6 +173,7 @@ export async function getPurchasePlanning(
     inventoryConfirmationResult,
     needsMappingResult,
     orderSourceResult,
+    authorizedShopifyResult,
   ] = await Promise.all([
     db.prepare(`
       SELECT id, code, name FROM skus
@@ -269,6 +270,12 @@ export async function getPurchasePlanning(
       WHERE store.tenant_id = ? AND store.active = 1
       ORDER BY store.platform, store.display_name, store.id
     `).bind(user.tenantId).all<OrderSourceRow>(),
+    db.prepare(`
+      SELECT store_key
+      FROM connector_credentials
+      WHERE tenant_id = ? AND platform = 'shopify'
+      ORDER BY store_key
+    `).bind(user.tenantId).all<{ store_key: string }>(),
   ]);
 
   const [inventoryResult, riskResult] = await Promise.all([
@@ -432,6 +439,7 @@ export async function getPurchasePlanning(
   const operations = buildProcurementOperationsStatus({
     freshness,
     orderSources,
+    shopifyAuthorizedStoreKeys: authorizedShopifyResult.results.map((row) => row.store_key),
     orderSyncMaxAgeMinutes,
     runtimeEnv,
   });

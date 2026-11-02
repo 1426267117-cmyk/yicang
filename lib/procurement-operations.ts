@@ -1,5 +1,9 @@
 import type { MukuFreshnessReport } from './muku-freshness-service';
 import { resolveMukuConfig } from './connectors/muku/config';
+import {
+  configuredShopifyEnvironmentStoreKeys,
+  isShopifyStoreKey,
+} from './connectors/shopify/config';
 
 const INTERNAL_JOB_TOKEN_MIN_LENGTH = 32;
 const MUKU_REFRESH_ENDPOINT = '/api/connectors/muku/refresh';
@@ -24,6 +28,7 @@ export type ProcurementOperationsStatus = ReturnType<typeof buildProcurementOper
 export function buildProcurementOperationsStatus(input: {
   freshness: MukuFreshnessReport;
   orderSources: PlanningOrderSource[];
+  shopifyAuthorizedStoreKeys?: readonly string[];
   orderSyncMaxAgeMinutes: number;
   runtimeEnv: Record<string, unknown>;
 }) {
@@ -39,8 +44,14 @@ export function buildProcurementOperationsStatus(input: {
   const officialShopifySources = input.orderSources.filter((source) => (
     source.official && source.platform.toLowerCase() === 'shopify'
   ));
+  const configuredShopifyStoreKeys = new Set([
+    ...configuredShopifyEnvironmentStoreKeys(input.runtimeEnv),
+    ...(input.shopifyAuthorizedStoreKeys ?? []).filter(isShopifyStoreKey),
+    ...officialShopifySources.map((source) => source.storeKey).filter(isShopifyStoreKey),
+  ]);
+  const shopifySourceConfigured = configuredShopifyStoreKeys.size > 0;
   const mukuEndpointReady = internalJobAuthConfigured && mukuSourceConfigured;
-  const shopifyEndpointReady = internalJobAuthConfigured && officialShopifySources.length > 0;
+  const shopifyEndpointReady = internalJobAuthConfigured && shopifySourceConfigured;
 
   const mukuConfigurationBlockers = [
     !mukuSourceConfigured
@@ -54,8 +65,8 @@ export function buildProcurementOperationsStatus(input: {
       : null,
   ].filter((reason): reason is string => reason !== null);
   const shopifyConfigurationBlockers = [
-    officialShopifySources.length === 0
-      ? '尚未发现已验证的 Shopify 官方订单源。'
+    !shopifySourceConfigured
+      ? '尚未发现 Shopify OAuth 授权或服务端 ADMIN_ACCESS_TOKEN。'
       : null,
     !internalJobAuthConfigured
       ? 'ERP 内部任务密钥未安全配置，调度器不能调用 Shopify 补漏入口。'
@@ -112,7 +123,7 @@ export function buildProcurementOperationsStatus(input: {
     shopify: {
       protectedEndpoint: SHOPIFY_RECONCILE_ENDPOINT,
       endpointReady: shopifyEndpointReady,
-      sourceConfigured: officialShopifySources.length > 0,
+      sourceConfigured: shopifySourceConfigured,
       externalScheduleConfigured: shopifyExternalScheduleConfigured,
       automationReady: shopifyEndpointReady && shopifyExternalScheduleConfigured,
       recommendedIntervalMinutes: recommendedShopifyInterval(input.orderSyncMaxAgeMinutes),

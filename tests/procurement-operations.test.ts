@@ -70,6 +70,42 @@ describe('采购数据自动化运维状态', () => {
     expect(status.shopify.configurationBlockers).toEqual([]);
   });
 
+  it('环境 ADMIN_ACCESS_TOKEN 可使 Shopify 对账入口就绪但不伪造已同步数据源', () => {
+    const status = buildProcurementOperationsStatus({
+      freshness: freshMukuReport(),
+      orderSources: [],
+      orderSyncMaxAgeMinutes: 30,
+      runtimeEnv: {
+        ERP_INTERNAL_JOB_TOKEN: internalToken,
+        SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'test-admin-access-token',
+      },
+    });
+
+    expect(status.shopify).toEqual(expect.objectContaining({
+      sourceConfigured: true,
+      endpointReady: true,
+      externalScheduleConfigured: false,
+      automationReady: false,
+      lastSuccessAt: null,
+      nextExpiryAt: null,
+      stores: [],
+    }));
+    expect(status.shopify.configurationBlockers.join('；')).not.toContain('OAuth 授权');
+  });
+
+  it('尚未生成平台店铺时也能从 D1 OAuth 授权口径判断入口就绪', () => {
+    const status = buildProcurementOperationsStatus({
+      freshness: freshMukuReport(),
+      orderSources: [],
+      shopifyAuthorizedStoreKeys: ['bizfurniz'],
+      orderSyncMaxAgeMinutes: 30,
+      runtimeEnv: { ERP_INTERNAL_JOB_TOKEN: internalToken },
+    });
+
+    expect(status.shopify.sourceConfigured).toBe(true);
+    expect(status.shopify.endpointReady).toBe(true);
+  });
+
   it('缺少密钥、官方店铺或有效时间时保持未知并给出阻断原因', () => {
     const freshness = freshMukuReport();
     freshness.datasets[0] = {
@@ -100,7 +136,7 @@ describe('采购数据自动化运维状态', () => {
     expect(status.shopify.endpointReady).toBe(false);
     expect(status.shopify.lastSuccessAt).toBeNull();
     expect(status.shopify.nextExpiryAt).toBeNull();
-    expect(status.shopify.configurationBlockers.join('；')).toContain('尚未发现已验证的 Shopify 官方订单源');
+    expect(status.shopify.configurationBlockers.join('；')).toContain('尚未发现 Shopify OAuth 授权');
   });
 });
 
