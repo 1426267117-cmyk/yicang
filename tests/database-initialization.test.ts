@@ -1,6 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
+import {
+  assertDatabaseSchemaReady,
+  DATABASE_REQUIRED_COLUMNS,
+  DATABASE_REQUIRED_TABLES,
+  DATABASE_SCHEMA_READINESS,
+} from '../db/initialize';
+
 describe('数据库初始化', () => {
   it('只创建结构和工作区，不自动写入业务记录', () => {
     const sql = readFileSync(
@@ -18,6 +25,42 @@ describe('数据库初始化', () => {
     expect(source).not.toContain('runtime-schema');
     expect(source).not.toMatch(/CREATE\s+TABLE/i);
     expect(source).toContain('DATABASE_MIGRATIONS_PENDING');
+  });
+
+  it('收货冲正、短到关闭和采购交付字段齐全时才判定数据库就绪', async () => {
+    await expect(assertDatabaseSchemaReady(readinessDatabase())).resolves.toBeUndefined();
+    expect(DATABASE_SCHEMA_READINESS).toBe('procurement-0016');
+    expect(DATABASE_REQUIRED_TABLES).toEqual(expect.arrayContaining([
+      'purchase_receipt_corrections',
+      'purchase_receipt_correction_lines',
+      'inventory_receipt_correction_movements',
+    ]));
+  });
+
+  it('收货冲正表漏迁移时失败关闭', async () => {
+    const tables = DATABASE_REQUIRED_TABLES.filter(
+      (table) => table !== 'purchase_receipt_corrections',
+    );
+    await expect(assertDatabaseSchemaReady(readinessDatabase({ tables })))
+      .rejects.toThrow('DATABASE_MIGRATIONS_PENDING');
+  });
+
+  it.each([
+    ['purchase_receipt_corrections', 'reason'],
+    ['purchase_receipt_correction_lines', 'quantity'],
+    ['inventory_receipt_correction_movements', 'on_hand_delta'],
+    ['purchase_orders', 'closed_at'],
+    ['suppliers', 'contact_name'],
+    ['warehouses', 'address'],
+    ['purchase_orders', 'delivery_warehouse_id'],
+    ['purchase_orders', 'supplier_name_snapshot'],
+    ['purchase_orders', 'delivery_address_snapshot'],
+  ] as const)('缺少 %s.%s 时失败关闭', async (table, missingColumn) => {
+    const columns = readinessColumns();
+    columns[table] = columns[table].filter((column) => column !== missingColumn);
+
+    await expect(assertDatabaseSchemaReady(readinessDatabase({ columns })))
+      .rejects.toThrow('DATABASE_MIGRATIONS_PENDING');
   });
 
   it('新增正式迁移不写入店铺、订单或模拟业务数据', () => {
@@ -58,3 +101,36 @@ describe('数据库初始化', () => {
     expect(syncSource).toContain('requireProductionAccessPolicy(runtimeEnv, user.email)');
   });
 });
+
+type RequiredTable = (typeof DATABASE_REQUIRED_TABLES)[number];
+type RequiredColumnTable = keyof typeof DATABASE_REQUIRED_COLUMNS;
+
+function readinessColumns(): Record<RequiredColumnTable, string[]> {
+  return Object.fromEntries(
+    Object.entries(DATABASE_REQUIRED_COLUMNS).map(([table, columns]) => [table, [...columns]]),
+  ) as Record<RequiredColumnTable, string[]>;
+}
+
+function readinessDatabase(input: {
+  tables?: readonly RequiredTable[];
+  columns?: Record<RequiredColumnTable, string[]>;
+} = {}) {
+  const tables = input.tables ?? DATABASE_REQUIRED_TABLES;
+  const columns = input.columns ?? readinessColumns();
+  return {
+    prepare(sql: string) {
+      return {
+        async all<T>() {
+          if (sql.includes('sqlite_master')) {
+            return { results: tables.map((name) => ({ name })) as T[] };
+          }
+          const match = sql.match(/PRAGMA table_info\('([^']+)'\)/u);
+          const table = match?.[1] as RequiredColumnTable | undefined;
+          return {
+            results: (table ? columns[table] : []).map((name) => ({ name })) as T[],
+          };
+        },
+      };
+    },
+  } as unknown as D1Database;
+}
