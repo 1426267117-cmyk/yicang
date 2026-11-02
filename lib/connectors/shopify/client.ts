@@ -24,10 +24,11 @@ export class ShopifyAdminClient {
   async graphql<T>(query: string, variables: Record<string, unknown> = {}) {
     const token = await this.accessToken();
     const endpoint = `https://${this.config.domain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+    const fetchImpl = this.fetchImpl;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       let response: Response;
       try {
-        response = await this.fetchImpl(endpoint, {
+        response = await fetchImpl(endpoint, {
           method: 'POST',
           redirect: 'error',
           headers: {
@@ -117,8 +118,9 @@ export class ShopifyAdminClient {
       client_secret: this.config.clientSecret,
     });
     let response: Response;
+    const fetchImpl = this.fetchImpl;
     try {
-      response = await this.fetchImpl(endpoint, {
+      response = await fetchImpl(endpoint, {
         method: 'POST',
         redirect: 'error',
         headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
