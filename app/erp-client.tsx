@@ -45,6 +45,26 @@ type ShopifyStatus = {
   }>;
 };
 
+type OAuthFailureNotice = { message: string; retryUrl: string };
+
+const shopifyOAuthFailureMessages: Record<string, string> = {
+  AUTH_REQUIRED: 'ERP 登录状态已失效，请重新登录后再授权 Shopify。',
+  ERP_ACCESS_NOT_ALLOWED: '当前 GPT 账号不在 ERP 访问名单中，无法保存 Shopify 授权。',
+  ERP_SYNC_OPERATOR_EMAIL_REQUIRED: '请使用 ERP 指定管理员账号重新发起 Shopify 授权。',
+  SHOPIFY_OAUTH_SESSION_MISSING: '授权会话已失效。请从这里重新授权，并尽快完成 Shopify 页面确认。',
+  SHOPIFY_OAUTH_CALLBACK_INVALID: 'Shopify 返回的授权校验未通过，请从这里重新授权。',
+  SHOPIFY_TOKEN_EXCHANGE_REJECTED: 'Shopify 拒绝了凭证交换；系统已记录失败环节，需要核对应用客户端密钥。',
+  SHOPIFY_TOKEN_EXCHANGE_NETWORK_ERROR: 'ERP 暂时未能连接 Shopify 授权服务，请重新授权。',
+  SHOPIFY_IDENTITY_MISMATCH: '返回的 Shopify 店铺与 ERP 配置不一致，授权未保存。',
+  SHOPIFY_REQUIRED_SCOPE_MISSING: '本次授权缺少订单只读权限，请重新授权并确认全部权限。',
+  SHOPIFY_AUTH_INVALID_RESPONSE: 'Shopify 授权响应不完整，请重新授权。',
+};
+
+function shopifyOAuthFailureMessage(code: string | null) {
+  return (code && shopifyOAuthFailureMessages[code])
+    ?? 'Shopify 授权没有保存。系统已记录失败环节，请重新授权。';
+}
+
 type ErpPayload = {
   ok: true;
   user: { displayName: string; email: string; role: 'admin' | 'operator' | 'viewer'; permissions: Permission[]; tenantName: string };
@@ -94,6 +114,7 @@ export default function ErpClient() {
   const [authRequired, setAuthRequired] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
+  const [oauthFailure, setOAuthFailure] = useState<OAuthFailureNotice | null>(null);
   const [showOrder, setShowOrder] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [actionBusy, setActionBusy] = useState('');
@@ -125,7 +146,9 @@ export default function ErpClient() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (params.get('shopify_oauth') && params.get('status') === 'connected') {
+    const storeKey = params.get('shopify_oauth');
+    const oauthStatus = params.get('status');
+    if (storeKey && oauthStatus === 'connected') {
       window.history.replaceState({}, '', window.location.pathname);
       const startTimer = window.setTimeout(() => {
         setActive('platform');
@@ -136,6 +159,20 @@ export default function ErpClient() {
         window.clearTimeout(startTimer);
         window.clearTimeout(clearTimer);
       };
+    }
+    if (storeKey && oauthStatus === 'error') {
+      window.history.replaceState({}, '', window.location.pathname);
+      const safeStoreKey = ['zimasya', 'kaguyasu', 'anzhap', 'bizfurniz'].includes(storeKey)
+        ? storeKey
+        : 'bizfurniz';
+      const startTimer = window.setTimeout(() => {
+        setActive('platform');
+        setOAuthFailure({
+          message: shopifyOAuthFailureMessage(params.get('code')),
+          retryUrl: `/api/connectors/shopify/oauth/${safeStoreKey}/start`,
+        });
+      }, 0);
+      return () => window.clearTimeout(startTimer);
     }
     return undefined;
   }, []);
@@ -266,6 +303,7 @@ export default function ErpClient() {
 
         {authRequired ? <AuthRequired /> : loading && !payload ? <LoadingState /> : payload ? (
           <>
+            {oauthFailure && <div className="inline-alert" role="alert"><span>!</span><p>{oauthFailure.message}</p><button onClick={() => window.location.assign(oauthFailure.retryUrl)}>重新授权</button></div>}
             {error && <div className="inline-alert" role="alert"><span>!</span><p>{error}</p><button onClick={() => { setError(''); void loadData(); }}>重试</button></div>}
             {active === 'dashboard' && <Dashboard payload={payload} openOrder={() => setShowOrder(true)} go={switchModule} />}
             {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}

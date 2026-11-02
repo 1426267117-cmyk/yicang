@@ -10,10 +10,13 @@ import {
 import { ShopifyOrderConnector } from '../../../../../../../lib/connectors/shopify/connector';
 import { saveShopifyOAuthCredential } from '../../../../../../../lib/connectors/shopify/credential-store';
 import { sanitizedConnectorError, ShopifyConnectorError } from '../../../../../../../lib/connectors/shopify/errors';
+import {
+  classifyShopifyOAuthFailure,
+  type ShopifyOAuthStage,
+} from '../../../../../../../lib/connectors/shopify/oauth-failure';
 import { createShopifyOAuthApi, SHOPIFY_ORDER_READ_SCOPES } from '../../../../../../../lib/connectors/shopify/oauth';
 import {
   HttpError,
-  jsonError,
   requestContext,
   requirePermission,
   requireProductionAccessPolicy,
@@ -25,15 +28,20 @@ export async function GET(
   request: Request,
   routeContext: { params: Promise<{ storeKey: string }> },
 ) {
+  let callbackStoreKey = 'shopify';
+  let stage: ShopifyOAuthStage = 'route';
   try {
+    const { storeKey } = await routeContext.params;
+    callbackStoreKey = storeKey;
+    stage = 'request_context';
     const { db, user } = await requestContext(request);
     requirePermission(user, 'connectors:sync');
     const runtimeEnv = env as unknown as Record<string, unknown>;
     requireProductionAccessPolicy(runtimeEnv, user.email);
-    const { storeKey } = await routeContext.params;
     if (!isShopifyStoreKey(storeKey)) {
       throw new HttpError(404, '未找到该 Shopify 店铺配置', 'UNKNOWN_SHOPIFY_STORE');
     }
+    stage = 'configuration';
     const config = resolveShopifyStoreConfig(runtimeEnv, storeKey);
     if (!hasShopifyAppCredentials(config)) {
       throw new HttpError(
@@ -43,7 +51,9 @@ export async function GET(
       );
     }
     const api = createShopifyOAuthApi(config, request.url);
+    stage = 'token_exchange';
     const callback = await api.auth.callback<Headers>({ rawRequest: request, expiring: true });
+    stage = 'identity';
     if (!callback.session.accessToken) {
       throw new ShopifyConnectorError('SHOPIFY_AUTH_INVALID_RESPONSE', 'Shopify 授权响应缺少访问令牌');
     }
@@ -62,7 +72,9 @@ export async function GET(
       verifiedConfig,
       new ShopifyAdminClient(verifiedConfig),
     );
+    stage = 'shop_context';
     const shop = await connector.getShopContext();
+    stage = 'scope_check';
     const missingScopes = SHOPIFY_ORDER_READ_SCOPES.filter((scope) => !shop.scopes.has(scope));
     if (missingScopes.length) {
       throw new ShopifyConnectorError(
@@ -70,6 +82,7 @@ export async function GET(
         `${config.displayName} 缺少 ERP 订单只读所需权限，已停止保存`,
       );
     }
+    stage = 'credential_save';
     await saveShopifyOAuthCredential({
       db,
       tenantId: user.tenantId,
@@ -84,19 +97,50 @@ export async function GET(
     const headers = new Headers(callback.headers);
     headers.set('Location', `/?shopify_oauth=${encodeURIComponent(storeKey)}&status=connected`);
     headers.set('Cache-Control', 'no-store');
+    headers.set('Referrer-Policy', 'no-referrer');
     return new Response(null, { status: 303, headers });
   } catch (error) {
-    if (error instanceof HttpError) return jsonError(error);
-    if (error instanceof ShopifyConnectorError) {
-      return Response.json({ ok: false, ...sanitizedConnectorError(error) }, {
-        status: 422,
-        headers: { 'Cache-Control': 'no-store' },
-      });
+    let failure: { code: string; message: string; retryable: boolean; errorName: string; upstreamStatus: number | null };
+    if (error instanceof HttpError) {
+      failure = {
+        code: error.code,
+        message: error.message,
+        retryable: error.status >= 500,
+        errorName: error.constructor.name || error.name,
+        upstreamStatus: null,
+      };
+    } else if (error instanceof ShopifyConnectorError) {
+      const sanitized = sanitizedConnectorError(error);
+      failure = {
+        ...sanitized,
+        errorName: error.constructor.name || error.name,
+        upstreamStatus: error.status,
+      };
+    } else {
+      failure = classifyShopifyOAuthFailure(error);
     }
-    return Response.json({
-      ok: false,
-      code: 'SHOPIFY_OAUTH_FAILED',
-      message: 'Shopify 授权未完成，旧凭证和已同步数据均未改动',
-    }, { status: 422, headers: { 'Cache-Control': 'no-store' } });
+
+    console.error('shopify_oauth_callback_failed', JSON.stringify({
+      storeKey: callbackStoreKey,
+      stage,
+      code: failure.code,
+      errorName: failure.errorName,
+      upstreamStatus: failure.upstreamStatus,
+      retryable: failure.retryable,
+    }));
+
+    const redirect = new URL('/', request.url);
+    redirect.searchParams.set('shopify_oauth', callbackStoreKey);
+    redirect.searchParams.set('status', 'error');
+    redirect.searchParams.set('code', failure.code);
+    redirect.searchParams.set('stage', stage);
+    return new Response(null, {
+      status: 303,
+      headers: {
+        Location: redirect.toString(),
+        'Cache-Control': 'no-store',
+        'Referrer-Policy': 'no-referrer',
+      },
+    });
   }
 }
