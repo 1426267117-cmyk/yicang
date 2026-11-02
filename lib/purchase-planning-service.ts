@@ -205,6 +205,16 @@ export async function getPurchasePlanning(
             AND receipt.tenant_id = receipt_line.tenant_id
           WHERE receipt_line.tenant_id = line.tenant_id
             AND receipt_line.purchase_order_line_id = pol.id
+            AND receipt_line.quantity > COALESCE((
+              SELECT SUM(correction_line.quantity)
+              FROM purchase_receipt_correction_lines correction_line
+              JOIN purchase_receipt_corrections correction
+                ON correction.id = correction_line.correction_id
+                AND correction.tenant_id = correction_line.tenant_id
+              WHERE correction_line.tenant_id = receipt_line.tenant_id
+                AND correction_line.purchase_receipt_line_id = receipt_line.id
+                AND correction.status = 'posted'
+            ), 0)
         ) AS latest_receipt_at
       FROM purchase_request_lines line
       JOIN purchase_requests pr

@@ -549,6 +549,67 @@ export const purchaseReceiptLines = sqliteTable('purchase_receipt_lines', {
   check('ck_purchase_receipt_lines_quantity_positive', sql`${table.quantity} > 0`),
 ]);
 
+export const purchaseReceiptCorrections = sqliteTable('purchase_receipt_corrections', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  correctionNo: text('correction_no').notNull(),
+  purchaseReceiptId: text('purchase_receipt_id').notNull().references(() => purchaseReceipts.id),
+  purchaseOrderId: text('purchase_order_id').notNull().references(() => purchaseOrders.id),
+  warehouseId: text('warehouse_id').notNull().references(() => warehouses.id),
+  status: text('status', { enum: ['posted'] }).notNull(),
+  reason: text('reason').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  createdByMemberId: text('created_by_member_id').notNull().references(() => members.id),
+  createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_purchase_receipt_corrections_number').on(table.tenantId, table.correctionNo),
+  uniqueIndex('uq_purchase_receipt_corrections_idempotency').on(table.tenantId, table.idempotencyKey),
+  index('idx_purchase_receipt_corrections_receipt').on(table.tenantId, table.purchaseReceiptId, table.createdAt),
+  index('idx_purchase_receipt_corrections_order').on(table.tenantId, table.purchaseOrderId, table.createdAt),
+]);
+
+export const purchaseReceiptCorrectionLines = sqliteTable('purchase_receipt_correction_lines', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  correctionId: text('correction_id').notNull().references(() => purchaseReceiptCorrections.id),
+  purchaseReceiptLineId: text('purchase_receipt_line_id').notNull().references(() => purchaseReceiptLines.id),
+  purchaseOrderLineId: text('purchase_order_line_id').notNull().references(() => purchaseOrderLines.id),
+  skuId: text('sku_id').notNull().references(() => skus.id),
+  warehouseId: text('warehouse_id').notNull().references(() => warehouses.id),
+  quantity: integer('quantity').notNull(),
+  createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_purchase_receipt_correction_lines_source').on(table.correctionId, table.purchaseReceiptLineId),
+  index('idx_purchase_receipt_correction_lines_receipt_line').on(table.tenantId, table.purchaseReceiptLineId),
+  index('idx_purchase_receipt_correction_lines_order_line').on(table.tenantId, table.purchaseOrderLineId),
+  check('ck_purchase_receipt_correction_lines_positive', sql`${table.quantity} > 0`),
+]);
+
+export const inventoryReceiptCorrectionMovements = sqliteTable('inventory_receipt_correction_movements', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  correctionId: text('correction_id').notNull().references(() => purchaseReceiptCorrections.id),
+  correctionLineId: text('correction_line_id').notNull().references(() => purchaseReceiptCorrectionLines.id),
+  purchaseReceiptId: text('purchase_receipt_id').notNull().references(() => purchaseReceipts.id),
+  purchaseReceiptLineId: text('purchase_receipt_line_id').notNull().references(() => purchaseReceiptLines.id),
+  purchaseOrderId: text('purchase_order_id').notNull().references(() => purchaseOrders.id),
+  purchaseOrderLineId: text('purchase_order_line_id').notNull().references(() => purchaseOrderLines.id),
+  skuId: text('sku_id').notNull().references(() => skus.id),
+  warehouseId: text('warehouse_id').notNull().references(() => warehouses.id),
+  type: text('type', { enum: ['purchase_receipt_correction'] }).notNull(),
+  onHandDelta: integer('on_hand_delta').notNull(),
+  operationKey: text('operation_key').notNull(),
+  createdBy: text('created_by').notNull(),
+  createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_inventory_receipt_correction_operation').on(table.tenantId, table.operationKey),
+  uniqueIndex('uq_inventory_receipt_correction_line').on(table.correctionLineId),
+  index('idx_inventory_receipt_correction_order').on(table.tenantId, table.purchaseOrderId, table.createdAt),
+  index('idx_inventory_receipt_correction_sku_warehouse').on(table.tenantId, table.skuId, table.warehouseId, table.createdAt),
+  check('ck_inventory_receipt_correction_delta_negative', sql`${table.onHandDelta} < 0`),
+]);
+
 export const inventoryInboundMovements = sqliteTable('inventory_inbound_movements', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),

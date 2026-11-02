@@ -16,6 +16,7 @@ import {
   createWarehouse,
   executePurchaseOrderAction,
 } from '../lib/purchase-order-service';
+import { createPurchaseReceiptCorrection } from '../lib/purchase-receipt-correction-service';
 import {
   createPurchaseRequestFromPlanning,
   getPurchasePlanning,
@@ -476,7 +477,7 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     await executePurchaseOrderAction(db, user, purchaseOrder.purchaseOrder.id, {
       action: 'issue',
     }, 'issue-plan-po-0001');
-    await createPurchaseReceipt(db, user, purchaseOrder.purchaseOrder.id, {
+    const postedReceipt = await createPurchaseReceipt(db, user, purchaseOrder.purchaseOrder.id, {
       warehouseId: warehouse.warehouse.id,
       receivedAt: '2026-11-02T10:05:00.000Z',
       lines: [{
@@ -506,6 +507,26 @@ describe('真实订单 + MUKU 库存采购计划', () => {
       recommendedQty: 3,
     }));
     expect(reflected.rows[0].blockers).not.toContain('receipt_not_reflected_in_muku');
+
+    await createPurchaseReceiptCorrection(db, user, postedReceipt.receipt.id, {
+      reason: '验收发现本批到货全部录错，完整冲正',
+      lines: [{
+        purchaseReceiptLineId: postedReceipt.receipt.lines[0].id,
+        quantity: 3,
+      }],
+    }, 'correct-plan-receipt-0001');
+    await db.prepare(`
+      UPDATE muku_inventory_records
+      SET available_qty = 3, source_updated_at = '2026-11-02T10:00:00.000Z'
+      WHERE tenant_id = ? AND snapshot_id = 'snapshot-inventory'
+    `).bind(tenantId).run();
+    const afterFullCorrection = await getPurchasePlanning(db, user, { now });
+    expect(afterFullCorrection.rows[0]).toEqual(expect.objectContaining({
+      erpOpenPoQty: 3,
+      erpReceivedQty: 0,
+    }));
+    expect(afterFullCorrection.rows[0].sourceTimes.latestReceiptAt).toBeNull();
+    expect(afterFullCorrection.rows[0].blockers).not.toContain('receipt_not_reflected_in_muku');
   });
 
   it('人工库存确认过期后拒绝提交既有采购建议草稿', async () => {
@@ -1008,6 +1029,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0010_mute_eternity.sql',
     '../drizzle/0011_dazzling_menace.sql',
     '../drizzle/0012_square_slyde.sql',
+    '../drizzle/0014_clever_silvermane.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {
