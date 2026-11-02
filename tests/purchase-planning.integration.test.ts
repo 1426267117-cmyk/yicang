@@ -459,9 +459,22 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-PLAN', name: '计划供应商',
     }, 'create-plan-supplier-0001');
+    const warehouse = await createWarehouse(db, user, {
+      code: 'PLAN-WH', name: '计划收货仓',
+    }, 'create-plan-warehouse-0001');
+    const requestLine = await db.prepare(`
+      SELECT id FROM purchase_request_lines
+      WHERE tenant_id = ? AND request_id = ?
+      LIMIT 1
+    `).bind(tenantId, created.request.id).first<{ id: string }>();
+    if (!requestLine) throw new Error('planned purchase request line missing');
     const purchaseOrder = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: created.request.id,
       supplierId: supplier.supplier.id,
+      deliveryWarehouseId: warehouse.warehouse.id,
+      expectedDeliveryAt: '2026-11-30',
+      currency: 'USD',
+      lineCosts: [{ purchaseRequestLineId: requestLine.id, unitCostMinor: 100 }],
     }, 'create-plan-po-0001');
     const afterPo = await getPurchasePlanning(db, user, { now });
     expect(afterPo.rows[0]).toEqual(expect.objectContaining({
@@ -471,12 +484,22 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     }));
     expect(afterPo.rows[0].calculationParts.erpOpenPoDeductedSeparately).toBe(false);
 
-    const warehouse = await createWarehouse(db, user, {
-      code: 'PLAN-WH', name: '计划收货仓',
-    }, 'create-plan-warehouse-0001');
+    await expect(executePurchaseOrderAction(db, buyerUser, purchaseOrder.purchaseOrder.id, {
+      action: 'issue',
+    }, 'issue-stale-plan-po-0001', { planningNow: now })).rejects.toMatchObject({
+      code: 'PURCHASE_RECOMMENDATION_STALE',
+    });
+    const staleOrder = await db.prepare(`
+      SELECT status FROM purchase_orders WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, purchaseOrder.purchaseOrder.id).first<{ status: string }>();
+    expect(staleOrder?.status).toBe('draft');
+    await db.prepare(`
+      UPDATE muku_inventory_records SET available_qty = 6
+      WHERE tenant_id = ? AND snapshot_id = 'snapshot-inventory'
+    `).bind(tenantId).run();
     await executePurchaseOrderAction(db, buyerUser, purchaseOrder.purchaseOrder.id, {
       action: 'issue',
-    }, 'issue-plan-po-0001');
+    }, 'issue-plan-po-0001', { planningNow: now });
     const postedReceipt = await createPurchaseReceipt(db, user, purchaseOrder.purchaseOrder.id, {
       warehouseId: warehouse.warehouse.id,
       receivedAt: '2026-11-02T10:05:00.000Z',

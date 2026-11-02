@@ -19,7 +19,7 @@ import {
   createPurchaseReceipt,
   createSupplier,
   createWarehouse,
-  executePurchaseOrderAction,
+  executePurchaseOrderAction as executePurchaseOrderActionService,
   getProcurementWorkspaceData,
 } from '../lib/purchase-order-service';
 import {
@@ -59,6 +59,23 @@ const shopContext: ShopifyShopContext = {
   timezone: 'America/Los_Angeles', timezoneOffset: '-0700', currency: 'USD',
   scopes: new Set(['read_orders']),
 };
+
+function executePurchaseOrderAction(
+  database: D1Database,
+  actor: UserContext,
+  purchaseOrderId: string,
+  input: { action: 'issue' | 'cancel' | 'close'; note?: string },
+  idempotencyKey: string,
+) {
+  return executePurchaseOrderActionService(
+    database,
+    actor,
+    purchaseOrderId,
+    input,
+    idempotencyKey,
+    { validatePlanningEvidence: async () => undefined },
+  );
+}
 
 describe('正式采购单与到货入库闭环', () => {
   let mf: Miniflare;
@@ -219,6 +236,200 @@ describe('正式采购单与到货入库闭环', () => {
     }, 'purchase-order-create-0002')).rejects.toMatchObject({ code: 'PURCHASE_ORDER_ALREADY_EXISTS' });
   });
 
+  it('旧申请缺少可复验采购计划证据时只能保留草稿，不能正式下单', async () => {
+    await db.prepare(`
+      UPDATE audit_logs SET after_json = '{}'
+      WHERE tenant_id = ? AND entity_type = 'purchase_request' AND entity_id = ?
+        AND action = 'CREATE_PURCHASE_REQUEST_FROM_PLAN'
+    `).bind(tenantId, approvedRequestId).run();
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-NO-PLAN-EVIDENCE', name: '缺计划证据供应商',
+    }, 'supplier-no-plan-evidence-0001');
+    const created = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
+    }, 'po-no-plan-evidence-create-0001');
+
+    await expect(executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'issue',
+    }, 'po-no-plan-evidence-issue-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_PLAN_EVIDENCE_MISSING',
+    });
+    const stored = await db.prepare(`
+      SELECT status FROM purchase_orders WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, created.purchaseOrder.id).first<{ status: string }>();
+    expect(stored?.status).toBe('draft');
+  });
+
+  it('正式下单缺仓库、交期、币种或单价时 fail-closed，完整采购单才能确认', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-ISSUE-GUARD', name: '正式下单校验供应商',
+    }, 'supplier-issue-guard-0001');
+    const lineId = await requestLineId(db, approvedRequestId);
+    const cost = [{ purchaseRequestLineId: lineId, unitCostMinor: 100 }];
+    const cancelDraft = async (purchaseOrderId: string, key: string) => executePurchaseOrderAction(
+      db,
+      buyerUser,
+      purchaseOrderId,
+      { action: 'cancel', note: '校验失败后取消旧草稿并重建' },
+      key,
+    );
+
+    const missingWarehouse = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      expectedDeliveryAt: '2026-11-30',
+      currency: 'USD',
+      lineCosts: cost,
+    }, 'po-issue-guard-create-no-warehouse');
+    await expect(executePurchaseOrderAction(db, buyerUser, missingWarehouse.purchaseOrder.id, {
+      action: 'issue',
+    }, 'po-issue-guard-issue-no-warehouse')).rejects.toMatchObject({
+      code: 'PURCHASE_ORDER_DELIVERY_WAREHOUSE_REQUIRED',
+    });
+    await cancelDraft(missingWarehouse.purchaseOrder.id, 'po-issue-guard-cancel-no-warehouse');
+
+    const missingDelivery = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      deliveryWarehouseId: 'warehouse-main',
+      currency: 'USD',
+      lineCosts: cost,
+    }, 'po-issue-guard-create-no-delivery');
+    await expect(executePurchaseOrderAction(db, buyerUser, missingDelivery.purchaseOrder.id, {
+      action: 'issue',
+    }, 'po-issue-guard-issue-no-delivery')).rejects.toMatchObject({
+      code: 'PURCHASE_ORDER_EXPECTED_DELIVERY_REQUIRED',
+    });
+    await cancelDraft(missingDelivery.purchaseOrder.id, 'po-issue-guard-cancel-no-delivery');
+
+    const missingCurrency = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      deliveryWarehouseId: 'warehouse-main',
+      expectedDeliveryAt: '2026-11-30',
+      lineCosts: cost,
+    }, 'po-issue-guard-create-no-currency');
+    await expect(executePurchaseOrderAction(db, buyerUser, missingCurrency.purchaseOrder.id, {
+      action: 'issue',
+    }, 'po-issue-guard-issue-no-currency')).rejects.toMatchObject({
+      code: 'PURCHASE_ORDER_CURRENCY_REQUIRED',
+    });
+    await cancelDraft(missingCurrency.purchaseOrder.id, 'po-issue-guard-cancel-no-currency');
+
+    const missingCost = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      deliveryWarehouseId: 'warehouse-main',
+      expectedDeliveryAt: '2026-11-30',
+      currency: 'USD',
+    }, 'po-issue-guard-create-no-cost');
+    await expect(executePurchaseOrderAction(db, buyerUser, missingCost.purchaseOrder.id, {
+      action: 'issue',
+    }, 'po-issue-guard-issue-no-cost')).rejects.toMatchObject({
+      code: 'PURCHASE_ORDER_UNIT_COST_REQUIRED',
+    });
+    await cancelDraft(missingCost.purchaseOrder.id, 'po-issue-guard-cancel-no-cost');
+
+    const concurrentChange = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
+    }, 'po-issue-guard-create-race');
+    let raced = false;
+    const racingDb = {
+      prepare: db.prepare.bind(db),
+      batch: async (statements: D1PreparedStatement[]) => {
+        if (!raced) {
+          raced = true;
+          await db.prepare(`
+            UPDATE purchase_order_lines SET currency = 'EUR'
+            WHERE tenant_id = ? AND purchase_order_id = ?
+          `).bind(tenantId, concurrentChange.purchaseOrder.id).run();
+        }
+        return db.batch(statements);
+      },
+    } as unknown as D1Database;
+    await expect(executePurchaseOrderAction(racingDb, buyerUser, concurrentChange.purchaseOrder.id, {
+      action: 'issue',
+    }, 'po-issue-guard-issue-race')).rejects.toMatchObject({
+      code: 'PURCHASE_ORDER_LINE_CURRENCY_MISMATCH',
+    });
+    const guarded = await db.prepare(`
+      SELECT status FROM purchase_orders WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, concurrentChange.purchaseOrder.id).first<{ status: string }>();
+    expect(guarded?.status).toBe('draft');
+    await cancelDraft(concurrentChange.purchaseOrder.id, 'po-issue-guard-cancel-race');
+
+    const sourceRace = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
+    }, 'po-issue-guard-create-source-race');
+    const sourceLine = await db.prepare(`
+      SELECT purchase_demand_id, requested_quantity
+      FROM purchase_request_lines
+      WHERE tenant_id = ? AND request_id = ? AND active = 1
+      LIMIT 1
+    `).bind(tenantId, approvedRequestId).first<{
+      purchase_demand_id: string;
+      requested_quantity: number;
+    }>();
+    if (!sourceLine) throw new Error('purchase request source line missing');
+    let sourceRaced = false;
+    const sourceRacingDb = {
+      prepare: db.prepare.bind(db),
+      batch: async (statements: D1PreparedStatement[]) => {
+        if (!sourceRaced) {
+          sourceRaced = true;
+          await db.prepare(`
+            UPDATE purchase_demands SET required_quantity = ?
+            WHERE tenant_id = ? AND id = ?
+          `).bind(
+            Number(sourceLine.requested_quantity) - 1,
+            tenantId,
+            sourceLine.purchase_demand_id,
+          ).run();
+        }
+        return db.batch(statements);
+      },
+    } as unknown as D1Database;
+    await expect(executePurchaseOrderAction(sourceRacingDb, buyerUser, sourceRace.purchaseOrder.id, {
+      action: 'issue',
+    }, 'po-issue-guard-issue-source-race')).rejects.toMatchObject({
+      code: 'PURCHASE_REQUEST_CHANGED',
+    });
+    const sourceGuarded = await db.prepare(`
+      SELECT status FROM purchase_orders WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, sourceRace.purchaseOrder.id).first<{ status: string }>();
+    expect(sourceGuarded?.status).toBe('draft');
+    await db.prepare(`
+      UPDATE purchase_demands SET required_quantity = ?
+      WHERE tenant_id = ? AND id = ?
+    `).bind(sourceLine.requested_quantity, tenantId, sourceLine.purchase_demand_id).run();
+    await cancelDraft(sourceRace.purchaseOrder.id, 'po-issue-guard-cancel-source-race');
+
+    const complete = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
+    }, 'po-issue-guard-create-complete');
+    const issued = await executePurchaseOrderAction(db, buyerUser, complete.purchaseOrder.id, {
+      action: 'issue', note: '字段完整，确认下单',
+    }, 'po-issue-guard-issue-complete');
+    expect(issued.purchaseOrder).toEqual(expect.objectContaining({
+      status: 'issued',
+      deliveryWarehouse: expect.objectContaining({ id: 'warehouse-main' }),
+      expectedDeliveryAt: '2026-11-30',
+      currency: 'USD',
+    }));
+    expect(issued.purchaseOrder.lines[0]).toEqual(expect.objectContaining({
+      unitCostMinor: 100,
+      currency: 'USD',
+    }));
+  });
+
   it('采购单保存供应商与收货信息快照，并拒绝引用其他租户仓库', async () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-DELIVERY',
@@ -347,6 +558,7 @@ describe('正式采购单与到货入库闭环', () => {
     const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
     }, 'purchase-order-owner-create-0001');
     await expect(executePurchaseOrderAction(db, user, created.purchaseOrder.id, {
       action: 'issue',
@@ -413,13 +625,53 @@ describe('正式采购单与到货入库闭环', () => {
     const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
-      currency: 'USD',
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
     }, 'purchase-order-create-1001');
     const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
       action: 'issue', note: '确认发给供应商',
     }, 'purchase-order-issue-1001');
     expect(issued.purchaseOrder.status).toBe('issued');
     const lineId = issued.purchaseOrder.lines[0].id;
+
+    const alternateWarehouse = await createWarehouse(db, user, {
+      code: 'ALT-RECEIVE', name: '其它同租户仓',
+    }, 'warehouse-alternate-receive-0001');
+    await expect(createPurchaseReceipt(db, user, created.purchaseOrder.id, {
+      warehouseId: alternateWarehouse.warehouse.id,
+      lines: [{ purchaseOrderLineId: lineId, quantity: 1 }],
+    }, 'purchase-receipt-wrong-warehouse-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_RECEIPT_WAREHOUSE_MISMATCH',
+    });
+
+    let receiptWarehouseRaced = false;
+    const receiptRacingDb = {
+      prepare: db.prepare.bind(db),
+      batch: async (statements: D1PreparedStatement[]) => {
+        if (!receiptWarehouseRaced) {
+          receiptWarehouseRaced = true;
+          await db.prepare(`
+            UPDATE purchase_orders SET delivery_warehouse_id = ?
+            WHERE tenant_id = ? AND id = ?
+          `).bind(alternateWarehouse.warehouse.id, tenantId, created.purchaseOrder.id).run();
+        }
+        return db.batch(statements);
+      },
+    } as unknown as D1Database;
+    await expect(createPurchaseReceipt(receiptRacingDb, user, created.purchaseOrder.id, {
+      warehouseId: 'warehouse-main',
+      lines: [{ purchaseOrderLineId: lineId, quantity: 1 }],
+    }, 'purchase-receipt-warehouse-race-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_RECEIPT_WAREHOUSE_MISMATCH',
+    });
+    expect(await inventoryOnHand(db)).toBe(0);
+    const receiptCountBeforeValid = await db.prepare(`
+      SELECT COUNT(*) AS count FROM purchase_receipts WHERE tenant_id = ?
+    `).bind(tenantId).first<{ count: number }>();
+    expect(Number(receiptCountBeforeValid?.count)).toBe(0);
+    await db.prepare(`
+      UPDATE purchase_orders SET delivery_warehouse_id = 'warehouse-main'
+      WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, created.purchaseOrder.id).run();
 
     const first = await createPurchaseReceipt(db, user, created.purchaseOrder.id, {
       warehouseId: 'warehouse-main',
@@ -474,6 +726,36 @@ describe('正式采购单与到货入库闭环', () => {
     expect(workspace.purchaseReceipts).toHaveLength(2);
   });
 
+  it('旧已下单采购单缺少指定收货仓时拒绝猜仓入库', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-LEGACY-RECEIPT', name: '旧单收货保护供应商',
+    }, 'supplier-legacy-receipt-0001');
+    const created = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
+    }, 'purchase-order-legacy-receipt-0001');
+    const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'issue',
+    }, 'purchase-order-legacy-receipt-issue-0001');
+    await db.prepare(`
+      UPDATE purchase_orders SET delivery_warehouse_id = NULL
+      WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, created.purchaseOrder.id).run();
+
+    await expect(createPurchaseReceipt(db, user, created.purchaseOrder.id, {
+      warehouseId: 'warehouse-main',
+      lines: [{ purchaseOrderLineId: issued.purchaseOrder.lines[0].id, quantity: 1 }],
+    }, 'purchase-receipt-legacy-no-warehouse-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_RECEIPT_DELIVERY_WAREHOUSE_REQUIRED',
+    });
+    const count = await db.prepare(`
+      SELECT COUNT(*) AS count FROM purchase_receipts WHERE tenant_id = ?
+    `).bind(tenantId).first<{ count: number }>();
+    expect(Number(count?.count)).toBe(0);
+    expect(await inventoryOnHand(db)).toBe(0);
+  });
+
   it('指定采购负责人可追加式关闭未到余量，原因、数量和历史均保留', async () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-CLOSE-SHORT', name: '短到关闭测试供应商',
@@ -481,6 +763,7 @@ describe('正式采购单与到货入库闭环', () => {
     const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
     }, 'purchase-order-close-short-0001');
     const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
       action: 'issue', note: '已向供应商下单',
@@ -560,6 +843,7 @@ describe('正式采购单与到货入库闭环', () => {
     const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
     }, 'purchase-order-close-correct-0001');
     const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
       action: 'issue',
@@ -618,7 +902,7 @@ describe('正式采购单与到货入库闭环', () => {
     const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
-      currency: 'CNY',
+      ...(await readyPurchaseOrderFields(db, approvedRequestId, 'CNY')),
     }, 'purchase-order-create-correction-0001');
     const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
       action: 'issue', note: '测试收货冲正',
@@ -732,6 +1016,7 @@ describe('正式采购单与到货入库闭环', () => {
     const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
     }, 'purchase-order-create-correction-guard-0001');
     const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
       action: 'issue',
@@ -868,6 +1153,7 @@ describe('正式采购单与到货入库闭环', () => {
     const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
     }, 'purchase-order-create-2002');
     await expect(createPurchaseReceipt(db, user, created.purchaseOrder.id, {
       warehouseId: 'warehouse-main',
@@ -898,6 +1184,44 @@ async function approveRequest(db: D1Database, demandId: string) {
   }, `request-create-${crypto.randomUUID()}`);
   await executePurchaseRequestAction(db, buyerUser, created.request.id, { action: 'submit' }, `request-submit-${crypto.randomUUID()}`);
   const approved = await executePurchaseRequestAction(db, reviewerUser, created.request.id, { action: 'approve' }, `request-approve-${crypto.randomUUID()}`);
+  const evidenceLine = await db.prepare(`
+    SELECT sku_id, requested_quantity
+    FROM purchase_request_lines
+    WHERE tenant_id = ? AND request_id = ? AND purchase_demand_id = ?
+    LIMIT 1
+  `).bind(tenantId, approved.request.id, demandId).first<{
+    sku_id: string;
+    requested_quantity: number;
+  }>();
+  if (!evidenceLine) throw new Error('purchase request evidence line missing');
+  const now = new Date().toISOString();
+  await db.prepare(`
+    INSERT INTO audit_logs (
+      id, tenant_id, actor_id, actor_email, action, entity_type, entity_id,
+      before_json, after_json, request_id, idempotency_key, source, created_at
+    ) VALUES (?, ?, ?, ?, 'CREATE_PURCHASE_REQUEST_FROM_PLAN', 'purchase_request', ?,
+      NULL, ?, ?, ?, 'human', ?)
+  `).bind(
+    crypto.randomUUID(),
+    tenantId,
+    user.id,
+    user.email,
+    approved.request.id,
+    JSON.stringify({
+      planningEvidence: {
+        schemaVersion: 1,
+        rows: [{
+          planRowId: `test-plan-${approved.request.id}`,
+          skuId: evidenceLine.sku_id,
+          recommendationVersion: `test-recommendation-${approved.request.id}`,
+          allocations: [{ demandId, quantity: Number(evidenceLine.requested_quantity) }],
+        }],
+      },
+    }),
+    crypto.randomUUID(),
+    `test-plan-evidence-${crypto.randomUUID()}`,
+    now,
+  ).run();
   return approved.request.id;
 }
 
@@ -966,6 +1290,22 @@ async function requestLineId(db: D1Database, requestId: string) {
   `).bind(tenantId, requestId).first<{ id: string }>();
   if (!row) throw new Error('purchase request line missing');
   return row.id;
+}
+
+async function readyPurchaseOrderFields(
+  db: D1Database,
+  requestId: string,
+  currency = 'USD',
+) {
+  return {
+    deliveryWarehouseId: 'warehouse-main',
+    expectedDeliveryAt: '2026-11-30',
+    currency,
+    lineCosts: [{
+      purchaseRequestLineId: await requestLineId(db, requestId),
+      unitCostMinor: 100,
+    }],
+  };
 }
 
 async function inventoryOnHand(db: D1Database) {
