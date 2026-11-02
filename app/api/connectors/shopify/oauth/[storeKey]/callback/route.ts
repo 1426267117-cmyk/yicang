@@ -1,4 +1,4 @@
-import { env } from 'cloudflare:workers';
+import { env, waitUntil } from 'cloudflare:workers';
 import { ShopifyAdminClient } from '../../../../../../../lib/connectors/shopify/client';
 import {
   hasShopifyAppCredentials,
@@ -10,6 +10,7 @@ import {
 import { ShopifyOrderConnector } from '../../../../../../../lib/connectors/shopify/connector';
 import { saveShopifyOAuthCredential } from '../../../../../../../lib/connectors/shopify/credential-store';
 import { sanitizedConnectorError, ShopifyConnectorError } from '../../../../../../../lib/connectors/shopify/errors';
+import { ensureShopifyOrderWebhookSubscriptions } from '../../../../../../../lib/connectors/shopify/webhook-registration';
 import {
   classifyShopifyOAuthFailure,
   type ShopifyOAuthStage,
@@ -71,10 +72,8 @@ export async function GET(
       domain: callback.session.shop,
       credentialRef: `d1:shopify:${storeKey}`,
     });
-    const connector = new ShopifyOrderConnector(
-      verifiedConfig,
-      new ShopifyAdminClient(verifiedConfig),
-    );
+    const client = new ShopifyAdminClient(verifiedConfig);
+    const connector = new ShopifyOrderConnector(verifiedConfig, client);
     stage = 'shop_context';
     const shop = await connector.getShopContext();
     stage = 'scope_check';
@@ -97,6 +96,25 @@ export async function GET(
       session: callback.session,
       createdBy: user.id,
     });
+    waitUntil(ensureShopifyOrderWebhookSubscriptions({
+        client,
+        storeKey,
+        requestUrl: request.url,
+      }).then((registration) => {
+        console.info('shopify_webhook_subscriptions_ready', JSON.stringify({
+          storeKey,
+          created: registration.created,
+          updated: registration.updated,
+          unchanged: registration.unchanged,
+        }));
+      }).catch((registrationError) => {
+        const registrationFailure = sanitizedConnectorError(registrationError);
+        console.error('shopify_webhook_subscription_failed', JSON.stringify({
+          storeKey,
+          code: registrationFailure.code,
+          retryable: registrationFailure.retryable,
+        }));
+      }));
     const headers = new Headers(callback.headers);
     headers.set('Location', `/?shopify_oauth=${encodeURIComponent(storeKey)}&status=connected`);
     headers.set('Cache-Control', 'no-store');

@@ -21,7 +21,9 @@ BizFurniz 的 `storeKey` 为 `bizfurniz`。回调会使用该店铺应用的 Cli
 
 ## 注册方式
 
-部署包含数据库迁移 `0004` 的版本后，用 ERP 后端已加密保存的店铺授权，通过 Shopify Admin GraphQL API 对每个主题执行 `webhookSubscriptionCreate`。不要把访问令牌复制到浏览器、聊天、脚本参数或文档。
+部署包含数据库迁移 `0004` 和 `0005` 的版本后，OAuth 回调会使用 ERP 后端当次授权会话自动幂等创建或收敛这四个订阅。访问令牌只在后端内存和加密凭证存储中使用，不能复制到浏览器、聊天、脚本参数或文档。
+
+订阅采用最小字段：订单主题只接收 `id`、`admin_graphql_api_id`；退款主题只接收 `order_id`。这样 webhook 只负责定位订单，不传输客户姓名、邮箱或地址，也能降低请求体过大的风险。
 
 ```graphql
 mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $subscription: WebhookSubscriptionInput!) {
@@ -39,7 +41,8 @@ mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $subscription: Webhook
   "topic": "ORDERS_CREATE",
   "subscription": {
     "uri": "https://yicang-erp.champztj.chatgpt.site/api/connectors/shopify/webhooks/bizfurniz",
-    "format": "JSON"
+    "format": "JSON",
+    "includeFields": ["id", "admin_graphql_api_id"]
   }
 }
 ```
@@ -52,6 +55,12 @@ mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $subscription: Webhook
 2. 先验签，再解析 JSON；验签失败不入库。
 3. 使用 `X-Shopify-Webhook-Id` 做投递幂等。
 4. 只保存主题、店铺、Order GID、触发时间和载荷哈希，不保存客户地址或邮箱原文。
-5. 新事件写入 `shopify_webhook_events` 的 `pending` 队列。
-6. 后续消费者应以条件更新/租约抢占事件，再调用现有完整订单读取与幂等落库逻辑。
-7. 保留周期性增量同步作为漏单补偿，Webhook 不能取代对账重扫。
+5. 新事件写入 `shopify_webhook_events` 的 `pending` 队列；仅新入队事件会启动后台消费，重复投递不会重复触发。
+6. 接收成功后通过 Worker `waitUntil` 即时处理最多一个订单，先快速向 Shopify 返回安全响应；积压和延迟重试交给补偿任务。
+7. `POST /api/connectors/shopify/webhooks/process` 是独立内部批处理入口，请求体可传 `{ "maxEvents": 10 }`。它不使用普通用户登录或 `connectors:sync` 权限，即使 `ERP_DEV_OPEN_ACCESS=true` 也必须携带 `Authorization: Bearer <ERP_INTERNAL_JOB_TOKEN>`。
+8. `ERP_INTERNAL_JOB_TOKEN` 必须以至少 32 个随机字符配置为服务端 Secret；不得写入前端、仓库、日志或本文档。未配置返回 503，无或错误 Token 返回 401。
+9. 消费者用租约条件抢占事件，再调用现有完整订单读取与幂等落库逻辑；失败按 1 分钟、5 分钟、15 分钟、1 小时退避，最多五次，最终失败记录保留。
+10. 应定期调用内部批处理入口，确保低流量店铺的退避事件和过期租约能继续推进；不要创建公开的订阅注册接口。
+11. 保留周期性增量同步作为漏单补偿，Webhook 不能取代对账重扫。
+
+订阅注册在 OAuth 凭证保存后由后台任务幂等执行。注册失败不会影响已成功的授权回跳，日志只记录安全错误码，绝不记录 Token；失败状态展示与主动重试入口属于后续增强项。

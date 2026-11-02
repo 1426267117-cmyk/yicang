@@ -38,5 +38,10 @@ export const shopifyOrderSyncSchema = z.object({
   }
 });
 
+export const shopifyWebhookProcessSchema = z.object({
+  maxEvents: z.number().int().min(1).max(10).default(5),
+});
+
 export type CreateOrderInput = z.infer<typeof createOrderSchema>;
 export type ShopifyOrderSyncInput = z.infer<typeof shopifyOrderSyncSchema>;
+export type ShopifyWebhookProcessInput = z.infer<typeof shopifyWebhookProcessSchema>;

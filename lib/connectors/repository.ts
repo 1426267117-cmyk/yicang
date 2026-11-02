@@ -417,7 +417,7 @@ export class PlatformOrderRepository {
     storeId: string;
     graph: CanonicalOrderGraph;
     apiVersion: string;
-    runId: string;
+    runId: string | null;
     fetchedAt: string;
   }): Promise<'inserted' | 'updated' | 'unchanged'> {
     const orderId = await stableId('porder', this.tenantId, input.storeId, input.graph.sourceOrderId);
@@ -644,7 +644,7 @@ export class PlatformOrderRepository {
       storeId: string;
       graph: CanonicalOrderGraph;
       apiVersion: string;
-      runId: string;
+      runId: string | null;
       fetchedAt: string;
     },
     rawJson: string,

@@ -188,12 +188,16 @@ export const shopifyWebhookEvents = sqliteTable('shopify_webhook_events', {
   status: text('status', { enum: ['pending', 'processing', 'processed', 'failed', 'ignored'] }).notNull(),
   attempts: integer('attempts').notNull().default(0),
   lastErrorCode: text('last_error_code'),
+  nextAttemptAt: text('next_attempt_at'),
+  leaseId: text('lease_id'),
+  leaseExpiresAt: text('lease_expires_at'),
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
   processedAt: text('processed_at'),
 }, (table) => [
   uniqueIndex('uq_shopify_webhook_events_delivery').on(table.tenantId, table.storeKey, table.webhookId),
   index('idx_shopify_webhook_events_pending').on(table.status, table.createdAt),
+  index('idx_shopify_webhook_events_ready').on(table.status, table.nextAttemptAt, table.createdAt),
   index('idx_shopify_webhook_events_order').on(table.tenantId, table.storeKey, table.sourceOrderId),
 ]);
 

@@ -81,15 +81,24 @@ export async function receiveShopifyOrderWebhook(input: {
     throw new ShopifyWebhookError('SHOPIFY_WEBHOOK_SHOP_MISMATCH', 'Shopify webhook 店铺与连接器不匹配', 401);
   }
 
-  const owner = await input.db.prepare(`
+  const owners = await input.db.prepare(`
     SELECT tenant_id
     FROM connector_credentials
     WHERE platform = 'shopify' AND store_key = ? AND shop_domain = ?
-    LIMIT 1
-  `).bind(input.storeKey, shopDomain).first<WebhookCredentialOwner>();
-  if (!owner) {
+    ORDER BY tenant_id
+    LIMIT 2
+  `).bind(input.storeKey, shopDomain).all<WebhookCredentialOwner>();
+  if (owners.results.length === 0) {
     throw new ShopifyWebhookError('SHOPIFY_WEBHOOK_STORE_UNAUTHORIZED', 'Shopify 店铺尚未完成 ERP 授权', 401);
   }
+  if (owners.results.length !== 1) {
+    throw new ShopifyWebhookError(
+      'SHOPIFY_WEBHOOK_STORE_AMBIGUOUS',
+      'Shopify 店铺授权归属不唯一，已停止接收事件',
+      409,
+    );
+  }
+  const owner = owners.results[0];
 
   const payload = parseWebhookPayload(input.rawBody);
   const sourceOrderId = extractShopifyOrderId(webhook.topic, payload);
@@ -122,11 +131,14 @@ export async function receiveShopifyOrderWebhook(input: {
     status === 'ignored' ? now : null,
   ).run();
 
+  const inserted = Number(result.meta.changes ?? 0) === 1;
+
   return {
     accepted: true,
-    duplicate: Number(result.meta.changes ?? 0) === 0,
-    queued: status === 'pending',
-    ignored: status === 'ignored',
+    tenantId: owner.tenant_id,
+    duplicate: !inserted,
+    queued: inserted && status === 'pending',
+    ignored: inserted && status === 'ignored',
     topic: webhook.topic,
     sourceOrderId,
   };

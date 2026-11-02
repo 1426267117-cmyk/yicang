@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   extractShopifyOrderId,
   receiveShopifyOrderWebhook,
+  SHOPIFY_WEBHOOK_MAX_BODY_BYTES,
   verifyShopifyWebhookHmac,
 } from '../lib/connectors/shopify/webhook';
 
@@ -83,6 +84,7 @@ describe('Shopify webhook 安全接收', () => {
       sourceOrderId: 'gid://shopify/Order/9001',
     });
     expect(duplicate).toMatchObject({ accepted: true, duplicate: true });
+    expect(duplicate).toMatchObject({ queued: false, ignored: false });
 
     const rows = await db.prepare('SELECT * FROM shopify_webhook_events').all<Record<string, unknown>>();
     expect(rows.results).toHaveLength(1);
@@ -117,6 +119,98 @@ describe('Shopify webhook 安全接收', () => {
     const count = await db.prepare('SELECT COUNT(*) AS count FROM shopify_webhook_events')
       .first<{ count: number }>();
     expect(count?.count).toBe(0);
+  });
+
+  it('多租户归属歧义时拒绝随机选择租户', async () => {
+    await db.prepare('INSERT INTO tenants (id, name, created_at) VALUES (?, ?, ?)')
+      .bind('tenant_webhook_other', 'Other', '2026-11-02T00:00:00.000Z').run();
+    await db.prepare(`
+      INSERT INTO connector_credentials (
+        id, tenant_id, platform, store_key, shop_domain, official_store_id,
+        access_token_ciphertext, refresh_token_ciphertext, granted_scopes,
+        access_token_expires_at, refresh_token_expires_at, refresh_started_at,
+        key_version, created_by, created_at, updated_at
+      ) VALUES (?, ?, 'shopify', 'bizfurniz', ?, ?, ?, NULL, 'read_orders',
+        NULL, NULL, NULL, 1, 'test', ?, ?)
+    `).bind(
+      'credential_webhook_other', 'tenant_webhook_other', shopDomain,
+      'gid://shopify/Shop/1001', 'v1:test-only',
+      '2026-11-02T00:00:00.000Z', '2026-11-02T00:00:00.000Z',
+    ).run();
+    const body = new TextEncoder().encode('{"id":9001,"admin_graphql_api_id":"gid://shopify/Order/9001"}');
+    await expect(receiveShopifyOrderWebhook({
+      db,
+      runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      storeKey: 'bizfurniz',
+      headers: await signedHeaders(body, { topic: 'orders/create', webhookId: 'ambiguous' }),
+      rawBody: body,
+    })).rejects.toMatchObject({ code: 'SHOPIFY_WEBHOOK_STORE_AMBIGUOUS', status: 409 });
+    expect((await db.prepare('SELECT COUNT(*) AS count FROM shopify_webhook_events').first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it('错误域名、未授权店铺和缺失请求头均拒绝入队', async () => {
+    const body = new TextEncoder().encode('{"id":9001}');
+    const wrongDomain = await signedHeaders(body, { topic: 'orders/create', webhookId: 'wrong-domain' });
+    wrongDomain.set('X-Shopify-Shop-Domain', 'other-store.myshopify.com');
+    await expect(receiveShopifyOrderWebhook({
+      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      storeKey: 'bizfurniz', headers: wrongDomain, rawBody: body,
+    })).rejects.toMatchObject({ code: 'SHOPIFY_WEBHOOK_SHOP_MISMATCH', status: 401 });
+
+    const missingHeader = await signedHeaders(body, { topic: 'orders/create', webhookId: 'missing-header' });
+    missingHeader.delete('X-Shopify-Topic');
+    await expect(receiveShopifyOrderWebhook({
+      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      storeKey: 'bizfurniz', headers: missingHeader, rawBody: body,
+    })).rejects.toMatchObject({ code: 'SHOPIFY_WEBHOOK_HEADER_MISSING', status: 400 });
+
+    await db.prepare('DELETE FROM connector_credentials').run();
+    await expect(receiveShopifyOrderWebhook({
+      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      storeKey: 'bizfurniz',
+      headers: await signedHeaders(body, { topic: 'orders/create', webhookId: 'unauthorized' }),
+      rawBody: body,
+    })).rejects.toMatchObject({ code: 'SHOPIFY_WEBHOOK_STORE_UNAUTHORIZED', status: 401 });
+  });
+
+  it('超限请求拒绝，缺少订单标识的已验签事件安全标记 ignored', async () => {
+    const oversized = new Uint8Array(SHOPIFY_WEBHOOK_MAX_BODY_BYTES + 1);
+    await expect(receiveShopifyOrderWebhook({
+      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      storeKey: 'bizfurniz', headers: new Headers(), rawBody: oversized,
+    })).rejects.toMatchObject({ code: 'SHOPIFY_WEBHOOK_TOO_LARGE', status: 413 });
+
+    const missingOrder = new TextEncoder().encode('{"note":"no order id"}');
+    const result = await receiveShopifyOrderWebhook({
+      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      storeKey: 'bizfurniz',
+      headers: await signedHeaders(missingOrder, { topic: 'orders/updated', webhookId: 'missing-order' }),
+      rawBody: missingOrder,
+    });
+    expect(result).toMatchObject({ accepted: true, queued: false, ignored: true, sourceOrderId: null });
+    const row = await db.prepare(`SELECT status, last_error_code FROM shopify_webhook_events WHERE webhook_id = 'missing-order'`)
+      .first<{ status: string; last_error_code: string | null }>();
+    expect(row).toEqual({ status: 'ignored', last_error_code: 'SHOPIFY_WEBHOOK_ORDER_ID_MISSING' });
+  });
+
+  it('订单删除通知只安全留痕，不进入完整订单抓取队列', async () => {
+    const body = new TextEncoder().encode('{"id":9001,"admin_graphql_api_id":"gid://shopify/Order/9001"}');
+    const result = await receiveShopifyOrderWebhook({
+      db,
+      runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      storeKey: 'bizfurniz',
+      headers: await signedHeaders(body, { topic: 'orders/delete', webhookId: 'order-delete' }),
+      rawBody: body,
+    });
+    expect(result).toMatchObject({ accepted: true, queued: false, ignored: true });
+    const row = await db.prepare(`SELECT status, source_order_id, last_error_code
+      FROM shopify_webhook_events WHERE webhook_id = 'order-delete'`)
+      .first<{ status: string; source_order_id: string | null; last_error_code: string | null }>();
+    expect(row).toEqual({
+      status: 'ignored',
+      source_order_id: 'gid://shopify/Order/9001',
+      last_error_code: null,
+    });
   });
 
   it('退款和履约事件可还原对应的 Shopify Order GID', () => {

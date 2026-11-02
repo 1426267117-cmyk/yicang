@@ -1,6 +1,7 @@
-import { env } from 'cloudflare:workers';
+import { env, waitUntil } from 'cloudflare:workers';
 import { ensureDatabase } from '../../../../../../db/initialize';
 import { isShopifyStoreKey } from '../../../../../../lib/connectors/shopify/config';
+import { processShopifyWebhookBatch } from '../../../../../../lib/connectors/shopify/webhook-consumer';
 import {
   receiveShopifyOrderWebhook,
   SHOPIFY_WEBHOOK_MAX_BODY_BYTES,
@@ -37,6 +38,22 @@ export async function POST(
       headers: request.headers,
       rawBody: await readRequestBody(request),
     });
+    if (result.queued) {
+      waitUntil(processShopifyWebhookBatch({
+        db: runtimeEnv.DB,
+        tenantId: result.tenantId,
+        runtimeEnv,
+        requestUrl: request.url,
+        // Keep the acknowledgement path small. The protected compensation job
+        // drains backlog and advances delayed retries.
+        maxEvents: 1,
+      }).catch((processingError) => {
+        console.error('shopify_webhook_background_process_failed', JSON.stringify({
+          storeKey,
+          errorName: processingError instanceof Error ? processingError.name : 'UnknownError',
+        }));
+      }));
+    }
     return Response.json({
       ok: true,
       accepted: result.accepted,
