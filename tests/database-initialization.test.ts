@@ -29,17 +29,18 @@ describe('数据库初始化', () => {
     expect(sql).not.toMatch(/INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+(platform_stores|platform_orders|platform_order_lines|platform_refunds|platform_fulfillments)/i);
   });
 
-  it('公开站点允许任意已登录 GPT 账号使用，同时拒绝匿名业务访问', () => {
+  it('开发开放模式保留管理员联调，正式模式强制名单和成员角色', () => {
     const dbSource = readFileSync(new URL('../lib/db.ts', import.meta.url), 'utf8');
     const syncSource = readFileSync(
       new URL('../app/api/connectors/shopify/sync/route.ts', import.meta.url),
       'utf8',
     );
     expect(dbSource).toContain("'AUTH_REQUIRED'");
-    expect(dbSource).toContain("const role: Role = 'admin'");
-    expect(dbSource).not.toContain('ERP_ACCESS_NOT_ALLOWED');
-    expect(dbSource).not.toContain('ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED');
-    expect(dbSource).not.toContain('ERP_SYNC_OPERATOR_EMAIL_REQUIRED');
+    expect(dbSource).toContain("developmentOpenAccess ? 'admin' : member.role");
+    expect(dbSource).toContain('ERP_ACCESS_POLICY_REQUIRED');
+    expect(dbSource).toContain('ERP_ACCESS_NOT_ALLOWED');
+    expect(dbSource).toContain('ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED');
+    expect(dbSource).toContain('ERP_SYNC_OPERATOR_EMAIL_REQUIRED');
     expect(syncSource).toContain('requireProductionAccessPolicy(runtimeEnv, user.email)');
   });
 });
