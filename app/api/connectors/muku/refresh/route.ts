@@ -9,6 +9,7 @@ import {
   InternalJobAuthError,
   requireInternalJobToken,
 } from '../../../../../lib/internal-job-auth';
+import { externalScheduleConfigured } from '../../../../../lib/procurement-operations';
 import {
   createMukuClient,
   mukuErrorResponse,
@@ -23,6 +24,7 @@ export async function POST(request: Request) {
   try {
     const runtimeEnv = env as unknown as Record<string, unknown> & { DB?: D1Database };
     requireInternalJobToken(request.headers, runtimeEnv);
+    const scheduleConfigured = externalScheduleConfigured(runtimeEnv, 'muku');
     const db = runtimeEnv.DB;
     if (!db) throw new HttpError(503, '数据库尚未绑定，请稍后重试', 'DATABASE_UNAVAILABLE');
     await ensureDatabase(db);
@@ -65,8 +67,10 @@ export async function POST(request: Request) {
       attempted: results.filter((result) => result.attempted).length,
       results,
       scheduling: {
-        externalScheduleConfigured: false,
-        note: '此接口仅提供受保护的任务入口；生产调度需由部署环境单独配置。',
+        externalScheduleConfigured: scheduleConfigured,
+        note: scheduleConfigured
+          ? '部署环境已声明配置外部调度；本次响应只证明任务调用成功，不证明后续调度一定执行。'
+          : '此接口仅提供受保护的任务入口；生产调度需由部署环境单独配置。',
       },
     }, { headers: NO_STORE_HEADERS });
   } catch (error) {

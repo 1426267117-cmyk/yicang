@@ -8,6 +8,7 @@ import type {
 import { developmentOpenAccessEnabled } from './access-policy';
 import { HttpError, requirePermission, type UserContext } from './db';
 import { evaluateMukuFreshness } from './muku-freshness-service';
+import { buildProcurementOperationsStatus } from './procurement-operations';
 import {
   createPurchaseRequestFromAllocations,
   getPurchaseRequest,
@@ -412,7 +413,7 @@ export async function getPurchasePlanning(
       ready: official && reasons.length === 0,
       lastSuccessAt,
       ageMinutes,
-      syncStatus: source.sync_status,
+      syncStatus: source.sync_status ?? 'not_started',
       lastErrorCode: source.sync_last_error_code,
       lastErrorAt: source.sync_last_error_at,
       reasons,
@@ -430,6 +431,12 @@ export async function getPurchasePlanning(
     : rows.some((row) => row.decision === 'blocked')
       ? 'blocked' as const
       : 'ready' as const;
+  const operations = buildProcurementOperationsStatus({
+    freshness,
+    orderSources,
+    orderSyncMaxAgeMinutes,
+    runtimeEnv,
+  });
 
   return {
     ok: true as const,
@@ -446,6 +453,7 @@ export async function getPurchasePlanning(
     orderSourceMaxAgeMinutes: orderSyncMaxAgeMinutes,
     orderSourceBlockers,
     orderSources,
+    operations,
     freshness,
     summary: {
       rows: rows.length,

@@ -6,6 +6,10 @@ import {
 } from '../../../../../lib/muku-freshness-service';
 import { getMukuStatus } from '../../../../../lib/muku-sync-service';
 import {
+  externalScheduleConfigured,
+  hasSecureInternalJobToken,
+} from '../../../../../lib/procurement-operations';
+import {
   createMukuClient,
   hasMukuConfiguration,
   mukuErrorResponse,
@@ -19,6 +23,7 @@ export async function GET(request: Request) {
     const { db, user } = await requestContext(request);
     const runtimeEnv = env as unknown as Record<string, unknown>;
     const configured = hasMukuConfiguration();
+    const internalJobAuthConfigured = hasSecureInternalJobToken(runtimeEnv);
     const [status, freshness] = await Promise.all([
       getMukuStatus(db, user),
       evaluateMukuFreshness(db, user.tenantId, { runtimeEnv }),
@@ -45,8 +50,12 @@ export async function GET(request: Request) {
       autoRefresh: {
         mode: 'stale-while-revalidate',
         refreshTriggered,
+        pageRefreshGuaranteesCollection: false,
         internalJobEndpoint: '/api/connectors/muku/refresh',
-        externalScheduleConfigured: false,
+        internalJobAuthConfigured,
+        endpointReady: configured && internalJobAuthConfigured,
+        externalScheduleConfigured: externalScheduleConfigured(runtimeEnv, 'muku'),
+        nextRefreshDueAt: freshness.nextRefreshAt,
       },
     }, { headers: NO_STORE_HEADERS });
   } catch (error) {

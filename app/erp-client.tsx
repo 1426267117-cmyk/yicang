@@ -131,6 +131,37 @@ type PurchasePlanningFreshness = {
   }>;
   blockingReasons: PurchasePlanningReason[];
 };
+type PurchasePlanningOperations = {
+  checkedAt: string;
+  browserRefresh: {
+    guaranteedCollection: false;
+    shopifySyncTriggered: false;
+    mukuDueRefreshMayTrigger: boolean;
+    note: string;
+  };
+  internalJobAuthConfigured: boolean;
+  automationReady: boolean;
+  muku: {
+    protectedEndpoint: string; endpointReady: boolean; sourceConfigured: boolean;
+    externalScheduleConfigured: boolean; automationReady: boolean;
+    recommendedIntervalMinutes: number; dataReady: boolean;
+    sourceGeneratedAt: string | null; lastSuccessAt: string | null;
+    freshUntil: string | null; nextRefreshDueAt: string | null;
+    configurationBlockers: string[]; dataBlockers: string[];
+  };
+  shopify: {
+    protectedEndpoint: string; endpointReady: boolean; sourceConfigured: boolean;
+    externalScheduleConfigured: boolean; automationReady: boolean;
+    recommendedIntervalMinutes: number; maxAgeMinutes: number;
+    lastSuccessAt: string | null; nextExpiryAt: string | null;
+    configurationBlockers: string[];
+    stores: Array<{
+      storeId: string; storeKey: string; storeName: string; ready: boolean;
+      lastSuccessAt: string | null; ageMinutes: number | null; freshUntil: string | null;
+      syncStatus: string; lastErrorCode: string | null; reasons: string[];
+    }>;
+  };
+};
 type PurchasePlanningRow = {
   planRowId: string; calculationVersion: string; recommendationVersion: string;
   skuId: string; skuCode: string; skuName: string;
@@ -199,6 +230,7 @@ type PurchasePlanningPayload = {
   }>;
   calculationVersion: string;
   formula: { target: string; coverage: string; recommendation: string; deduplication: string; mukuInbound: string };
+  operations: PurchasePlanningOperations;
   freshness: PurchasePlanningFreshness;
   summary: {
     rows: number; buy: number; noPurchase: number; blocked: number;
@@ -1520,6 +1552,7 @@ function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanR
         ? { label: 'MUKU 出口已更新，仓库源数据需处理', className: 'error' }
         : { label: '库存数据不可用于采购', className: 'error' };
   const inventoryFreshness = freshness.datasets.find((item) => item.dataset === 'inventory');
+  const operations = planning.operations;
   const selectedRows = planning.rows.filter((row) => selectedPlanRowIds.has(row.planRowId));
   const selectedQuantity = selectedRows.reduce((sum, row) => sum + row.conversion.eligibleOrderQty, 0);
   const mappingExceptions = planning.mappingExceptions.muku;
@@ -1529,6 +1562,27 @@ function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanR
       <div className="planning-source-times"><span>MUKU 库存生成 <b>{formatOptionalTime(inventoryFreshness?.generatedAt ?? null)}</b></span><span>ERP 同步 <b>{formatOptionalTime(inventoryFreshness?.lastSuccessAt ?? null)}</b></span></div>
       {!freshness.readyForProcurement && <p>{freshness.blockingReasons.map((reason) => reason.message).join('；') || '库存快照状态未知，暂不允许转采购申请。'}</p>}
       {freshness.readyForProcurement && sourceTimeBlocked && <p>ERP 刚读取到 MUKU 导出，但至少一项仓库业务源时间未知、无效或超过采购时效，相关建议已被阻断。</p>}
+    </section>
+    <section className="planning-operations" aria-label="采购数据自动化运维状态">
+      <div className="planning-operations-head">
+        <div><strong>持续同步与到期监控</strong><small>{operations.browserRefresh.note}</small></div>
+        <span className={`status-pill ${operations.automationReady ? 'success' : 'danger'}`}>{operations.automationReady ? '安全调度已确认' : '自动化尚未闭环'}</span>
+      </div>
+      <div className="planning-operations-grid">
+        <article className={operations.muku.dataReady ? 'ready' : 'blocked'}>
+          <div className="planning-operation-title"><div><strong>MUKU 库存</strong><small>建议每 {operations.muku.recommendedIntervalMinutes} 分钟检查一次到期状态</small></div><span className={`status-pill ${operations.muku.automationReady ? 'success' : ''}`}>{operations.muku.automationReady ? '已调度' : operations.muku.endpointReady ? '仅任务入口' : '入口未就绪'}</span></div>
+          <div className="planning-operation-times"><span>最近成功<b>{formatOptionalTime(operations.muku.lastSuccessAt)}</b></span><span>数据有效至<b>{formatOptionalTime(operations.muku.freshUntil)}</b></span><span>建议刷新点<b>{formatOptionalTime(operations.muku.nextRefreshDueAt)}</b></span></div>
+          <small className="planning-operation-config">受保护入口：{operations.muku.endpointReady ? '已就绪' : '未就绪'} · 外部调度：{operations.muku.externalScheduleConfigured ? '已声明配置' : '未确认'}</small>
+          {[...operations.muku.configurationBlockers, ...operations.muku.dataBlockers].length > 0 && <p>{[...operations.muku.configurationBlockers, ...operations.muku.dataBlockers].join('；')}</p>}
+        </article>
+        <article className={operations.shopify.stores.length > 0 && operations.shopify.stores.every((store) => store.ready) ? 'ready' : 'blocked'}>
+          <div className="planning-operation-title"><div><strong>Shopify 订单</strong><small>增量补漏建议每 {operations.shopify.recommendedIntervalMinutes} 分钟运行，允许时效 {operations.shopify.maxAgeMinutes} 分钟</small></div><span className={`status-pill ${operations.shopify.automationReady ? 'success' : ''}`}>{operations.shopify.automationReady ? '已调度' : operations.shopify.endpointReady ? '仅任务入口' : '入口未就绪'}</span></div>
+          <div className="planning-operation-times"><span>最近成功<b>{formatOptionalTime(operations.shopify.lastSuccessAt)}</b></span><span>最早到期<b>{formatOptionalTime(operations.shopify.nextExpiryAt)}</b></span><span>官方店铺<b>{operations.shopify.stores.length || '无'}</b></span></div>
+          <small className="planning-operation-config">受保护入口：{operations.shopify.endpointReady ? '已就绪' : '未就绪'} · 外部调度：{operations.shopify.externalScheduleConfigured ? '已声明配置' : '未确认'}</small>
+          {operations.shopify.stores.length > 0 && <div className="planning-store-syncs">{operations.shopify.stores.map((store) => <span key={store.storeId}><b>{store.storeName}</b>{formatOptionalTime(store.lastSuccessAt)} → {formatOptionalTime(store.freshUntil)}{store.reasons.length ? ` · ${store.reasons.map(planningReasonLabel).join('、')}` : ' · 正常'}</span>)}</div>}
+          {operations.shopify.configurationBlockers.length > 0 && <p>{operations.shopify.configurationBlockers.join('；')}</p>}
+        </article>
+      </div>
     </section>
     <section className="planning-formula" aria-label="采购建议公式"><div><strong>系统怎么算</strong><span>{planning.formula.target} − {planning.formula.coverage}</span></div><small>{planning.formula.recommendation}。MUKU 在途只展示，不参与抵扣。</small></section>
     {error && <div className="planning-inline-warning">{error}</div>}
