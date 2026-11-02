@@ -21,7 +21,8 @@ async function initialize(db: D1Database) {
       'purchase_receipts', 'purchase_receipt_lines', 'inventory_inbound_movements',
       'muku_dataset_state', 'muku_sync_runs', 'muku_snapshots',
       'muku_inventory_records', 'muku_inventory_detail_records',
-      'muku_inventory_risk_records', 'muku_source_status_records'
+      'muku_inventory_risk_records', 'muku_source_status_records',
+      'muku_sku_mappings', 'sku_procurement_policies'
     )
   `).all<{ name: string }>();
   const names = new Set(schema.results.map((row) => row.name));
@@ -37,7 +38,8 @@ async function initialize(db: D1Database) {
   if (!names.has('muku_dataset_state') || !names.has('muku_sync_runs')
     || !names.has('muku_snapshots') || !names.has('muku_inventory_records')
     || !names.has('muku_inventory_detail_records') || !names.has('muku_inventory_risk_records')
-    || !names.has('muku_source_status_records')) {
+    || !names.has('muku_source_status_records') || !names.has('muku_sku_mappings')
+    || !names.has('sku_procurement_policies')) {
     throw new Error('DATABASE_MIGRATIONS_PENDING');
   }
   await db.prepare('PRAGMA optimize').run();

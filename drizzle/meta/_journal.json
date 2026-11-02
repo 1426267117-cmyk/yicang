@@ -78,6 +78,13 @@
       "when": 1793604784037,
       "tag": "0010_mute_eternity",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1793608857425,
+      "tag": "0011_dazzling_menace",
+      "breakpoints": true
     }
   ]
 }

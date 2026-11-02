@@ -53,6 +53,38 @@ export const createPurchaseRequestSchema = z.object({
   }
 });
 
+export const upsertMukuSkuMappingSchema = z.object({
+  mukuSku: z.string().trim().min(1).max(240),
+  skuId: z.string().trim().min(1),
+});
+
+export const upsertSkuProcurementPolicySchema = z.object({
+  skuId: z.string().trim().min(1),
+  safetyDays: z.number().int().min(0).max(365).optional(),
+  safetyStockQty: z.number().int().min(0).max(100_000_000).nullable().optional(),
+  moq: z.number().int().positive().max(100_000_000).nullable().optional(),
+  packSize: z.number().int().positive().max(100_000_000).nullable().optional(),
+  leadTimeDays: z.number().int().min(0).max(3650).nullable().optional(),
+  preferredSupplierId: z.string().trim().min(1).nullable().optional(),
+});
+
+const purchasePlanningSelectionSchema = z.object({
+  planRowId: z.string().trim().min(1),
+  recommendationVersion: z.string().trim().min(16).max(128),
+});
+
+export const createPlanningPurchaseRequestSchema = z.object({
+  selections: z.array(purchasePlanningSelectionSchema).min(1).max(100),
+  purchaserMemberId: z.string().trim().min(1),
+  reviewerMemberId: z.string().trim().min(1),
+  note: z.string().trim().max(500).optional(),
+}).superRefine((value, context) => {
+  const rowIds = value.selections.map((selection) => selection.planRowId);
+  if (new Set(rowIds).size !== rowIds.length) {
+    context.addIssue({ code: 'custom', message: '采购建议不能重复选择', path: ['selections'] });
+  }
+});
+
 export const purchaseRequestActionSchema = z.object({
   action: z.enum(['submit', 'approve', 'reject', 'cancel']),
   note: z.string().trim().max(500).optional(),
@@ -120,6 +152,9 @@ export type CreateOrderInput = z.infer<typeof createOrderSchema>;
 export type ShopifyOrderSyncInput = z.infer<typeof shopifyOrderSyncSchema>;
 export type ShopifyWebhookProcessInput = z.infer<typeof shopifyWebhookProcessSchema>;
 export type CreatePurchaseRequestInput = z.infer<typeof createPurchaseRequestSchema>;
+export type UpsertMukuSkuMappingInput = z.infer<typeof upsertMukuSkuMappingSchema>;
+export type UpsertSkuProcurementPolicyInput = z.infer<typeof upsertSkuProcurementPolicySchema>;
+export type CreatePlanningPurchaseRequestInput = z.infer<typeof createPlanningPurchaseRequestSchema>;
 export type PurchaseRequestActionInput = z.infer<typeof purchaseRequestActionSchema>;
 export type CreateSupplierInput = z.infer<typeof createSupplierSchema>;
 export type CreateWarehouseInput = z.infer<typeof createWarehouseSchema>;

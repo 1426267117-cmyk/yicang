@@ -221,14 +221,87 @@ export async function createPurchaseRequest(
   input: CreatePurchaseRequestInput,
   idempotencyKey: string,
 ) {
-  requirePermission(user, 'purchase:create');
-  validateIdempotencyKey(idempotencyKey);
   const normalizedInput = {
     ...input,
     demandIds: [...input.demandIds].sort(),
     note: input.note?.trim() || null,
   };
-  const requestHash = await hashPayload(normalizedInput);
+  return createPurchaseRequestWithAllocations(db, user, {
+    purchaserMemberId: normalizedInput.purchaserMemberId,
+    reviewerMemberId: normalizedInput.reviewerMemberId,
+    note: normalizedInput.note,
+    allocations: normalizedInput.demandIds.map((demandId) => ({
+      demandId,
+      requestedQuantity: null,
+    })),
+    requestHashInput: normalizedInput,
+    auditAction: 'CREATE_PURCHASE_REQUEST',
+    auditContext: null,
+  }, idempotencyKey);
+}
+
+export type PurchaseRequestAllocationInput = {
+  purchaserMemberId: string;
+  reviewerMemberId: string;
+  note?: string | null;
+  allocations: Array<{ demandId: string; requestedQuantity: number }>;
+  recommendationVersions: string[];
+  planningInputHash: string;
+};
+
+export async function createPurchaseRequestFromAllocations(
+  db: D1Database,
+  user: UserContext,
+  input: PurchaseRequestAllocationInput,
+  idempotencyKey: string,
+) {
+  const normalizedInput = {
+    purchaserMemberId: input.purchaserMemberId,
+    reviewerMemberId: input.reviewerMemberId,
+    note: input.note?.trim() || null,
+    allocations: [...input.allocations].sort((left, right) => left.demandId.localeCompare(right.demandId)),
+    recommendationVersions: [...input.recommendationVersions].sort(),
+    planningInputHash: input.planningInputHash,
+  };
+  return createPurchaseRequestWithAllocations(db, user, {
+    ...normalizedInput,
+    allocations: normalizedInput.allocations.map((allocation) => ({
+      ...allocation,
+      requestedQuantity: allocation.requestedQuantity,
+    })),
+    requestHashInput: normalizedInput,
+    auditAction: 'CREATE_PURCHASE_REQUEST_FROM_PLAN',
+    auditContext: {
+      recommendationVersions: normalizedInput.recommendationVersions,
+      planningInputHash: normalizedInput.planningInputHash,
+    },
+  }, idempotencyKey);
+}
+
+async function createPurchaseRequestWithAllocations(
+  db: D1Database,
+  user: UserContext,
+  input: {
+    purchaserMemberId: string;
+    reviewerMemberId: string;
+    note: string | null;
+    allocations: Array<{ demandId: string; requestedQuantity: number | null }>;
+    requestHashInput: unknown;
+    auditAction: string;
+    auditContext: Record<string, unknown> | null;
+  },
+  idempotencyKey: string,
+) {
+  requirePermission(user, 'purchase:create');
+  validateIdempotencyKey(idempotencyKey);
+  if (input.allocations.length === 0) {
+    throw new HttpError(400, '采购申请至少需要一条需求', 'PURCHASE_REQUEST_EMPTY');
+  }
+  const demandIds = input.allocations.map((allocation) => allocation.demandId);
+  if (new Set(demandIds).size !== demandIds.length) {
+    throw new HttpError(400, '采购需求不能重复选择', 'PURCHASE_DEMAND_DUPLICATE');
+  }
+  const requestHash = await hashPayload(input.requestHashInput);
   const existing = await db.prepare(`
     SELECT id, request_hash
     FROM purchase_requests
@@ -246,11 +319,25 @@ export async function createPurchaseRequest(
   await validateAssignedMembers(
     db,
     user.tenantId,
-    normalizedInput.purchaserMemberId,
-    normalizedInput.reviewerMemberId,
+    input.purchaserMemberId,
+    input.reviewerMemberId,
   );
-  const demands = await loadCreateDemands(db, user.tenantId, normalizedInput.demandIds);
-  validateCreateDemands(normalizedInput.demandIds, demands);
+  const demands = await loadCreateDemands(db, user.tenantId, demandIds);
+  validateCreateDemands(demandIds, demands);
+  const demandById = new Map(demands.map((demand) => [demand.id, demand]));
+  const resolvedAllocations = input.allocations.map((allocation) => {
+    const demand = demandById.get(allocation.demandId)!;
+    const requestedQuantity = allocation.requestedQuantity ?? Number(demand.required_quantity);
+    if (!Number.isSafeInteger(requestedQuantity) || requestedQuantity <= 0
+      || requestedQuantity > Number(demand.required_quantity)) {
+      throw new HttpError(
+        409,
+        '采购建议分配量已超过当前订单需求，请刷新后重试',
+        'PURCHASE_ALLOCATION_INVALID',
+      );
+    }
+    return { demand, requestedQuantity };
+  });
 
   const now = new Date().toISOString();
   const requestId = crypto.randomUUID();
@@ -258,9 +345,11 @@ export async function createPurchaseRequest(
   const auditAfter = JSON.stringify({
     status: 'draft',
     requestNo,
-    purchaserMemberId: normalizedInput.purchaserMemberId,
-    reviewerMemberId: normalizedInput.reviewerMemberId,
+    purchaserMemberId: input.purchaserMemberId,
+    reviewerMemberId: input.reviewerMemberId,
     lineCount: demands.length,
+    totalQuantity: resolvedAllocations.reduce((sum, allocation) => sum + allocation.requestedQuantity, 0),
+    ...(input.auditContext ?? {}),
   });
   const statements: D1PreparedStatement[] = [
     db.prepare(`
@@ -273,10 +362,10 @@ export async function createPurchaseRequest(
       requestId,
       user.tenantId,
       requestNo,
-      normalizedInput.purchaserMemberId,
-      normalizedInput.reviewerMemberId,
+      input.purchaserMemberId,
+      input.reviewerMemberId,
       createdByMemberId,
-      normalizedInput.note,
+      input.note,
       idempotencyKey,
       requestHash,
       idempotencyKey,
@@ -284,7 +373,7 @@ export async function createPurchaseRequest(
       now,
     ),
   ];
-  for (const demand of demands) {
+  for (const { demand, requestedQuantity } of resolvedAllocations) {
     statements.push(db.prepare(`
       INSERT INTO purchase_request_lines (
         id, tenant_id, request_id, purchase_demand_id, sku_id, requested_quantity,
@@ -296,7 +385,7 @@ export async function createPurchaseRequest(
       requestId,
       demand.id,
       demand.mapped_sku_id,
-      demand.required_quantity,
+      requestedQuantity,
       demand.required_quantity,
       demand.source_updated_at,
       now,
@@ -304,7 +393,7 @@ export async function createPurchaseRequest(
   }
   statements.push(auditInsertStatement(db, {
     user,
-    action: 'CREATE_PURCHASE_REQUEST',
+    action: input.auditAction,
     entityId: requestId,
     beforeJson: null,
     afterJson: auditAfter,

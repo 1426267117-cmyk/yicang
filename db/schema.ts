@@ -44,6 +44,23 @@ export const skus = sqliteTable('skus', {
   createdAt: text('created_at').notNull(),
 }, (table) => [uniqueIndex('uq_skus_tenant_code').on(table.tenantId, table.code)]);
 
+export const mukuSkuMappings = sqliteTable('muku_sku_mappings', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  mukuSku: text('muku_sku').notNull(),
+  normalizedMukuSku: text('normalized_muku_sku').notNull(),
+  skuId: text('sku_id').notNull().references(() => skus.id),
+  mappingSource: text('mapping_source', { enum: ['manual', 'exact'] }).notNull(),
+  createdBy: text('created_by').notNull(),
+  updatedBy: text('updated_by').notNull(),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_muku_sku_mappings_source').on(table.tenantId, table.mukuSku),
+  index('idx_muku_sku_mappings_normalized').on(table.tenantId, table.normalizedMukuSku),
+  index('idx_muku_sku_mappings_target').on(table.tenantId, table.skuId),
+]);
+
 export const inventoryBalances = sqliteTable('inventory_balances', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),
@@ -397,6 +414,30 @@ export const suppliers = sqliteTable('suppliers', {
   uniqueIndex('uq_suppliers_tenant_code').on(table.tenantId, table.code),
   uniqueIndex('uq_suppliers_tenant_idempotency').on(table.tenantId, table.idempotencyKey),
   index('idx_suppliers_tenant_active').on(table.tenantId, table.active, table.name),
+]);
+
+export const skuProcurementPolicies = sqliteTable('sku_procurement_policies', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  skuId: text('sku_id').notNull().references(() => skus.id),
+  safetyDays: integer('safety_days').notNull().default(14),
+  safetyStockQty: integer('safety_stock_qty'),
+  moq: integer('moq'),
+  packSize: integer('pack_size'),
+  leadTimeDays: integer('lead_time_days'),
+  preferredSupplierId: text('preferred_supplier_id').references(() => suppliers.id),
+  createdBy: text('created_by').notNull(),
+  updatedBy: text('updated_by').notNull(),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_sku_procurement_policies').on(table.tenantId, table.skuId),
+  index('idx_sku_procurement_policies_supplier').on(table.tenantId, table.preferredSupplierId),
+  check('ck_sku_procurement_safety_days', sql`${table.safetyDays} >= 0 AND ${table.safetyDays} <= 365`),
+  check('ck_sku_procurement_safety_stock', sql`${table.safetyStockQty} IS NULL OR ${table.safetyStockQty} >= 0`),
+  check('ck_sku_procurement_moq', sql`${table.moq} IS NULL OR ${table.moq} > 0`),
+  check('ck_sku_procurement_pack_size', sql`${table.packSize} IS NULL OR ${table.packSize} > 0`),
+  check('ck_sku_procurement_lead_time', sql`${table.leadTimeDays} IS NULL OR ${table.leadTimeDays} >= 0`),
 ]);
 
 export const purchaseOrders = sqliteTable('purchase_orders', {
