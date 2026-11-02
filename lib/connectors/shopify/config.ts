@@ -89,8 +89,14 @@ export function configuredShopifyEnvironmentStoreKeys(
   runtimeEnv: Record<string, unknown>,
 ): ShopifyStoreKey[] {
   return SHOPIFY_STORE_CANDIDATES
-    .map((candidate) => candidate.key)
-    .filter((storeKey) => hasShopifyCredentials(resolveShopifyStoreConfig(runtimeEnv, storeKey)));
+    // Target discovery must not parse optional SHOP_DOMAIN values for stores
+    // that have no usable server-side credential. A stale typo in an unused
+    // candidate must not stop reconciliation for every authorized store.
+    .filter((candidate) => envString(
+      runtimeEnv,
+      `${candidate.environmentPrefix}_ADMIN_ACCESS_TOKEN`,
+    ) !== null)
+    .map((candidate) => candidate.key);
 }
 
 export function hasShopifyAppCredentials(config: ShopifyCredentialConfig) {

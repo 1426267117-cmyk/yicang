@@ -47,7 +47,6 @@ export function buildProcurementOperationsStatus(input: {
   const configuredShopifyStoreKeys = new Set([
     ...configuredShopifyEnvironmentStoreKeys(input.runtimeEnv),
     ...(input.shopifyAuthorizedStoreKeys ?? []).filter(isShopifyStoreKey),
-    ...officialShopifySources.map((source) => source.storeKey).filter(isShopifyStoreKey),
   ]);
   const shopifySourceConfigured = configuredShopifyStoreKeys.size > 0;
   const mukuEndpointReady = internalJobAuthConfigured && mukuSourceConfigured;

@@ -10,6 +10,7 @@ describe('采购数据自动化运维状态', () => {
     const status = buildProcurementOperationsStatus({
       freshness: freshMukuReport(),
       orderSources: [shopifySource()],
+      shopifyAuthorizedStoreKeys: ['bizfurniz'],
       orderSyncMaxAgeMinutes: 30,
       runtimeEnv: {
         ERP_INTERNAL_JOB_TOKEN: internalToken,
@@ -46,6 +47,7 @@ describe('采购数据自动化运维状态', () => {
     const status = buildProcurementOperationsStatus({
       freshness: freshMukuReport(),
       orderSources: [shopifySource()],
+      shopifyAuthorizedStoreKeys: ['bizfurniz'],
       orderSyncMaxAgeMinutes: 30,
       runtimeEnv: {
         ERP_INTERNAL_JOB_TOKEN: internalToken,
@@ -104,6 +106,27 @@ describe('采购数据自动化运维状态', () => {
 
     expect(status.shopify.sourceConfigured).toBe(true);
     expect(status.shopify.endpointReady).toBe(true);
+  });
+
+  it('历史官方店铺仍展示新鲜度，但凭证已移除时不误报自动化就绪', () => {
+    const status = buildProcurementOperationsStatus({
+      freshness: freshMukuReport(),
+      orderSources: [shopifySource()],
+      shopifyAuthorizedStoreKeys: [],
+      orderSyncMaxAgeMinutes: 30,
+      runtimeEnv: {
+        ERP_INTERNAL_JOB_TOKEN: internalToken,
+        ERP_SHOPIFY_RECONCILE_SCHEDULE_CONFIGURED: true,
+      },
+    });
+
+    expect(status.shopify.stores).toHaveLength(1);
+    expect(status.shopify).toEqual(expect.objectContaining({
+      sourceConfigured: false,
+      endpointReady: false,
+      automationReady: false,
+    }));
+    expect(status.shopify.configurationBlockers.join('；')).toContain('尚未发现 Shopify OAuth 授权');
   });
 
   it('缺少密钥、官方店铺或有效时间时保持未知并给出阻断原因', () => {

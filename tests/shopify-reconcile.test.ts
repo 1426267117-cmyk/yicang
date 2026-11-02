@@ -3,7 +3,11 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('cloudflare:workers', () => ({ env: {} }));
 
 import { handleShopifyReconcileRequest } from '../app/api/connectors/shopify/reconcile/route';
-import type { ShopifyCredentialConfig, ShopifyStoreKey } from '../lib/connectors/shopify/config';
+import {
+  resolveShopifyStoreConfig,
+  type ShopifyCredentialConfig,
+  type ShopifyStoreKey,
+} from '../lib/connectors/shopify/config';
 import { ShopifyConnectorError } from '../lib/connectors/shopify/errors';
 import { reconcileStoredShopifyOrders } from '../lib/connectors/shopify/reconcile';
 
@@ -251,6 +255,78 @@ describe('Shopify 已授权店铺定时对账编排', () => {
     });
     expect(resolveConfig).not.toHaveBeenCalled();
     expect(runSync).not.toHaveBeenCalled();
+  });
+
+  it('未授权候选即使 SHOP_DOMAIN 写错也不会拖垮目标发现', async () => {
+    const resolveConfig = vi.fn();
+    const runSync = vi.fn();
+    const result = await reconcileStoredShopifyOrders({
+      db: {} as D1Database,
+      runtimeEnv: {
+        SHOPIFY_ZIMASYA_SHOP_DOMAIN: 'not-a-shopify-domain.example',
+      },
+      requestUrl: 'https://erp.example/api/connectors/shopify/reconcile',
+      maxPages: 20,
+      dependencies: {
+        loadTargets: async () => [],
+        resolveConfig,
+        runSync: runSync as never,
+      },
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      noConfiguredStores: true,
+      skipReason: 'SHOPIFY_NO_CONFIGURED_STORES',
+      storesChecked: 0,
+      synced: [],
+      skipped: [],
+      failed: [],
+    });
+    expect(resolveConfig).not.toHaveBeenCalled();
+    expect(runSync).not.toHaveBeenCalled();
+  });
+
+  it('单个已配置店铺域名错误时隔离失败并继续同步其他店铺', async () => {
+    const runtimeEnv = {
+      SHOPIFY_ZIMASYA_ADMIN_ACCESS_TOKEN: 'secret-bad-store-token',
+      SHOPIFY_ZIMASYA_SHOP_DOMAIN: 'not-a-shopify-domain.example',
+      SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'secret-good-store-token',
+    };
+    const resolveConfig = vi.fn(async (input: { storeKey: ShopifyStoreKey }) => (
+      resolveShopifyStoreConfig(runtimeEnv, input.storeKey)
+    ));
+    const runSync = vi.fn(async (input: { config: ShopifyCredentialConfig }) => (
+      syncResult(input.config.key)
+    ));
+    const result = await reconcileStoredShopifyOrders({
+      db: {} as D1Database,
+      runtimeEnv,
+      requestUrl: 'https://erp.example/api/connectors/shopify/reconcile',
+      maxPages: 20,
+      dependencies: {
+        loadTargets: async () => [],
+        resolveConfig,
+        runSync: runSync as never,
+      },
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      noConfiguredStores: false,
+      skipReason: null,
+      storesChecked: 2,
+      synced: [expect.objectContaining({ storeKey: 'bizfurniz' })],
+      skipped: [],
+      failed: [{ storeKey: 'zimasya', code: 'SHOPIFY_SYNC_FAILED', retryable: false }],
+    });
+    expect(runSync).toHaveBeenCalledTimes(1);
+    expect(runSync).toHaveBeenCalledWith(expect.objectContaining({
+      config: expect.objectContaining({ key: 'bizfurniz' }),
+    }));
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain('not-a-shopify-domain');
+    expect(serialized).not.toContain('secret-');
   });
 
   it('每次运行都先解析运行时授权，使过期 Token 走统一刷新路径', async () => {
