@@ -211,6 +211,32 @@ describe('Shopify 已授权店铺定时对账编排', () => {
     expect(result.skipped).toEqual([{ storeKey: 'anzhap', code: 'SHOPIFY_AUTHORIZATION_REQUIRED' }]);
     expect(runSync).toHaveBeenCalledTimes(1);
   });
+
+  it('可由托管任务限定到数据库选出的租户范围', async () => {
+    const resolveConfig = vi.fn(async (input: { storeKey: ShopifyStoreKey }) => config(input.storeKey));
+    const runSync = vi.fn(async () => syncResult('bizfurniz'));
+    const result = await reconcileStoredShopifyOrders({
+      db: {} as D1Database,
+      runtimeEnv: {},
+      requestUrl: 'https://erp.example',
+      tenantIds: ['tenant-allowed'],
+      maxPages: 20,
+      dependencies: {
+        loadTargets: async () => [
+          { tenantId: 'tenant-allowed', storeKey: 'bizfurniz' },
+          { tenantId: 'tenant-outside', storeKey: 'zimasya' },
+        ],
+        resolveConfig,
+        runSync: runSync as never,
+      },
+    });
+    expect(result.storesChecked).toBe(1);
+    expect(resolveConfig).toHaveBeenCalledTimes(1);
+    expect(resolveConfig).toHaveBeenCalledWith(expect.objectContaining({
+      tenantId: 'tenant-allowed',
+      storeKey: 'bizfurniz',
+    }));
+  });
 });
 
 function authorizedRequest(body: unknown) {

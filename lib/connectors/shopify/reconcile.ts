@@ -12,6 +12,7 @@ import { sanitizedConnectorError, ShopifyConnectorError } from './errors';
 import { runShopifyOrderSync } from './sync-service';
 
 const MAX_RECONCILE_TARGETS = 100;
+const MAX_RECONCILE_TENANTS = 20;
 
 type StoredReconcileTarget = {
   tenantId: string;
@@ -19,7 +20,7 @@ type StoredReconcileTarget = {
 };
 
 type ReconcileDependencies = {
-  loadTargets: (db: D1Database) => Promise<StoredReconcileTarget[]>;
+  loadTargets: (db: D1Database, tenantIds?: string[]) => Promise<StoredReconcileTarget[]>;
   resolveConfig: typeof resolveShopifyRuntimeConfig;
   runSync: (input: {
     db: D1Database;
@@ -33,6 +34,7 @@ export async function reconcileStoredShopifyOrders(input: {
   db: D1Database;
   runtimeEnv: Record<string, unknown>;
   requestUrl: string;
+  tenantIds?: string[];
   storeKeys?: ShopifyStoreKey[];
   maxPages: number;
   dependencies?: Partial<ReconcileDependencies>;
@@ -43,9 +45,13 @@ export async function reconcileStoredShopifyOrders(input: {
     runSync: runIncrementalSync,
     ...input.dependencies,
   };
+  const requestedTenantIds = input.tenantIds ? new Set(input.tenantIds) : null;
   const requestedKeys = input.storeKeys ? new Set(input.storeKeys) : null;
-  const loaded = await dependencies.loadTargets(input.db);
-  const targets = loaded.filter((target) => !requestedKeys || requestedKeys.has(target.storeKey as ShopifyStoreKey));
+  const loaded = await dependencies.loadTargets(input.db, input.tenantIds);
+  const targets = loaded.filter((target) => (
+    (!requestedTenantIds || requestedTenantIds.has(target.tenantId))
+    && (!requestedKeys || requestedKeys.has(target.storeKey as ShopifyStoreKey))
+  ));
   assertUnambiguousTargets(targets);
 
   const synced: Array<{
@@ -144,14 +150,26 @@ async function runIncrementalSync(input: {
   });
 }
 
-async function loadStoredReconcileTargets(db: D1Database) {
+async function loadStoredReconcileTargets(db: D1Database, tenantIds?: string[]) {
+  if (tenantIds && tenantIds.length > MAX_RECONCILE_TENANTS) {
+    throw new ShopifyConnectorError(
+      'SHOPIFY_RECONCILE_TENANT_LIMIT',
+      '单次 Shopify 对账的租户数量超过安全上限',
+    );
+  }
+  if (tenantIds?.length === 0) return [];
+  const tenantClause = tenantIds
+    ? `AND tenant_id IN (${tenantIds.map(() => '?').join(', ')})`
+    : '';
   const rows = await db.prepare(`
     SELECT tenant_id, store_key
     FROM connector_credentials
     WHERE platform = 'shopify'
+      ${tenantClause}
     ORDER BY store_key, tenant_id
     LIMIT ?
-  `).bind(MAX_RECONCILE_TARGETS + 1).all<{ tenant_id: string; store_key: string }>();
+  `).bind(...(tenantIds ?? []), MAX_RECONCILE_TARGETS + 1)
+    .all<{ tenant_id: string; store_key: string }>();
   if (rows.results.length > MAX_RECONCILE_TARGETS) {
     throw new ShopifyConnectorError(
       'SHOPIFY_RECONCILE_TARGET_LIMIT',
