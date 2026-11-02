@@ -225,25 +225,48 @@ describe('采购团队角色管理', () => {
     expect(await storedRole(db, tenantId, 'member-reviewer')).toBe('admin');
   });
 
-  it('已批准申请存在有效采购单后不再阻止负责人转只读', async () => {
-    await insertRequest(db, 'request-approved', 'approved', 'member-buyer', 'member-owner');
-    await expect(updateManagedMemberRole(db, admin, {
-      memberId: 'member-buyer',
-      role: 'viewer',
-      bootstrapOwnerEmail: ownerEmail,
-    })).rejects.toMatchObject({ code: 'MEMBER_ROLE_ACTIVE_PURCHASER_ASSIGNMENTS' });
+  it.each(['draft', 'issued', 'partially_received'])(
+    '仍负责 %s 采购单时不能降为只读',
+    async (orderStatus) => {
+      await insertRequest(db, 'request-approved', 'approved', 'member-buyer', 'member-owner');
+      await db.prepare(`
+        INSERT INTO purchase_orders (id, tenant_id, purchase_request_id, status)
+        VALUES ('order-active', ?, 'request-approved', ?)
+      `).bind(tenantId, orderStatus).run();
 
-    await db.prepare(`
-      INSERT INTO purchase_orders (id, tenant_id, purchase_request_id, status)
-      VALUES ('order-issued', ?, 'request-approved', 'issued')
-    `).bind(tenantId).run();
-    const changed = await updateManagedMemberRole(db, admin, {
-      memberId: 'member-buyer',
-      role: 'viewer',
-      bootstrapOwnerEmail: ownerEmail,
-    });
-    expect(changed.member.role).toBe('viewer');
-  });
+      await expect(updateManagedMemberRole(db, admin, {
+        memberId: 'member-buyer',
+        role: 'viewer',
+        bootstrapOwnerEmail: ownerEmail,
+      })).rejects.toMatchObject({
+        status: 409,
+        code: 'MEMBER_ROLE_ACTIVE_PURCHASE_ORDERS',
+      });
+      expect(await storedRole(db, tenantId, 'member-buyer')).toBe('operator');
+      expect(await auditCount(db)).toBe(0);
+    },
+  );
+
+  it.each(['received', 'closed_short', 'cancelled'])(
+    '只有 %s 终态采购单时不因该采购单阻止降级',
+    async (orderStatus) => {
+      const requestStatus = orderStatus === 'cancelled' ? 'cancelled' : 'approved';
+      await insertRequest(db, 'request-terminal', requestStatus, 'member-buyer', 'member-owner');
+      await db.prepare(`
+        INSERT INTO purchase_orders (id, tenant_id, purchase_request_id, status)
+        VALUES ('order-terminal', ?, 'request-terminal', ?)
+      `).bind(tenantId, orderStatus).run();
+
+      const changed = await updateManagedMemberRole(db, admin, {
+        memberId: 'member-buyer',
+        role: 'viewer',
+        bootstrapOwnerEmail: ownerEmail,
+      });
+
+      expect(changed.member.role).toBe('viewer');
+      expect(await auditCount(db)).toBe(1);
+    },
+  );
 });
 
 async function createSchema(db: D1Database) {

@@ -88,6 +88,7 @@ export async function updateManagedMemberRole(
   const nextPermissions = ROLE_PERMISSIONS[input.role];
   const keepsSubmitPermission = nextPermissions.includes('purchase:submit') ? 1 : 0;
   const keepsReviewPermission = nextPermissions.includes('purchase:review') ? 1 : 0;
+  const keepsOrderIssuePermission = nextPermissions.includes('purchase:order:issue') ? 1 : 0;
   const results = await db.batch([
     db.prepare(`
       UPDATE members
@@ -130,6 +131,19 @@ export async function updateManagedMemberRole(
               AND request.status IN ('draft', 'pending_review')
           )
         )
+        AND (
+          ? = 1
+          OR NOT EXISTS (
+            SELECT 1
+            FROM purchase_orders purchase_order
+            JOIN purchase_requests request
+              ON request.id = purchase_order.purchase_request_id
+              AND request.tenant_id = purchase_order.tenant_id
+            WHERE purchase_order.tenant_id = members.tenant_id
+              AND request.purchaser_member_id = members.id
+              AND purchase_order.status IN ('draft', 'issued', 'partially_received')
+          )
+        )
     `).bind(
       input.role,
       user.tenantId,
@@ -142,6 +156,7 @@ export async function updateManagedMemberRole(
       protectedEmail,
       keepsSubmitPermission,
       keepsReviewPermission,
+      keepsOrderIssuePermission,
     ),
     db.prepare(`
       INSERT INTO audit_logs (
@@ -263,6 +278,26 @@ async function assertRoleChangeDoesNotStrandProcurement(
         409,
         `该成员仍需复审 ${count} 张采购申请，请先完成或取消这些申请`,
         'MEMBER_ROLE_ACTIVE_REVIEWER_ASSIGNMENTS',
+      );
+    }
+  }
+  if (!permissions.includes('purchase:order:issue')) {
+    const activeOrders = await db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM purchase_orders purchase_order
+      JOIN purchase_requests request
+        ON request.id = purchase_order.purchase_request_id
+        AND request.tenant_id = purchase_order.tenant_id
+      WHERE purchase_order.tenant_id = ?
+        AND request.purchaser_member_id = ?
+        AND purchase_order.status IN ('draft', 'issued', 'partially_received')
+    `).bind(tenantId, memberId).first<{ count: number }>();
+    const count = Number(activeOrders?.count ?? 0);
+    if (count > 0) {
+      throw new HttpError(
+        409,
+        `该成员仍负责 ${count} 张待确认、待到货或部分到货采购单，请先完成、取消或关闭剩余量`,
+        'MEMBER_ROLE_ACTIVE_PURCHASE_ORDERS',
       );
     }
   }

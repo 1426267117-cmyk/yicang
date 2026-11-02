@@ -87,5 +87,9 @@ describe('团队角色前端合同', () => {
       { code: 'MEMBER_ROLE_ACTIVE_REVIEWER_ASSIGNMENTS' },
       '失败',
     )).toContain('待复审');
+    expect(managedMemberErrorMessage(
+      { code: 'MEMBER_ROLE_ACTIVE_PURCHASE_ORDERS' },
+      '失败',
+    )).toContain('未完成的采购单');
   });
 });

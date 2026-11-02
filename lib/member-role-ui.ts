@@ -82,6 +82,7 @@ export function managedMemberErrorMessage(value: unknown, fallback: string) {
     PERMISSION_DENIED: '当前账号已没有团队角色管理权限，请刷新页面',
     MEMBER_ROLE_ACTIVE_PURCHASER_ASSIGNMENTS: '该成员仍有未完成的采购负责人任务，请先完成或撤回对应申请',
     MEMBER_ROLE_ACTIVE_REVIEWER_ASSIGNMENTS: '该成员仍有待复审任务，请先完成或取消对应申请',
+    MEMBER_ROLE_ACTIVE_PURCHASE_ORDERS: '该成员仍负责未完成的采购单，请先确认、取消、完成收货或关闭剩余量',
   };
   if (messages[code]) return messages[code];
   return typeof root.message === 'string' && root.message.trim() ? root.message.trim() : fallback;
