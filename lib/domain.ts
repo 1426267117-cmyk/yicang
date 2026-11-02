@@ -20,7 +20,8 @@ export type Permission =
   | 'purchase:order:create'
   | 'purchase:order:issue'
   | 'inventory:receive'
-  | 'warehouse:manage';
+  | 'warehouse:manage'
+  | 'members:manage';
 
 export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
   admin: [
@@ -28,7 +29,7 @@ export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
     'audit:read', 'connectors:read', 'connectors:sync',
     'purchase:read', 'purchase:create', 'purchase:submit', 'purchase:review', 'purchase:mapping',
     'purchase:supplier:create', 'purchase:order:create', 'purchase:order:issue', 'inventory:receive',
-    'warehouse:manage',
+    'warehouse:manage', 'members:manage',
   ],
   operator: [
     'orders:read', 'orders:create', 'orders:ship', 'orders:cancel', 'connectors:read',
