@@ -46,6 +46,7 @@ type PurchaseDemand = {
 type PurchaseMember = { id: string; displayName: string; role: 'admin' | 'operator' | 'viewer' };
 type PurchaseSkuOption = { id: string; code: string; name: string };
 type PurchaseRequestStatus = 'draft' | 'pending_review' | 'approved' | 'rejected' | 'cancelled';
+type PurchaseRequestAction = 'submit' | 'approve' | 'reject' | 'cancel' | 'withdraw';
 type PurchaseRequestLine = {
   id: string; demandId: string; skuId: string; skuCode?: string | null; skuName?: string | null;
   rawSku?: string | null; requestedQuantity: number; sourceRequiredQuantity?: number;
@@ -408,6 +409,7 @@ const actionLabel: Record<string, string> = {
   MAP_PURCHASE_SKU: '映射采购 SKU', CREATE_PURCHASE_REQUEST: '创建采购申请',
   SUBMIT_PURCHASE_REQUEST: '提交采购复审', APPROVE_PURCHASE_REQUEST: '批准采购申请',
   REJECT_PURCHASE_REQUEST: '驳回采购申请', CANCEL_PURCHASE_REQUEST: '取消采购申请',
+  WITHDRAW_PURCHASE_REQUEST: '撤回已批准采购申请',
   CREATE_SUPPLIER: '新增供应商', CREATE_WAREHOUSE: '新增仓库', CREATE_PURCHASE_ORDER: '生成正式采购单',
   ISSUE_PURCHASE_ORDER: '确认采购下单', CANCEL_PURCHASE_ORDER: '取消采购单',
   POST_PURCHASE_RECEIPT: '采购到货入库',
@@ -493,6 +495,7 @@ export default function ErpClient() {
   const [mappingDemand, setMappingDemand] = useState<PurchaseDemand | null>(null);
   const [planningMapping, setPlanningMapping] = useState<MukuPlanningException | null>(null);
   const [planningPolicy, setPlanningPolicy] = useState<PurchasePlanningRow | null>(null);
+  const [inventoryConfirmationRow, setInventoryConfirmationRow] = useState<PurchasePlanningRow | null>(null);
   const [showPurchaseRequest, setShowPurchaseRequest] = useState(false);
   const [showPlanningRequest, setShowPlanningRequest] = useState(false);
   const [showSupplier, setShowSupplier] = useState(false);
@@ -982,6 +985,47 @@ export default function ErpClient() {
     } finally { setPurchaseBusy(''); }
   }
 
+  async function submitInventoryConfirmation(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!inventoryConfirmationRow) return;
+    if (!manualInventoryConfirmationEligible(inventoryConfirmationRow)) {
+      setError('只有 MUKU 可用库存未知且映射无歧义时，才能录入人工库存确认');
+      return;
+    }
+    const data = new FormData(event.currentTarget);
+    const quantityText = String(data.get('confirmedAvailableQty') ?? '').trim();
+    const confirmedAvailableQty = Number(quantityText);
+    const note = String(data.get('note') ?? '').trim();
+    if (!/^\d+$/.test(quantityText) || !Number.isSafeInteger(confirmedAvailableQty)) {
+      setError('仓库可用库存必须是大于或等于 0 的整数');
+      return;
+    }
+    if (note.length < 3) {
+      setError('请填写至少 3 个字的核对说明');
+      return;
+    }
+    const renewing = Boolean(inventoryConfirmationRow.inventoryConfirmation);
+    setPurchaseBusy(`planning-inventory:${inventoryConfirmationRow.skuId}`); setError('');
+    try {
+      const response = await fetch('/api/purchase/planning/inventory-confirmations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          skuId: inventoryConfirmationRow.skuId,
+          confirmedAvailableQty,
+          note,
+        }),
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiMessage(body, '人工库存确认保存失败'));
+      setInventoryConfirmationRow(null);
+      await loadData();
+      flash(renewing ? '人工库存确认已更新并续期 24 小时' : '人工库存确认已保存，24 小时内可作为缺失值兜底');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '人工库存确认保存失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
   async function submitPlanningRequest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!purchasePlanning) return;
@@ -1094,13 +1138,15 @@ export default function ErpClient() {
     } finally { setPurchaseBusy(''); }
   }
 
-  async function runPurchaseRequestAction(request: PurchaseRequest, action: 'submit' | 'approve' | 'reject' | 'cancel') {
+  async function runPurchaseRequestAction(request: PurchaseRequest, action: PurchaseRequestAction) {
     let note = '';
-    if (action === 'reject') {
-      const reason = window.prompt(`请输入驳回 ${request.requestNo} 的原因，需求将被释放但历史不会删除：`);
+    if (action === 'reject' || action === 'withdraw') {
+      const reason = window.prompt(action === 'reject'
+        ? `请输入驳回 ${request.requestNo} 的原因，需求将被释放但历史不会删除：`
+        : `请输入撤回 ${request.requestNo} 的原因。仅在尚未生成有效采购单时可撤回，需求会释放并重新计算：`);
       if (reason === null) return;
       note = reason.trim();
-      if (!note) { setError('驳回时必须填写原因'); return; }
+      if (!note) { setError(action === 'reject' ? '驳回时必须填写原因' : '撤回时必须填写原因'); return; }
     } else {
       const message = action === 'approve'
         ? `确认批准 ${request.requestNo}？批准后需求将保持占用，避免重复采购。`
@@ -1119,7 +1165,15 @@ export default function ErpClient() {
       const body = await response.json() as { message?: string };
       if (!response.ok) throw new Error(body.message ?? '采购申请操作失败');
       await loadData();
-      flash(action === 'submit' ? '已提交复审' : action === 'approve' ? '复审已批准' : action === 'reject' ? '已驳回并释放需求' : '草稿已取消并释放需求');
+      flash(action === 'submit'
+        ? '已提交复审'
+        : action === 'approve'
+          ? '复审已批准'
+          : action === 'reject'
+            ? '已驳回并释放需求'
+            : action === 'withdraw'
+              ? '已撤回批准申请，需求已释放并重新计算'
+              : '草稿已取消并释放需求');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '采购申请操作失败');
     } finally { setPurchaseBusy(''); }
@@ -1296,7 +1350,7 @@ export default function ErpClient() {
             {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}
             {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
             {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} source={inventorySource} setSource={switchInventorySource} mukuStatus={mukuStatus} mukuRuns={mukuRuns} mukuInventory={mukuInventory} mukuRisk={mukuRisk} mukuInventoryRows={filteredMukuInventory} mukuRiskRows={filteredMukuRisk} mukuPage={mukuPage} setMukuPage={setMukuPage} mukuFilters={mukuFilters} applyMukuFilters={applyMukuFilters} mukuBusy={mukuBusy} mukuError={mukuError} canRead={can('connectors:read')} canSync={can('connectors:sync')} testConnection={testMukuConnection} syncReadOnly={syncMukuReadOnly} />}
-            {active === 'purchase' && <PurchaseWorkspaceView planning={purchasePlanning} planningRows={filteredPurchasePlanningRows} planningError={planningError} demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedPlanRowIds={selectedPlanRowIds} togglePlanningRow={togglePlanningRow} openPlanningRequest={() => setShowPlanningRequest(true)} openPlanningMapping={setPlanningMapping} openPlanningPolicy={setPlanningPolicy} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={setReceivingOrder} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
+            {active === 'purchase' && <PurchaseWorkspaceView planning={purchasePlanning} planningRows={filteredPurchasePlanningRows} planningError={planningError} demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedPlanRowIds={selectedPlanRowIds} togglePlanningRow={togglePlanningRow} openPlanningRequest={() => setShowPlanningRequest(true)} openPlanningMapping={setPlanningMapping} openPlanningPolicy={setPlanningPolicy} openInventoryConfirmation={setInventoryConfirmationRow} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={setReceivingOrder} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
             {!['dashboard','platform','orders','inventory','purchase'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
           </>
         ) : <LoadingState message={error || '暂时无法加载业务数据'} />}
@@ -1306,6 +1360,7 @@ export default function ErpClient() {
       {mappingDemand && purchasePayload && <SkuMappingModal demand={mappingDemand} skuOptions={purchasePayload.skuOptions} busy={purchaseBusy.startsWith('mapping:')} error={error} onClose={() => { if (!purchaseBusy) { setMappingDemand(null); setError(''); } }} onSubmit={submitSkuMapping} />}
       {planningMapping && purchasePayload && <MukuPlanningMappingModal exception={planningMapping} skuOptions={purchasePayload.skuOptions} busy={purchaseBusy.startsWith('planning-mapping:')} error={error} onClose={() => { if (!purchaseBusy) { setPlanningMapping(null); setError(''); } }} onSubmit={submitPlanningMapping} />}
       {planningPolicy && purchasePayload && <PlanningPolicyModal row={planningPolicy} suppliers={purchasePayload.suppliers} busy={purchaseBusy.startsWith('planning-policy:')} error={error} onClose={() => { if (!purchaseBusy) { setPlanningPolicy(null); setError(''); } }} onSubmit={submitPlanningPolicy} />}
+      {inventoryConfirmationRow && <InventoryConfirmationModal row={inventoryConfirmationRow} busy={purchaseBusy.startsWith('planning-inventory:')} error={error} onClose={() => { if (!purchaseBusy) { setInventoryConfirmationRow(null); setError(''); } }} onSubmit={submitInventoryConfirmation} />}
       {showPlanningRequest && purchasePlanning && purchasePayload && <PlanningRequestModal rows={purchasePlanning.rows.filter((row) => selectedPlanRowIds.has(row.planRowId))} members={purchasePayload.members} developmentOpenAccess={purchasePayload.developmentOpenAccess} busy={purchaseBusy === 'create-planning-request'} error={error} onClose={() => { if (!purchaseBusy) { setShowPlanningRequest(false); setError(''); } }} onSubmit={submitPlanningRequest} />}
       {showPurchaseRequest && purchasePayload && <PurchaseRequestModal demands={purchasePayload.demands.filter((demand) => selectedDemandIds.has(demand.id))} members={purchasePayload.members} developmentOpenAccess={purchasePayload.developmentOpenAccess} busy={purchaseBusy === 'create-request'} error={error} onClose={() => { if (!purchaseBusy) { setShowPurchaseRequest(false); setError(''); } }} onSubmit={submitPurchaseRequest} />}
       {showSupplier && <SupplierModal busy={purchaseBusy === 'create-supplier'} error={error} onClose={() => { if (!purchaseBusy) { setShowSupplier(false); setError(''); } }} onSubmit={submitSupplier} />}
@@ -1457,18 +1512,19 @@ function MukuPaginationView({ pagination, currentPage, setPage, busy, fallbackTe
   return <div className="pagination muku-pagination"><span>{fallbackText}</span><div><button aria-label="上一页" disabled={busy || page <= 1} onClick={() => setPage(Math.max(1, page - 1))}>‹</button><button className="current" disabled>{page} / {totalPages}</button><button aria-label="下一页" disabled={busy || !(pagination?.hasNext ?? false)} onClick={() => setPage(page + 1)}>›</button></div></div>;
 }
 
-function PurchaseWorkspaceView({ planning, planningRows, planningError, demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedPlanRowIds, togglePlanningRow, openPlanningRequest, openPlanningMapping, openPlanningPolicy, selectedDemandIds, toggleDemand, openMapping, openRequest, openSupplier, openWarehouse, openPurchaseOrder, openReceipt, can, busy, runAction, runOrderAction, hasQuery }: {
+function PurchaseWorkspaceView({ planning, planningRows, planningError, demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedPlanRowIds, togglePlanningRow, openPlanningRequest, openPlanningMapping, openPlanningPolicy, openInventoryConfirmation, selectedDemandIds, toggleDemand, openMapping, openRequest, openSupplier, openWarehouse, openPurchaseOrder, openReceipt, can, busy, runAction, runOrderAction, hasQuery }: {
   planning: PurchasePlanningPayload | null; planningRows: PurchasePlanningRow[]; planningError: string;
   demands: PurchaseDemand[]; requests: PurchaseRequest[]; purchaseOrders: PurchaseOrder[]; purchaseReceipts: PurchaseReceipt[];
   workspace: PurchaseWorkspacePayload | null; tab: PurchaseTab; setTab: (tab: PurchaseTab) => void;
   selectedPlanRowIds: Set<string>; togglePlanningRow: (id: string) => void;
   openPlanningRequest: () => void; openPlanningMapping: (exception: MukuPlanningException) => void;
   openPlanningPolicy: (row: PurchasePlanningRow) => void;
+  openInventoryConfirmation: (row: PurchasePlanningRow) => void;
   selectedDemandIds: Set<string>; toggleDemand: (id: string) => void;
   openMapping: (demand: PurchaseDemand) => void; openRequest: () => void; openSupplier: () => void; openWarehouse: () => void;
   openPurchaseOrder: (request: PurchaseRequest) => void; openReceipt: (order: PurchaseOrder) => void;
   can: (permission: Permission) => boolean; busy: string;
-  runAction: (request: PurchaseRequest, action: 'submit' | 'approve' | 'reject' | 'cancel') => void;
+  runAction: (request: PurchaseRequest, action: PurchaseRequestAction) => void;
   runOrderAction: (order: PurchaseOrder, action: 'issue' | 'cancel') => void; hasQuery: boolean;
 }) {
   const summary = workspace?.summary ?? emptyPurchaseSummary;
@@ -1516,25 +1572,27 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
   return <div className="content module-content"><div className="module-head"><div><p>订单需求 / 采购执行</p><h1>采购工作台</h1><span>已验证的官方订单形成采购需求，经过申请、复审、供应商下单和到货登记后更新 ERP 库存；不会向 Shopify 写入。</span></div><div className="purchase-head-actions"><div className="ledger-chip">需求防重复 · 入库有流水 · 历史不删除</div>{can('warehouse:manage') && <button className="secondary-button warehouse-button" onClick={openWarehouse} disabled={Boolean(busy)}><span>＋</span>仓库</button>}{can('purchase:supplier:create') && <button className="primary-button" onClick={openSupplier} disabled={Boolean(busy)}><span>＋</span>供应商</button>}</div></div><StatCards stats={stats} />
     {planning && !planning.orderSourceReadiness && <div className="planning-order-source-warning purchase-source-warning"><strong>官方订单源未就绪</strong><span>{formatOrderSourceWarning(planning)}</span></div>}
     <article className="card data-card purchase-workspace-card"><div className="data-toolbar purchase-toolbar"><div>{tabs.map(([key, label, count]) => <button key={key} className={tab === key ? 'tab-active' : ''} onClick={() => setTab(key)}>{label}<b>{count}</b></button>)}</div><span>{toolbarText}</span></div>
-      {tab === 'planning' ? <PurchasePlanningView planning={planning} rows={planningRows} error={planningError} skuOptions={workspace?.skuOptions ?? []} selectedPlanRowIds={selectedPlanRowIds} toggleRow={togglePlanningRow} openRequest={openPlanningRequest} openMapping={openPlanningMapping} openPolicy={openPlanningPolicy} canCreate={can('purchase:create')} canMap={can('purchase:mapping')} busy={busy} hasQuery={hasQuery} />
+      {tab === 'planning' ? <PurchasePlanningView planning={planning} rows={planningRows} error={planningError} skuOptions={workspace?.skuOptions ?? []} selectedPlanRowIds={selectedPlanRowIds} toggleRow={togglePlanningRow} openRequest={openPlanningRequest} openMapping={openPlanningMapping} openPolicy={openPlanningPolicy} openInventoryConfirmation={openInventoryConfirmation} canCreate={can('purchase:create')} canMap={can('purchase:mapping')} busy={busy} hasQuery={hasQuery} />
         : tab === 'pending' || tab === 'mapping' ? <>
         {tab === 'pending' && <div className="purchase-selection"><div><strong>已选 {selectedDemandIds.size} 行 / {selectedQuantity} 件</strong><span>每条需求只能进入一张有效采购申请</span></div><button className="primary-button" disabled={!selectedDemandIds.size || !can('purchase:create') || Boolean(busy) || planning?.orderSourceReadiness !== true} onClick={openRequest}><span>＋</span>生成采购申请</button></div>}
         <PurchaseDemandTable demands={visibleDemands} selectable={tab === 'pending'} selectedDemandIds={selectedDemandIds} toggleDemand={toggleDemand} openMapping={openMapping} canMap={can('purchase:mapping')} busy={busy} emptyMessage={hasQuery ? '没有符合当前搜索条件的需求' : tab === 'pending' ? '暂无可采购需求；待映射 SKU 完成后会出现在这里' : '暂无待映射的真实订单行'} />
-      </> : tab === 'requests' ? <><div className="planning-inline-warning"><strong>{workspace?.developmentOpenAccess ? '开发试运行模式' : '正式岗位分离'}</strong> {workspace?.developmentOpenAccess ? '当前允许同一人兼任采购负责人和复审人，仅用于开发测试；操作仍只对被分配成员开放。' : '采购负责人负责提交，指定复审人负责批准或驳回，且两者必须为不同成员。'}</div><PurchaseRequestTable requests={visibleRequests} can={can} busy={busy} runAction={runAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购申请' : '暂无草稿或待复审申请，可从待处理需求生成'} /></>
-        : tab === 'approved' ? <PurchaseRequestTable requests={approvedRequests} can={can} busy={busy} runAction={runAction} openPurchaseOrder={openPurchaseOrder} emptyMessage={hasQuery ? '没有符合当前搜索条件的已批准申请' : '暂无待转采购单；采购申请批准后会出现在这里'} />
+      </> : tab === 'requests' ? <><div className="planning-inline-warning"><strong>{workspace?.developmentOpenAccess ? '开发试运行模式' : '正式岗位分离'}</strong> {workspace?.developmentOpenAccess ? '当前允许同一人兼任采购负责人和复审人，仅用于开发测试；操作仍只对被分配成员开放。' : '采购负责人负责提交，指定复审人负责批准或驳回，且两者必须为不同成员。'}</div><PurchaseRequestTable requests={visibleRequests} currentMemberId={workspace?.currentMemberId ?? null} can={can} busy={busy} runAction={runAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购申请' : '暂无草稿或待复审申请，可从待处理需求生成'} /></>
+        : tab === 'approved' ? <PurchaseRequestTable requests={approvedRequests} currentMemberId={workspace?.currentMemberId ?? null} can={can} busy={busy} runAction={runAction} openPurchaseOrder={openPurchaseOrder} emptyMessage={hasQuery ? '没有符合当前搜索条件的已批准申请' : '暂无待转采购单；采购申请批准后会出现在这里'} />
           : tab === 'orders' ? <PurchaseOrderTable orders={activeOrders} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购单' : '暂无待下单或待到货采购单'} />
             : tab === 'received' ? <PurchaseReceiptTable receipts={purchaseReceipts} emptyMessage={hasQuery ? '没有符合当前搜索条件的到货记录' : '暂无到货记录；确认采购单下单后可分批登记到货'} />
-              : <div className="purchase-history-sections"><div><h3>已结束的申请</h3><PurchaseRequestTable requests={historyRequests} can={can} busy={busy} runAction={runAction} emptyMessage="暂无驳回或取消的采购申请" /></div><div><h3>已结束的采购单</h3><PurchaseOrderTable orders={closedOrders} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage="暂无完成或取消的正式采购单" /></div></div>}
+              : <div className="purchase-history-sections"><div><h3>已结束的申请</h3><PurchaseRequestTable requests={historyRequests} currentMemberId={workspace?.currentMemberId ?? null} can={can} busy={busy} runAction={runAction} emptyMessage="暂无驳回或取消的采购申请" /></div><div><h3>已结束的采购单</h3><PurchaseOrderTable orders={closedOrders} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage="暂无完成或取消的正式采购单" /></div></div>}
       <div className="pagination"><span>取消、退款、到货和库存变化均保留原始记录；系统不物理删除采购历史</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div>
     </article>
   </div>;
 }
 
-function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanRowIds, toggleRow, openRequest, openMapping, openPolicy, canCreate, canMap, busy, hasQuery }: {
+function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanRowIds, toggleRow, openRequest, openMapping, openPolicy, openInventoryConfirmation, canCreate, canMap, busy, hasQuery }: {
   planning: PurchasePlanningPayload | null; rows: PurchasePlanningRow[]; error: string;
   skuOptions: PurchaseSkuOption[]; selectedPlanRowIds: Set<string>; toggleRow: (id: string) => void;
   openRequest: () => void; openMapping: (exception: MukuPlanningException) => void;
-  openPolicy: (row: PurchasePlanningRow) => void; canCreate: boolean; canMap: boolean;
+  openPolicy: (row: PurchasePlanningRow) => void;
+  openInventoryConfirmation: (row: PurchasePlanningRow) => void;
+  canCreate: boolean; canMap: boolean;
   busy: string; hasQuery: boolean;
 }) {
   const [showAllMappings, setShowAllMappings] = useState(false);
@@ -1588,20 +1646,22 @@ function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanR
     <section className="planning-formula" aria-label="采购建议公式"><div><strong>系统怎么算</strong><span>{planning.formula.target} − {planning.formula.coverage}</span></div><small>{planning.formula.recommendation}。MUKU 在途只展示，不参与抵扣。</small></section>
     {error && <div className="planning-inline-warning">{error}</div>}
     <div className="purchase-selection planning-selection"><div><strong>已选 {selectedRows.length} 个 SKU / 可转 {selectedQuantity} 件</strong><span>只会把已验证的官方订单缺口转成申请；安全库存和取整超量不会伪造订单需求</span></div><button className="primary-button" disabled={!selectedRows.length || !selectedQuantity || !canCreate || Boolean(busy) || planning.readiness === 'stale' || !planning.orderSourceReadiness} onClick={openRequest}><span>＋</span>按建议生成申请</button></div>
-    <PurchasePlanningTable planning={planning} rows={rows} selectedPlanRowIds={selectedPlanRowIds} toggleRow={toggleRow} openPolicy={openPolicy} canMap={canMap} busy={busy} hasQuery={hasQuery} />
+    <PurchasePlanningTable planning={planning} rows={rows} selectedPlanRowIds={selectedPlanRowIds} toggleRow={toggleRow} openPolicy={openPolicy} openInventoryConfirmation={openInventoryConfirmation} canMap={canMap} busy={busy} hasQuery={hasQuery} />
     {mappingExceptions.length > 0 && <section className="planning-exceptions"><div className="planning-section-head"><div><strong>MUKU SKU 待映射</strong><span>{mappingExceptions.length} 项库存尚未归属到 ERP SKU，不会按 0 库存参与建议</span></div>{mappingExceptions.length > 24 && <button onClick={() => setShowAllMappings((current) => !current)}>{showAllMappings ? '收起' : `展开全部 ${mappingExceptions.length} 项`}</button>}</div><div className="planning-exception-grid">{(showAllMappings ? mappingExceptions : mappingExceptions.slice(0, 24)).map((item) => <article key={item.mukuSku}><div><strong>{item.mukuSku}</strong><small>可用 {formatOptionalQuantity(item.availableQty)} · 在途 {formatOptionalQuantity(item.inboundQty)}</small></div><span className={`status-pill ${item.status === 'ambiguous' ? 'danger' : ''}`}>{item.status === 'ambiguous' ? '存在歧义' : '未映射'}</span>{canMap && <button disabled={Boolean(busy) || !skuOptions.length} onClick={() => openMapping(item)}>去映射</button>}</article>)}</div></section>}
   </div>;
 }
 
-function PurchasePlanningTable({ planning, rows, selectedPlanRowIds, toggleRow, openPolicy, canMap, busy, hasQuery }: {
+function PurchasePlanningTable({ planning, rows, selectedPlanRowIds, toggleRow, openPolicy, openInventoryConfirmation, canMap, busy, hasQuery }: {
   planning: PurchasePlanningPayload; rows: PurchasePlanningRow[]; selectedPlanRowIds: Set<string>;
   toggleRow: (id: string) => void; openPolicy: (row: PurchasePlanningRow) => void;
+  openInventoryConfirmation: (row: PurchasePlanningRow) => void;
   canMap: boolean; busy: string; hasQuery: boolean;
 }) {
   return <div className="table-wrap module-table"><table className="purchase-planning-table"><thead><tr><th className="selection-cell">选择</th><th>ERP SKU / MUKU SKU</th><th>订单需求 / 安全库存</th><th>有效可用 / 在途</th><th>ERP 覆盖 / 已收展示</th><th>建议采购</th><th>状态与依据</th><th>操作</th></tr></thead><tbody>{rows.length ? rows.map((row) => {
     const convertible = planningRowConvertible(row, planning.readiness, planning.orderSourceReadiness);
     const matchedSkus = row.mukuSkus.map((source) => source.sku).join('、');
-    return <tr key={row.planRowId} className={row.decision === 'blocked' ? 'planning-row-blocked' : ''}><td className="selection-cell"><input className="purchase-check" type="checkbox" aria-label={`选择 ${row.skuCode}`} checked={selectedPlanRowIds.has(row.planRowId)} disabled={!convertible || Boolean(busy)} onChange={() => toggleRow(row.planRowId)} /></td><td><strong>{row.skuCode}</strong><small className="cell-sub">{row.skuName}</small><small className="cell-sub planning-match">{matchedSkus || (row.mukuMatchStatus === 'ambiguous' ? 'MUKU SKU 存在歧义' : '尚未映射 MUKU SKU')}</small></td><td><strong>{row.orderDemandQty} / {formatOptionalQuantity(row.safetyStockQty)}</strong><small className="cell-sub">近 30 天销量：{formatOptionalQuantity(row.sales30d)}</small></td><td><strong>{formatOptionalQuantity(row.effectiveAvailableQty)} / {formatOptionalQuantity(row.mukuInboundQty)}</strong><small className="cell-sub">{planningAvailableSourceLabel(row)}</small><small className="cell-sub">在途仅展示，不抵扣</small></td><td><strong>{row.erpPurchaseChainCoverageQty}</strong><small className="cell-sub">PO 未收 {row.erpOpenPoQty} · 已收 {row.erpReceivedQty}（仅展示）</small></td><td><strong className="planning-recommendation">{formatOptionalQuantity(row.recommendedQty)}</strong><small className="cell-sub">可转官方订单 {row.conversion.eligibleOrderQty} 件</small>{row.conversion.blockedRecommendationQty > 0 && <small className="cell-sub attention-text">另有 {row.conversion.blockedRecommendationQty} 件不可自动转</small>}</td><td><span className={`status-pill planning-status-${row.decision}`}>{planningDecisionLabel(row.decision)}</span><details className="planning-explanation"><summary>查看计算依据</summary><div><p><b>公式：</b>{formatPlanningEquation(row)}</p>{row.explanations.map((text, index) => <p key={`${row.planRowId}-explanation-${index}`}>{text}</p>)}{[...row.blockers, ...row.warnings].map((reason) => <p className="attention-text" key={`${row.planRowId}-${reason}`}>{planningReasonLabel(reason)}</p>)}<p className="planning-source-note">原始 MUKU 可用量：{formatOptionalQuantity(row.mukuAvailableQty)} · 有效可用量来源：{planningAvailableSourceLabel(row)} · 库存源更新时间：{formatOptionalTime(row.sourceTimes.inventoryRecordUpdatedAt)}</p></div></details></td><td><div className="row-actions planning-row-actions">{canMap && <button disabled={Boolean(busy)} onClick={() => openPolicy(row)}>采购策略</button>}{convertible ? <span className="terminal-label">勾选后批量转申请</span> : <span className="terminal-label">{!planning.orderSourceReadiness ? '官方订单源未就绪' : row.conversion.eligibleOrderQty <= 0 && row.blockers.length === 0 ? '暂无可转订单缺口' : planningPrimaryBlocker(row)}</span>}</div></td></tr>;
+    const canConfirmInventory = manualInventoryConfirmationEligible(row);
+    return <tr key={row.planRowId} className={row.decision === 'blocked' ? 'planning-row-blocked' : ''}><td className="selection-cell"><input className="purchase-check" type="checkbox" aria-label={`选择 ${row.skuCode}`} checked={selectedPlanRowIds.has(row.planRowId)} disabled={!convertible || Boolean(busy)} onChange={() => toggleRow(row.planRowId)} /></td><td><strong>{row.skuCode}</strong><small className="cell-sub">{row.skuName}</small><small className="cell-sub planning-match">{matchedSkus || (row.mukuMatchStatus === 'ambiguous' ? 'MUKU SKU 存在歧义' : '尚未匹配 MUKU 编码')}</small></td><td><strong>{row.orderDemandQty} / {formatOptionalQuantity(row.safetyStockQty)}</strong><small className="cell-sub">近 30 天销量：{formatOptionalQuantity(row.sales30d)}</small></td><td><strong>{formatOptionalQuantity(row.effectiveAvailableQty)} / {formatOptionalQuantity(row.mukuInboundQty)}</strong><small className="cell-sub">{planningAvailableSourceLabel(row)}</small><small className="cell-sub">在途仅展示，不抵扣</small></td><td><strong>{row.erpPurchaseChainCoverageQty}</strong><small className="cell-sub">PO 未收 {row.erpOpenPoQty} · 已收 {row.erpReceivedQty}（仅展示）</small></td><td><strong className="planning-recommendation">{formatOptionalQuantity(row.recommendedQty)}</strong><small className="cell-sub">可转官方订单 {row.conversion.eligibleOrderQty} 件</small>{row.conversion.blockedRecommendationQty > 0 && <small className="cell-sub attention-text">另有 {row.conversion.blockedRecommendationQty} 件不可自动转</small>}</td><td><span className={`status-pill planning-status-${row.decision}`}>{planningDecisionLabel(row.decision)}</span><details className="planning-explanation"><summary>查看计算依据</summary><div><p><b>公式：</b>{formatPlanningEquation(row)}</p>{row.explanations.map((text, index) => <p key={`${row.planRowId}-explanation-${index}`}>{text}</p>)}{[...row.blockers, ...row.warnings].map((reason) => <p className="attention-text" key={`${row.planRowId}-${reason}`}>{planningReasonLabel(reason)}</p>)}<p className="planning-source-note">原始 MUKU 可用量：{formatOptionalQuantity(row.mukuAvailableQty)} · 有效可用量来源：{planningAvailableSourceLabel(row)} · 库存源更新时间：{formatOptionalTime(row.sourceTimes.inventoryRecordUpdatedAt)}</p></div></details></td><td><div className="row-actions planning-row-actions">{canMap && <button disabled={Boolean(busy)} onClick={() => openPolicy(row)}>采购策略</button>}{canMap && canConfirmInventory && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openInventoryConfirmation(row)}>{row.inventoryConfirmation ? '更新 / 续期库存' : '人工确认库存'}</button>}{convertible ? <span className="terminal-label">勾选后批量转申请</span> : <span className="terminal-label">{!planning.orderSourceReadiness ? '官方订单源未就绪' : row.conversion.eligibleOrderQty <= 0 && row.blockers.length === 0 ? '暂无可转订单缺口' : planningPrimaryBlocker(row)}</span>}</div></td></tr>;
   }) : <tr><td className="empty-cell" colSpan={8}>{hasQuery ? '没有符合当前搜索条件的采购建议' : '暂无可计算的 ERP SKU；接入真实订单或设置采购策略后会出现在这里'}</td></tr>}</tbody></table></div>;
 }
 
@@ -1615,12 +1675,17 @@ function PurchaseDemandTable({ demands, selectable, selectedDemandIds, toggleDem
   }) : <tr><td className="empty-cell" colSpan={selectable ? 8 : 7}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
-function PurchaseRequestTable({ requests, can, busy, runAction, openPurchaseOrder, emptyMessage }: {
-  requests: PurchaseRequest[]; can: (permission: Permission) => boolean; busy: string;
-  runAction: (request: PurchaseRequest, action: 'submit' | 'approve' | 'reject' | 'cancel') => void; emptyMessage: string;
+function PurchaseRequestTable({ requests, currentMemberId, can, busy, runAction, openPurchaseOrder, emptyMessage }: {
+  requests: PurchaseRequest[]; currentMemberId: string | null;
+  can: (permission: Permission) => boolean; busy: string;
+  runAction: (request: PurchaseRequest, action: PurchaseRequestAction) => void; emptyMessage: string;
   openPurchaseOrder?: (request: PurchaseRequest) => void;
 }) {
-  return <div className="table-wrap module-table"><table className="purchase-request-table"><thead><tr><th>申请单</th><th>采购负责人</th><th>复审人</th><th>明细 / 件数</th><th>状态</th><th>备注</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{requests.length ? requests.map((request) => <tr key={request.id}><td><strong>{request.requestNo}</strong><small className="cell-sub">创建：{request.creator?.displayName ?? '系统成员'}</small></td><td>{request.buyer?.displayName ?? '待指定'}</td><td>{request.reviewer?.displayName ?? '待指定'}</td><td>{request.lineCount} 行 / {request.totalQuantity} 件</td><td><span className={`status-pill purchase-status-${request.status}`}>{purchaseRequestStatusLabel[request.status]}</span>{request.needsAttention && <small className="cell-sub attention-text">源订单已变化，需复核</small>}</td><td>{request.reviewNote ?? request.note ?? '—'}</td><td>{formatTime(request.updatedAt)}</td><td><div className="row-actions">{request.status === 'draft' && can('purchase:submit') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'submit')}>{busy === `${request.id}:submit` ? '提交中…' : '提交复审'}</button>}{request.status === 'draft' && can('purchase:submit') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'cancel')}>取消</button>}{request.status === 'pending_review' && can('purchase:review') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'approve')}>{busy === `${request.id}:approve` ? '复审中…' : '批准'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'reject')}>驳回</button></>}{request.status === 'approved' && openPurchaseOrder && can('purchase:order:create') && !request.needsAttention && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openPurchaseOrder(request)}>生成正式采购单</button>}{request.status === 'approved' && request.needsAttention && <span className="terminal-label">源订单变化，暂不能转单</span>}{(['rejected','cancelled'].includes(request.status) || (request.status === 'approved' && !openPurchaseOrder)) && <span className="terminal-label">历史已保留</span>}</div></td></tr>) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
+  return <div className="table-wrap module-table"><table className="purchase-request-table"><thead><tr><th>申请单</th><th>采购负责人</th><th>复审人</th><th>明细 / 件数</th><th>状态</th><th>备注</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{requests.length ? requests.map((request) => {
+    const purchaserMemberId = request.buyer?.id ?? request.purchaser?.id ?? request.purchaserMemberId;
+    const assignedPurchaser = Boolean(currentMemberId && purchaserMemberId === currentMemberId);
+    return <tr key={request.id}><td><strong>{request.requestNo}</strong><small className="cell-sub">创建：{request.creator?.displayName ?? '系统成员'}</small></td><td>{request.buyer?.displayName ?? '待指定'}</td><td>{request.reviewer?.displayName ?? '待指定'}</td><td>{request.lineCount} 行 / {request.totalQuantity} 件</td><td><span className={`status-pill purchase-status-${request.status}`}>{purchaseRequestStatusLabel[request.status]}</span>{request.needsAttention && <small className="cell-sub attention-text">源订单已变化，需复核</small>}</td><td>{request.reviewNote ?? request.note ?? '—'}</td><td>{formatTime(request.updatedAt)}</td><td><div className="row-actions">{request.status === 'draft' && can('purchase:submit') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'submit')}>{busy === `${request.id}:submit` ? '提交中…' : '提交复审'}</button>}{request.status === 'draft' && can('purchase:submit') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'cancel')}>取消</button>}{request.status === 'pending_review' && can('purchase:review') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'approve')}>{busy === `${request.id}:approve` ? '复审中…' : '批准'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'reject')}>驳回</button></>}{request.status === 'approved' && openPurchaseOrder && can('purchase:order:create') && !request.needsAttention && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openPurchaseOrder(request)}>生成正式采购单</button>}{request.status === 'approved' && openPurchaseOrder && can('purchase:submit') && assignedPurchaser && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'withdraw')}>{busy === `${request.id}:withdraw` ? '撤回中…' : '撤回重算'}</button>}{request.status === 'approved' && request.needsAttention && <span className="terminal-label">源订单变化，暂不能转单</span>}{(['rejected','cancelled'].includes(request.status) || (request.status === 'approved' && !openPurchaseOrder)) && <span className="terminal-label">历史已保留</span>}</div></td></tr>;
+  }) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
 function PurchaseOrderTable({ orders, can, busy, openReceipt, runAction, emptyMessage }: {
@@ -1677,6 +1742,17 @@ function PlanningPolicyModal({ row, suppliers, busy, error, onClose, onSubmit }:
 }) {
   const activeSuppliers = suppliers.filter((supplier) => supplier.active);
   return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal purchase-modal planning-policy-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>采购策略</h2><p>{row.skuCode} · {row.skuName}</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>安全库存天数<input name="safetyDays" type="number" min="0" max="365" step="1" defaultValue={row.safetyDays} required /></label><label>固定安全库存<input name="safetyStockQty" type="number" min="0" step="1" defaultValue={row.safetyStockBasis === 'explicit' ? row.safetyStockQty ?? '' : ''} placeholder="留空按近 30 天销量" /></label><label>最小采购量 MOQ<input name="moq" type="number" min="1" step="1" defaultValue={row.policy.moq ?? ''} placeholder="留空不限制" /></label><label>包装倍数<input name="packSize" type="number" min="1" step="1" defaultValue={row.policy.packSize ?? ''} placeholder="留空不取整" /></label><label>采购提前期（天）<input name="leadTimeDays" type="number" min="0" step="1" defaultValue={row.policy.leadTimeDays ?? ''} placeholder="可选" /></label><label>首选供应商<select name="preferredSupplierId" defaultValue={row.policy.preferredSupplierId ?? ''}><option value="">暂不指定</option>{activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.code} · {supplier.name}</option>)}</select></label>{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>计算规则</span>留空固定安全库存时按近 30 天销量估算；销量未知会明确显示“未知”，不会补成 0</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy}>{busy ? '正在保存…' : '保存并重新计算'}</button></div></form></div>;
+}
+
+function InventoryConfirmationModal({ row, busy, error, onClose, onSubmit }: {
+  row: PurchasePlanningRow; busy: boolean; error: string;
+  onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const previous = row.inventoryConfirmation;
+  const mappingText = row.mukuMatchStatus === 'unmapped'
+    ? '当前未匹配到 MUKU 编码，但不存在歧义'
+    : `已通过${row.mukuMatchStatus === 'manual' ? '人工' : '精确'}规则匹配 MUKU SKU`;
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal purchase-modal inventory-confirmation-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>{previous ? '更新并续期库存确认' : '人工确认仓库可用库存'}</h2><p>{row.skuCode} · {row.skuName}</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="mapping-context"><strong>MUKU 可用库存：未知</strong><span>{mappingText}</span><code>确认范围：全部仓库汇总 · 保存后有效 24 小时</code></div>{previous && <div className="planning-modal-warning">上次确认 {previous.confirmedAvailableQty} 件，有效至 {formatOptionalTime(previous.expiresAt)}；本次保存会以当前时间重新计算 24 小时有效期。</div>}<div className="form-grid"><label>仓库可用库存<input name="confirmedAvailableQty" type="number" min="0" max="100000000" step="1" inputMode="numeric" defaultValue={previous?.confirmedAvailableQty ?? 0} required /></label><label>有效期<input value="保存后 24 小时" readOnly /></label><label className="full">核对说明<textarea name="note" rows={3} minLength={3} maxLength={500} defaultValue={previous?.note ?? ''} placeholder="例如：仓库人工核对，全部仓库可用库存为 0" required /></label>{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>兜底规则</span>仅在 MUKU 可用量未知且 SKU 映射无歧义时生效；MUKU 一旦提供明确值，系统立即优先使用 MUKU。此操作不回写 MUKU 或共享盘。</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy}>{busy ? '正在保存…' : previous ? '更新并续期 24 小时' : '确认并启用 24 小时'}</button></div></form></div>;
 }
 
 function PlanningRequestModal({ rows, members, developmentOpenAccess, busy, error, onClose, onSubmit }: {
@@ -2160,6 +2236,10 @@ function planningRowConvertible(row: PurchasePlanningRow, readiness: PurchasePla
     && row.blockers.length === 0
     && row.conversion.eligibleOrderQty > 0
     && !row.conversion.reasons.includes('policy_rounding_exceeds_order_gap');
+}
+
+function manualInventoryConfirmationEligible(row: PurchasePlanningRow) {
+  return row.mukuAvailableQty === null && row.mukuMatchStatus !== 'ambiguous';
 }
 
 function planningDecisionLabel(decision: PurchasePlanningRow['decision']) {

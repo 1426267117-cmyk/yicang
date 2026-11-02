@@ -116,6 +116,10 @@ const ACTION_TRANSITIONS: Record<PurchaseRequestAction, {
     from: 'draft', to: 'cancelled', permission: 'purchase:submit',
     auditAction: 'CANCEL_PURCHASE_REQUEST',
   },
+  withdraw: {
+    from: 'approved', to: 'cancelled', permission: 'purchase:submit',
+    auditAction: 'WITHDRAW_PURCHASE_REQUEST',
+  },
 };
 
 export async function getPurchaseWorkspace(
@@ -487,6 +491,9 @@ export async function executePurchaseRequestAction(
     await assertRequestDemandsStillValid(db, user.tenantId, purchaseRequestId);
     await assertRequestPlanningStillValid(db, user, current, options);
   }
+  if (input.action === 'withdraw') {
+    await assertNoActivePurchaseOrder(db, user.tenantId, purchaseRequestId);
+  }
 
   const now = (options.now ?? new Date()).toISOString();
   const actionRequestId = crypto.randomUUID();
@@ -496,8 +503,18 @@ export async function executePurchaseRequestAction(
     version: current.version + 1,
     note: input.note?.trim() || null,
   });
-  const releaseLines = input.action === 'reject' || input.action === 'cancel';
+  const releaseLines = input.action === 'reject'
+    || input.action === 'cancel'
+    || input.action === 'withdraw';
   const refreshSnapshots = input.action === 'submit' || input.action === 'approve';
+  const activeOrderGuard = input.action === 'withdraw'
+    ? `AND NOT EXISTS (
+        SELECT 1 FROM purchase_orders po
+        WHERE po.tenant_id = purchase_requests.tenant_id
+          AND po.purchase_request_id = purchase_requests.id
+          AND po.status <> 'cancelled'
+      )`
+    : '';
   const statements: D1PreparedStatement[] = [];
   if (refreshSnapshots) {
     statements.push(db.prepare(`
@@ -524,16 +541,18 @@ export async function executePurchaseRequestAction(
   statements.push(db.prepare(`
     UPDATE purchase_requests
     SET status = ?,
-        review_note = CASE WHEN ? IN ('approved', 'rejected') THEN ? ELSE review_note END,
+        review_note = CASE WHEN ? IN ('approved', 'rejected') OR ? = 'withdraw' THEN ? ELSE review_note END,
         submitted_at = CASE WHEN ? = 'pending_review' THEN ? ELSE submitted_at END,
         reviewed_at = CASE WHEN ? IN ('approved', 'rejected') THEN ? ELSE reviewed_at END,
         version = version + 1,
         last_action_key = ?,
         updated_at = ?
     WHERE id = ? AND tenant_id = ? AND status = ? AND version = ?
+      ${activeOrderGuard}
   `).bind(
     transition.to,
     transition.to,
+    input.action,
     input.note?.trim() || null,
     transition.to,
     now,
@@ -593,6 +612,9 @@ export async function executePurchaseRequestAction(
   }
   const updateResultIndex = refreshSnapshots ? 1 : 0;
   if (Number(results[updateResultIndex]?.meta?.changes ?? 0) !== 1) {
+    if (input.action === 'withdraw') {
+      await assertNoActivePurchaseOrder(db, user.tenantId, purchaseRequestId);
+    }
     throw new HttpError(409, '采购申请已被其他操作更新，请刷新后重试', 'CONCURRENT_UPDATE');
   }
   return {
@@ -792,7 +814,7 @@ function assertAssignedActor(
   actorMemberId: string,
   action: PurchaseRequestAction,
 ) {
-  const purchaserAction = action === 'submit' || action === 'cancel';
+  const purchaserAction = action === 'submit' || action === 'cancel' || action === 'withdraw';
   const assignedMemberId = purchaserAction
     ? request.purchaser_member_id
     : request.reviewer_member_id;
@@ -800,9 +822,28 @@ function assertAssignedActor(
     throw new HttpError(
       403,
       purchaserAction
-        ? '只有该申请指定的采购负责人可以提交或取消'
+        ? '只有该申请指定的采购负责人可以提交、取消或撤回'
         : '只有该申请指定的复审人可以批准或驳回',
       purchaserAction ? 'PURCHASE_PURCHASER_REQUIRED' : 'PURCHASE_REVIEWER_REQUIRED',
+    );
+  }
+}
+
+async function assertNoActivePurchaseOrder(
+  db: D1Database,
+  tenantId: string,
+  purchaseRequestId: string,
+) {
+  const order = await db.prepare(`
+    SELECT id FROM purchase_orders
+    WHERE tenant_id = ? AND purchase_request_id = ? AND status <> 'cancelled'
+    LIMIT 1
+  `).bind(tenantId, purchaseRequestId).first<{ id: string }>();
+  if (order) {
+    throw new HttpError(
+      409,
+      '该申请已生成有效采购单，不能撤回；请先按真实供应商状态处理采购单',
+      'PURCHASE_REQUEST_HAS_ACTIVE_ORDER',
     );
   }
 }

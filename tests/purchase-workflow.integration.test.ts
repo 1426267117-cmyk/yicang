@@ -9,6 +9,7 @@ import type { ShopifyCredentialConfig } from '../lib/connectors/shopify/config';
 import type { ShopifyShopContext } from '../lib/connectors/shopify/connector';
 import type { UserContext } from '../lib/db';
 import { ROLE_PERMISSIONS } from '../lib/domain';
+import { createPurchaseOrder, createSupplier } from '../lib/purchase-order-service';
 import {
   createPurchaseRequest,
   executePurchaseRequestAction,
@@ -232,6 +233,80 @@ describe('采购申请闭环', () => {
     );
     expect(approved.request.status).toBe('approved');
   });
+
+  it('指定采购负责人可撤回尚未转采购单的已批准申请并释放需求', async () => {
+    const created = await createPurchaseRequest(db, user, {
+      demandIds: [demandId], purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer',
+    }, 'create-request-withdraw-0001');
+    await executePurchaseRequestAction(db, buyerUser, created.request.id, {
+      action: 'submit',
+    }, 'submit-request-withdraw-0001');
+    await executePurchaseRequestAction(db, reviewerUser, created.request.id, {
+      action: 'approve',
+    }, 'approve-request-withdraw-0001');
+
+    await expect(executePurchaseRequestAction(db, user, created.request.id, {
+      action: 'withdraw', note: '源订单取消，撤回重新计算',
+    }, 'withdraw-request-unassigned')).rejects.toMatchObject({
+      code: 'PURCHASE_PURCHASER_REQUIRED',
+    });
+
+    const withdrawn = await executePurchaseRequestAction(db, buyerUser, created.request.id, {
+      action: 'withdraw', note: '源订单取消，撤回重新计算',
+    }, 'withdraw-request-0001');
+    expect(withdrawn.request).toEqual(expect.objectContaining({
+      status: 'cancelled', reviewNote: '源订单取消，撤回重新计算',
+    }));
+    expect(withdrawn.request.lines[0].active).toBe(false);
+
+    const replay = await executePurchaseRequestAction(db, buyerUser, created.request.id, {
+      action: 'withdraw', note: '源订单取消，撤回重新计算',
+    }, 'withdraw-request-0001');
+    expect(replay.replayed).toBe(true);
+    expect(replay.request.status).toBe('cancelled');
+
+    const replacement = await createPurchaseRequest(db, user, {
+      demandIds: [demandId], purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer',
+    }, 'create-request-after-withdraw-0001');
+    expect(replacement.request.status).toBe('draft');
+
+    const audit = await db.prepare(`
+      SELECT COUNT(*) AS count FROM audit_logs
+      WHERE tenant_id = ? AND entity_id = ? AND action = 'WITHDRAW_PURCHASE_REQUEST'
+    `).bind(tenantId, created.request.id).first<{ count: number }>();
+    expect(Number(audit?.count)).toBe(1);
+  });
+
+  it('已生成有效采购单的批准申请不能撤回且不会释放需求', async () => {
+    const created = await createPurchaseRequest(db, user, {
+      demandIds: [demandId], purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer',
+    }, 'create-request-with-order-0001');
+    await executePurchaseRequestAction(db, buyerUser, created.request.id, {
+      action: 'submit',
+    }, 'submit-request-with-order-0001');
+    await executePurchaseRequestAction(db, reviewerUser, created.request.id, {
+      action: 'approve',
+    }, 'approve-request-with-order-0001');
+    const supplier = await createSupplier(db, user, {
+      code: 'WITHDRAW-GUARD', name: '撤回保护测试供应商',
+    }, 'supplier-withdraw-guard-0001');
+    await createPurchaseOrder(db, user, {
+      purchaseRequestId: created.request.id,
+      supplierId: supplier.supplier.id,
+      currency: 'CNY',
+    }, 'purchase-order-withdraw-guard-0001');
+
+    await expect(executePurchaseRequestAction(db, buyerUser, created.request.id, {
+      action: 'withdraw', note: '不应允许撤回',
+    }, 'withdraw-request-with-order-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_REQUEST_HAS_ACTIVE_ORDER',
+    });
+
+    const stored = await getPurchaseWorkspace(db, user);
+    const request = stored.requests.find((item) => item.id === created.request.id);
+    expect(request).toEqual(expect.objectContaining({ status: 'approved' }));
+    expect(request?.lines[0].active).toBe(true);
+  });
 });
 
 async function seedMembers(db: D1Database) {
@@ -305,6 +380,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0007_worried_stone_men.sql',
     '../drizzle/0008_nifty_mimic.sql',
     '../drizzle/0009_shocking_iron_lad.sql',
+    '../drizzle/0013_guarded_withdrawal.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

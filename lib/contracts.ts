@@ -92,11 +92,15 @@ export const createPlanningPurchaseRequestSchema = z.object({
 });
 
 export const purchaseRequestActionSchema = z.object({
-  action: z.enum(['submit', 'approve', 'reject', 'cancel']),
+  action: z.enum(['submit', 'approve', 'reject', 'cancel', 'withdraw']),
   note: z.string().trim().max(500).optional(),
 }).superRefine((value, context) => {
-  if (value.action === 'reject' && !value.note) {
-    context.addIssue({ code: 'custom', message: '驳回采购申请时必须填写原因', path: ['note'] });
+  if ((value.action === 'reject' || value.action === 'withdraw') && !value.note) {
+    context.addIssue({
+      code: 'custom',
+      message: value.action === 'reject' ? '驳回采购申请时必须填写原因' : '撤回已批准申请时必须填写原因',
+      path: ['note'],
+    });
   }
 });
 
