@@ -2,6 +2,7 @@ import { env } from 'cloudflare:workers';
 import type {
   CreatePlanningPurchaseRequestInput,
   UpsertMukuSkuMappingInput,
+  UpsertSkuInventoryConfirmationInput,
   UpsertSkuProcurementPolicyInput,
 } from './contracts';
 import { HttpError, requirePermission, type UserContext } from './db';
@@ -11,10 +12,11 @@ import {
   getPurchaseRequest,
 } from './purchase-workflow-service';
 
-export const PURCHASE_PLANNING_CALCULATION_VERSION = 'procurement-planning-v1';
+export const PURCHASE_PLANNING_CALCULATION_VERSION = 'procurement-planning-v2';
 const DEFAULT_SAFETY_DAYS = 14;
 const DEFAULT_INVENTORY_SOURCE_MAX_AGE_MINUTES = 48 * 60;
 const DEFAULT_ORDER_SYNC_MAX_AGE_MINUTES = 30;
+const INVENTORY_CONFIRMATION_TTL_HOURS = 24;
 
 type SkuRow = { id: string; code: string; name: string };
 type DemandRow = {
@@ -53,6 +55,19 @@ type PolicyRow = {
   lead_time_days: number | null;
   preferred_supplier_id: string | null;
   supplier_name: string | null;
+  updated_at: string;
+};
+type InventoryConfirmationRow = {
+  id: string;
+  sku_id: string;
+  confirmed_available_qty: number;
+  scope: 'all_warehouses';
+  confirmed_at: string;
+  expires_at: string;
+  note: string;
+  confirmed_by: string;
+  confirmed_by_email: string;
+  created_at: string;
   updated_at: string;
 };
 type InventoryRow = {
@@ -141,6 +156,7 @@ export async function getPurchasePlanning(
     activeLineResult,
     mappingResult,
     policyResult,
+    inventoryConfirmationResult,
     needsMappingResult,
     orderSourceResult,
   ] = await Promise.all([
@@ -204,6 +220,13 @@ export async function getPurchasePlanning(
       WHERE policy.tenant_id = ?
       ORDER BY policy.sku_id
     `).bind(user.tenantId).all<PolicyRow>(),
+    db.prepare(`
+      SELECT id, sku_id, confirmed_available_qty, scope, confirmed_at, expires_at,
+             note, confirmed_by, confirmed_by_email, created_at, updated_at
+      FROM sku_inventory_confirmations
+      WHERE tenant_id = ?
+      ORDER BY sku_id
+    `).bind(user.tenantId).all<InventoryConfirmationRow>(),
     db.prepare(`
       SELECT id, raw_sku, normalized_sku, required_quantity, platform,
              source_order_id, source_order_line_id
@@ -296,9 +319,13 @@ export async function getPurchasePlanning(
   const activeLinesBySku = groupBy(activeLineResult.results, (line) => line.sku_id);
   const activeLineByDemand = new Map(activeLineResult.results.map((line) => [line.purchase_demand_id, line]));
   const policyBySku = new Map(policyResult.results.map((policy) => [policy.sku_id, policy]));
+  const inventoryConfirmationBySku = new Map(
+    inventoryConfirmationResult.results.map((confirmation) => [confirmation.sku_id, confirmation]),
+  );
   const relevantSkuIds = new Set<string>([
     ...demandsBySku.keys(),
     ...policyBySku.keys(),
+    ...inventoryConfirmationBySku.keys(),
     ...assignmentsBySku.keys(),
     ...activeLinesBySku.keys(),
   ]);
@@ -318,6 +345,7 @@ export async function getPurchasePlanning(
           .filter(([, candidateSkuIds]) => candidateSkuIds.includes(sku.id))
           .map(([mukuSku]) => mukuSku),
         policy: policyBySku.get(sku.id) ?? null,
+        inventoryConfirmation: inventoryConfirmationBySku.get(sku.id) ?? null,
         inventoryBySku,
         riskBySku,
         inventoryDataset,
@@ -392,7 +420,7 @@ export async function getPurchasePlanning(
     calculationVersion: PURCHASE_PLANNING_CALCULATION_VERSION,
     formula: {
       target: '订单需求 + 安全库存',
-      coverage: 'MUKU 可用库存 + ERP 采购链覆盖量',
+      coverage: '有效可用库存（MUKU 优先，缺失时可用有效人工确认）+ ERP 采购链覆盖量',
       recommendation: 'max(0, target - coverage)，再按 MOQ/包装量展示建议',
       deduplication: '无有效采购单时按 active purchase_request_line；有采购单后仅按 ordered-received，采购单不再重复扣减',
       mukuInbound: 'MUKU 在途仅展示，不参与扣减，直至能证明不与 ERP 采购链重叠',
@@ -450,6 +478,7 @@ async function buildPlanningRow(input: {
   assignments: MukuAssignment[];
   ambiguousMukuSkus: string[];
   policy: PolicyRow | null;
+  inventoryConfirmation: InventoryConfirmationRow | null;
   inventoryBySku: Map<string, (InventoryRow & { sku: string })[]>;
   riskBySku: Map<string, (RiskRow & { sku: string })[]>;
   inventoryDataset: Awaited<ReturnType<typeof evaluateMukuFreshness>>['datasets'][number] | null;
@@ -482,6 +511,7 @@ async function buildPlanningRow(input: {
       inboundQty: aggregateNullable(allInventoryRecords, (row) => row.inbound_qty),
       sales30d: aggregateNullable(riskRecords, (row) => row.sales_30d),
       inventoryRecordCount: inventoryRecords.length,
+      availableValueCount: inventoryRecords.filter((row) => row.available_qty !== null).length,
       inventorySourceUpdatedAt: latestTimestamp(inventoryRecords.map((row) => row.source_updated_at)),
       inventoryOldestSourceUpdatedAt: earliestTimestamp(
         inventoryRecords.map((row) => row.source_updated_at),
@@ -526,6 +556,32 @@ async function buildPlanningRow(input: {
       : inventorySourceAgeMinutes > input.sourceFreshnessMaxAgeMinutes
         ? 'stale' as const
         : 'fresh' as const;
+  const confirmationTimeValid = Boolean(
+    input.inventoryConfirmation
+    && !Number.isNaN(Date.parse(input.inventoryConfirmation.confirmed_at))
+    && !Number.isNaN(Date.parse(input.inventoryConfirmation.expires_at)),
+  );
+  const confirmationActive = Boolean(
+    input.inventoryConfirmation
+    && confirmationTimeValid
+    && Date.parse(input.inventoryConfirmation.confirmed_at) <= Date.parse(input.checkedAt)
+    && Date.parse(input.inventoryConfirmation.expires_at) > Date.parse(input.checkedAt),
+  );
+  const hasExplicitMukuAvailableValue = sourceDetails.some(
+    (source) => source.availableValueCount > 0,
+  );
+  const manualInventoryFallbackUsed = mukuAvailableQty === null
+    && !hasExplicitMukuAvailableValue
+    && confirmationActive
+    && mukuMatchStatus !== 'ambiguous';
+  const effectiveAvailableQty = mukuAvailableQty ?? (manualInventoryFallbackUsed
+    ? Number(input.inventoryConfirmation!.confirmed_available_qty)
+    : null);
+  const availableQtySource = mukuAvailableQty !== null
+    ? 'muku' as const
+    : manualInventoryFallbackUsed
+      ? 'manual_confirmation' as const
+      : 'unknown' as const;
   const latestReceiptAt = latestTimestamp(input.activeLines.map((line) => line.latest_receipt_at));
   const receiptReflectedInMuku = latestReceiptAt === null
     ? null
@@ -550,18 +606,30 @@ async function buildPlanningRow(input: {
   const blockers: string[] = [];
   const warnings: string[] = [];
   if (!input.inventoryReady) blockers.push('inventory_stale');
-  if (mukuMatchStatus === 'unmapped') blockers.push('muku_sku_unmapped');
+  if (mukuMatchStatus === 'unmapped' && !manualInventoryFallbackUsed) blockers.push('muku_sku_unmapped');
   if (mukuMatchStatus === 'ambiguous') blockers.push('muku_sku_ambiguous');
-  if (input.assignments.length > 0 && sourceDetails.some((source) => source.inventoryRecordCount === 0)) {
+  if (!manualInventoryFallbackUsed
+    && input.assignments.length > 0
+    && sourceDetails.some((source) => source.inventoryRecordCount === 0)) {
     blockers.push('muku_sku_missing_from_snapshot');
   }
-  if (input.assignments.length > 0 && mukuAvailableQty === null) blockers.push('muku_available_unknown');
+  if (!manualInventoryFallbackUsed && input.assignments.length > 0 && mukuAvailableQty === null) {
+    blockers.push('muku_available_unknown');
+  }
   if (latestReceiptAt !== null && receiptReflectedInMuku !== true) {
     blockers.push('receipt_not_reflected_in_muku');
   }
-  if (inventorySourceFreshness === 'unknown') blockers.push('inventory_source_time_unknown');
-  if (inventorySourceFreshness === 'invalid') blockers.push('inventory_source_time_invalid');
-  if (inventorySourceFreshness === 'stale') blockers.push('inventory_source_stale');
+  if (!manualInventoryFallbackUsed && inventorySourceFreshness === 'unknown') {
+    blockers.push('inventory_source_time_unknown');
+  }
+  if (inventorySourceFreshness === 'invalid') {
+    blockers.push('inventory_source_time_invalid');
+  }
+  if (inventorySourceFreshness === 'stale') {
+    blockers.push('inventory_source_stale');
+  }
+  if (manualInventoryFallbackUsed) warnings.push('manual_inventory_confirmation');
+  if (input.inventoryConfirmation && !confirmationActive) warnings.push('manual_inventory_confirmation_expired');
   if (safetyStockQty === null) warnings.push('safety_unknown');
   if (mukuInboundQty === null) warnings.push('muku_inbound_unknown');
   warnings.push('warehouse_scope_global_unverified');
@@ -574,14 +642,14 @@ async function buildPlanningRow(input: {
   let safetyOnlyQty = 0;
   let policyRoundingQty = 0;
   let demandAllocations: Array<{ demandId: string; quantity: number }> = [];
-  if (blockers.length === 0 && mukuAvailableQty !== null) {
+  if (blockers.length === 0 && effectiveAvailableQty !== null) {
     rawOrderGapQty = Math.max(
       0,
-      orderDemandQty - mukuAvailableQty - erpPurchaseChainCoverageQty,
+      orderDemandQty - effectiveAvailableQty - erpPurchaseChainCoverageQty,
     );
     rawTotalGapQty = Math.max(
       0,
-      orderDemandQty + (safetyStockQty ?? 0) - mukuAvailableQty - erpPurchaseChainCoverageQty,
+      orderDemandQty + (safetyStockQty ?? 0) - effectiveAvailableQty - erpPurchaseChainCoverageQty,
     );
     recommendedQty = roundRecommendation(rawTotalGapQty, policy?.moq ?? null, policy?.pack_size ?? null);
     safetyOnlyQty = Math.max(0, rawTotalGapQty - rawOrderGapQty);
@@ -618,6 +686,15 @@ async function buildPlanningRow(input: {
     '发生收货时，只有 MUKU 库存源时间已越过到货时间才继续计算；否则阻断建议，避免刷新窗口重复采购。',
     'MUKU 在途仅展示，不参与抵扣，避免与 ERP 采购链重复计算。',
   ];
+  if (manualInventoryFallbackUsed) {
+    explanations.push(
+      `MUKU 仓库可用量缺失；本次按人工确认的全仓可用量 ${effectiveAvailableQty} 件计算，确认有效至 ${input.inventoryConfirmation!.expires_at}。`,
+    );
+  } else if (input.inventoryConfirmation && !confirmationActive) {
+    explanations.push(`人工库存确认已于 ${input.inventoryConfirmation.expires_at} 过期，不参与本次计算。`);
+  } else if (input.inventoryConfirmation && mukuAvailableQty !== null) {
+    explanations.push('当前 MUKU 已提供明确仓库可用量，优先使用 MUKU；人工确认仅保留审计展示。');
+  }
   if (safetyStockQty === null) {
     explanations.push('近 30 天销量或安全库存未知；不阻断已确认订单缺口，仅暂不追加安全库存。');
   } else {
@@ -660,6 +737,19 @@ async function buildPlanningRow(input: {
       preferredSupplierId: policy.preferred_supplier_id,
       updatedAt: policy.updated_at,
     } : null,
+    inventoryConfirmation: input.inventoryConfirmation ? {
+      id: input.inventoryConfirmation.id,
+      confirmedAvailableQty: Number(input.inventoryConfirmation.confirmed_available_qty),
+      scope: input.inventoryConfirmation.scope,
+      confirmedAt: input.inventoryConfirmation.confirmed_at,
+      expiresAt: input.inventoryConfirmation.expires_at,
+      note: input.inventoryConfirmation.note,
+      confirmedBy: input.inventoryConfirmation.confirmed_by,
+      confirmedByEmail: input.inventoryConfirmation.confirmed_by_email,
+      active: confirmationActive,
+      used: manualInventoryFallbackUsed,
+      updatedAt: input.inventoryConfirmation.updated_at,
+    } : null,
     inventorySnapshotId: input.inventoryDataset?.activeSnapshotId ?? null,
     riskSnapshotId: input.riskDataset?.activeSnapshotId ?? null,
   };
@@ -685,6 +775,8 @@ async function buildPlanningRow(input: {
       .filter((demand) => !input.activeLineByDemand.has(demand.id))
       .reduce((sum, demand) => sum + Number(demand.required_quantity), 0),
     mukuAvailableQty,
+    effectiveAvailableQty,
+    availableQtySource,
     mukuInboundQty,
     inventoryScope: 'all_muku_warehouses' as const,
     erpPurchaseChainCoverageQty,
@@ -710,6 +802,8 @@ async function buildPlanningRow(input: {
       orderDemandQty,
       safetyStockQty,
       mukuAvailableQty,
+      effectiveAvailableQty,
+      availableQtySource,
       erpPurchaseChainCoverageQty,
       mukuInboundQty,
       mukuInboundDeducted: false,
@@ -734,6 +828,18 @@ async function buildPlanningRow(input: {
       riskLastSuccessAt: input.riskDataset?.lastSuccessAt ?? null,
       riskRecordUpdatedAt: latestTimestamp(sourceDetails.map((source) => source.riskSourceUpdatedAt)),
     },
+    inventoryConfirmation: input.inventoryConfirmation ? {
+      id: input.inventoryConfirmation.id,
+      confirmedAvailableQty: Number(input.inventoryConfirmation.confirmed_available_qty),
+      scope: input.inventoryConfirmation.scope,
+      confirmedAt: input.inventoryConfirmation.confirmed_at,
+      expiresAt: input.inventoryConfirmation.expires_at,
+      note: input.inventoryConfirmation.note,
+      confirmedBy: input.inventoryConfirmation.confirmed_by,
+      confirmedByEmail: input.inventoryConfirmation.confirmed_by_email,
+      active: confirmationActive,
+      used: manualInventoryFallbackUsed,
+    } : null,
     conversion: {
       eligibleOrderQty,
       blockedRecommendationQty,
@@ -949,6 +1055,110 @@ export async function upsertSkuProcurementPolicy(
     }),
   ]);
   return { policy: merged, replayed: false };
+}
+
+export async function upsertSkuInventoryConfirmation(
+  db: D1Database,
+  user: UserContext,
+  input: UpsertSkuInventoryConfirmationInput,
+  idempotencyKey: string,
+  options: { now?: Date } = {},
+) {
+  requirePermission(user, 'purchase:mapping');
+  validateIdempotencyKey(idempotencyKey);
+  const requestHash = await hashPayload(input);
+  const replay = await replayMutation(
+    db,
+    user.tenantId,
+    idempotencyKey,
+    'UPSERT_SKU_INVENTORY_CONFIRMATION',
+    requestHash,
+  );
+  if (replay) {
+    const confirmation = parseInventoryConfirmationAudit(replay.after)
+      ?? await loadInventoryConfirmation(db, user.tenantId, replay.entityId);
+    return { confirmation, replayed: true };
+  }
+
+  const [sku, before] = await Promise.all([
+    db.prepare(`
+      SELECT id, code, name FROM skus
+      WHERE tenant_id = ? AND id = ? AND active = 1
+      LIMIT 1
+    `).bind(user.tenantId, input.skuId).first<SkuRow>(),
+    db.prepare(`
+      SELECT id, sku_id, confirmed_available_qty, scope, confirmed_at, expires_at,
+             note, confirmed_by, confirmed_by_email, created_at, updated_at
+      FROM sku_inventory_confirmations
+      WHERE tenant_id = ? AND sku_id = ?
+      LIMIT 1
+    `).bind(user.tenantId, input.skuId).first<InventoryConfirmationRow>(),
+  ]);
+  if (!sku) throw new HttpError(404, 'ERP SKU 不存在或已停用', 'ERP_SKU_NOT_FOUND');
+
+  const clock = options.now ?? new Date();
+  if (Number.isNaN(clock.getTime())) {
+    throw new HttpError(400, '确认时间无效', 'INVALID_INVENTORY_CONFIRMATION_TIME');
+  }
+  const confirmedAt = clock.toISOString();
+  const expiresAt = new Date(
+    clock.getTime() + INVENTORY_CONFIRMATION_TTL_HOURS * 60 * 60 * 1000,
+  ).toISOString();
+  const confirmationId = before?.id ?? await stableInventoryConfirmationId(user.tenantId, sku.id);
+  const after = {
+    id: confirmationId,
+    skuId: sku.id,
+    skuCode: sku.code,
+    confirmedAvailableQty: input.confirmedAvailableQty,
+    scope: 'all_warehouses' as const,
+    confirmedAt,
+    expiresAt,
+    note: input.note,
+    confirmedBy: user.id,
+    confirmedByEmail: user.email,
+    updatedAt: confirmedAt,
+  };
+
+  await db.batch([
+    db.prepare(`
+      INSERT INTO sku_inventory_confirmations (
+        id, tenant_id, sku_id, confirmed_available_qty, scope, confirmed_at,
+        expires_at, note, confirmed_by, confirmed_by_email, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'all_warehouses', ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT DO UPDATE SET
+        confirmed_available_qty = excluded.confirmed_available_qty,
+        scope = excluded.scope,
+        confirmed_at = excluded.confirmed_at,
+        expires_at = excluded.expires_at,
+        note = excluded.note,
+        confirmed_by = excluded.confirmed_by,
+        confirmed_by_email = excluded.confirmed_by_email,
+        updated_at = excluded.updated_at
+    `).bind(
+      confirmationId,
+      user.tenantId,
+      sku.id,
+      input.confirmedAvailableQty,
+      confirmedAt,
+      expiresAt,
+      input.note,
+      user.id,
+      user.email,
+      confirmedAt,
+      confirmedAt,
+    ),
+    auditStatement(db, {
+      user,
+      action: 'UPSERT_SKU_INVENTORY_CONFIRMATION',
+      entityType: 'sku_inventory_confirmation',
+      entityId: confirmationId,
+      beforeJson: before ? JSON.stringify(before) : null,
+      afterJson: JSON.stringify({ ...after, requestHash }),
+      idempotencyKey,
+      now: confirmedAt,
+    }),
+  ]);
+  return { confirmation: after, replayed: false };
 }
 
 export async function createPurchaseRequestFromPlanning(
@@ -1197,6 +1407,80 @@ async function loadPolicy(db: D1Database, tenantId: string, id: string) {
   };
 }
 
+async function loadInventoryConfirmation(db: D1Database, tenantId: string, id: string) {
+  const row = await db.prepare(`
+    SELECT confirmation.id, confirmation.sku_id, sku.code AS sku_code,
+           confirmation.confirmed_available_qty, confirmation.scope,
+           confirmation.confirmed_at, confirmation.expires_at, confirmation.note,
+           confirmation.confirmed_by, confirmation.confirmed_by_email,
+           confirmation.updated_at
+    FROM sku_inventory_confirmations confirmation
+    JOIN skus sku
+      ON sku.id = confirmation.sku_id AND sku.tenant_id = confirmation.tenant_id
+    WHERE confirmation.tenant_id = ? AND confirmation.id = ?
+    LIMIT 1
+  `).bind(tenantId, id).first<{
+    id: string;
+    sku_id: string;
+    sku_code: string;
+    confirmed_available_qty: number;
+    scope: 'all_warehouses';
+    confirmed_at: string;
+    expires_at: string;
+    note: string;
+    confirmed_by: string;
+    confirmed_by_email: string;
+    updated_at: string;
+  }>();
+  if (!row) {
+    throw new HttpError(404, '人工库存确认不存在', 'INVENTORY_CONFIRMATION_NOT_FOUND');
+  }
+  return {
+    id: row.id,
+    skuId: row.sku_id,
+    skuCode: row.sku_code,
+    confirmedAvailableQty: Number(row.confirmed_available_qty),
+    scope: row.scope,
+    confirmedAt: row.confirmed_at,
+    expiresAt: row.expires_at,
+    note: row.note,
+    confirmedBy: row.confirmed_by,
+    confirmedByEmail: row.confirmed_by_email,
+    updatedAt: row.updated_at,
+  };
+}
+
+function parseInventoryConfirmationAudit(value: Record<string, unknown> | null) {
+  if (!value
+    || typeof value.id !== 'string'
+    || typeof value.skuId !== 'string'
+    || typeof value.skuCode !== 'string'
+    || !Number.isSafeInteger(value.confirmedAvailableQty)
+    || Number(value.confirmedAvailableQty) < 0
+    || value.scope !== 'all_warehouses'
+    || typeof value.confirmedAt !== 'string'
+    || typeof value.expiresAt !== 'string'
+    || typeof value.note !== 'string'
+    || typeof value.confirmedBy !== 'string'
+    || typeof value.confirmedByEmail !== 'string'
+    || typeof value.updatedAt !== 'string') {
+    return null;
+  }
+  return {
+    id: value.id,
+    skuId: value.skuId,
+    skuCode: value.skuCode,
+    confirmedAvailableQty: Number(value.confirmedAvailableQty),
+    scope: value.scope,
+    confirmedAt: value.confirmedAt,
+    expiresAt: value.expiresAt,
+    note: value.note,
+    confirmedBy: value.confirmedBy,
+    confirmedByEmail: value.confirmedByEmail,
+    updatedAt: value.updatedAt,
+  };
+}
+
 async function replayMutation(
   db: D1Database,
   tenantId: string,
@@ -1218,7 +1502,7 @@ async function replayMutation(
   if (row.action !== action || after?.requestHash !== requestHash) {
     throw new HttpError(409, '该幂等键已用于另一项业务操作', 'IDEMPOTENCY_CONFLICT');
   }
-  return { entityId: row.entity_id };
+  return { entityId: row.entity_id, after };
 }
 
 function auditStatement(db: D1Database, input: {
@@ -1262,6 +1546,11 @@ async function hashPayload(input: unknown) {
   const encoded = new TextEncoder().encode(JSON.stringify(input));
   const digest = await crypto.subtle.digest('SHA-256', encoded);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function stableInventoryConfirmationId(tenantId: string, skuId: string) {
+  const digest = await hashPayload({ tenantId, skuId });
+  return `inventory-confirmation:${digest}`;
 }
 
 function parseJsonObject(value: string | null) {

@@ -440,6 +440,25 @@ export const skuProcurementPolicies = sqliteTable('sku_procurement_policies', {
   check('ck_sku_procurement_lead_time', sql`${table.leadTimeDays} IS NULL OR ${table.leadTimeDays} >= 0`),
 ]);
 
+export const skuInventoryConfirmations = sqliteTable('sku_inventory_confirmations', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  skuId: text('sku_id').notNull().references(() => skus.id),
+  confirmedAvailableQty: integer('confirmed_available_qty').notNull(),
+  scope: text('scope', { enum: ['all_warehouses'] }).notNull().default('all_warehouses'),
+  confirmedAt: text('confirmed_at').notNull(),
+  expiresAt: text('expires_at').notNull(),
+  note: text('note').notNull(),
+  confirmedBy: text('confirmed_by').notNull(),
+  confirmedByEmail: text('confirmed_by_email').notNull(),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_sku_inventory_confirmations').on(table.tenantId, table.skuId),
+  index('idx_sku_inventory_confirmations_expiry').on(table.tenantId, table.expiresAt),
+  check('ck_sku_inventory_confirmation_non_negative', sql`${table.confirmedAvailableQty} >= 0`),
+]);
+
 export const purchaseOrders = sqliteTable('purchase_orders', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),

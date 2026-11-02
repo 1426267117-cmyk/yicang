@@ -20,6 +20,7 @@ import {
   createPurchaseRequestFromPlanning,
   getPurchasePlanning,
   upsertMukuSkuMapping,
+  upsertSkuInventoryConfirmation,
   upsertSkuProcurementPolicy,
 } from '../lib/purchase-planning-service';
 import { executePurchaseRequestAction } from '../lib/purchase-workflow-service';
@@ -123,6 +124,239 @@ describe('真实订单 + MUKU 库存采购计划', () => {
       now: new Date('2026-11-02T10:11:00.000Z'),
     });
     expect(nextMinute.rows[0].recommendationVersion).toBe(ready.rows[0].recommendationVersion);
+  });
+
+  it('BGY 无 MUKU 编码时人工确认 0 仅作 24 小时兜底，过期与全局陈旧会恢复阻断', async () => {
+    await db.prepare(`
+      UPDATE skus SET code = 'BGY-2134-01', name = 'BGY 测试商品'
+      WHERE tenant_id = ? AND id = 'sku-service'
+    `).bind(tenantId).run();
+
+    const unknown = await getPurchasePlanning(db, user, { now });
+    const unknownRow = unknown.rows[0];
+    expect(unknownRow).toEqual(expect.objectContaining({
+      skuCode: 'BGY-2134-01',
+      decision: 'blocked',
+      mukuMatchStatus: 'unmapped',
+      mukuAvailableQty: null,
+      effectiveAvailableQty: null,
+      availableQtySource: 'unknown',
+      recommendedQty: null,
+    }));
+    expect(unknownRow.blockers).toEqual(expect.arrayContaining([
+      'muku_sku_unmapped',
+      'inventory_source_time_unknown',
+    ]));
+
+    const input = {
+      skuId: 'sku-service',
+      confirmedAvailableQty: 0,
+      note: '仓库人工核对：BGY 无其他编码，可用库存为 0',
+    };
+    const created = await upsertSkuInventoryConfirmation(
+      db,
+      user,
+      input,
+      'confirm-bgy-zero-0001',
+      { now },
+    );
+    expect(created).toEqual(expect.objectContaining({
+      replayed: false,
+      confirmation: expect.objectContaining({
+        skuCode: 'BGY-2134-01',
+        confirmedAvailableQty: 0,
+        scope: 'all_warehouses',
+        confirmedAt: '2026-11-02T10:10:00.000Z',
+        expiresAt: '2026-11-03T10:10:00.000Z',
+        confirmedBy: user.id,
+        confirmedByEmail: user.email,
+      }),
+    }));
+    const replay = await upsertSkuInventoryConfirmation(
+      db,
+      user,
+      input,
+      'confirm-bgy-zero-0001',
+      { now },
+    );
+    expect(replay.replayed).toBe(true);
+    await expect(upsertSkuInventoryConfirmation(db, user, {
+      ...input,
+      confirmedAvailableQty: 1,
+    }, 'confirm-bgy-zero-0001', { now })).rejects.toMatchObject({
+      code: 'IDEMPOTENCY_CONFLICT',
+    });
+
+    const active = await getPurchasePlanning(db, user, { now });
+    const activeRow = active.rows[0];
+    expect(activeRow).toEqual(expect.objectContaining({
+      decision: 'buy',
+      mukuMatchStatus: 'unmapped',
+      mukuAvailableQty: null,
+      effectiveAvailableQty: 0,
+      availableQtySource: 'manual_confirmation',
+      recommendedQty: 9,
+      inventoryConfirmation: expect.objectContaining({
+        confirmedAvailableQty: 0,
+        active: true,
+        used: true,
+      }),
+    }));
+    expect(activeRow.blockers).not.toContain('muku_sku_unmapped');
+    expect(activeRow.blockers).not.toContain('inventory_source_time_unknown');
+    expect(activeRow.warnings).toContain('manual_inventory_confirmation');
+    expect(activeRow.recommendationVersion).not.toBe(unknownRow.recommendationVersion);
+
+    const globallyStale = await getPurchasePlanning(db, user, {
+      now: new Date('2026-11-02T12:00:00.000Z'),
+      maxAgeMinutes: 30,
+    });
+    expect(globallyStale.rows[0]).toEqual(expect.objectContaining({
+      decision: 'blocked',
+      mukuAvailableQty: null,
+      effectiveAvailableQty: 0,
+      availableQtySource: 'manual_confirmation',
+      recommendedQty: null,
+    }));
+    expect(globallyStale.rows[0].blockers).toContain('inventory_stale');
+
+    const expired = await getPurchasePlanning(db, user, {
+      now: new Date('2026-11-03T10:10:00.000Z'),
+      maxAgeMinutes: 48 * 60,
+    });
+    expect(expired.rows[0]).toEqual(expect.objectContaining({
+      decision: 'blocked',
+      mukuAvailableQty: null,
+      effectiveAvailableQty: null,
+      availableQtySource: 'unknown',
+      recommendedQty: null,
+      inventoryConfirmation: expect.objectContaining({ active: false, used: false }),
+    }));
+    expect(expired.rows[0].blockers).toEqual(expect.arrayContaining([
+      'muku_sku_unmapped',
+      'inventory_source_time_unknown',
+    ]));
+    expect(expired.rows[0].warnings).toContain('manual_inventory_confirmation_expired');
+
+    const renewed = await upsertSkuInventoryConfirmation(db, user, {
+      ...input,
+      confirmedAvailableQty: 1,
+    }, 'confirm-bgy-one-0002', {
+      now: new Date('2026-11-03T10:11:00.000Z'),
+    });
+    expect(renewed.confirmation.id).toBe(created.confirmation.id);
+    expect(renewed.confirmation.confirmedAvailableQty).toBe(1);
+    const historicReplay = await upsertSkuInventoryConfirmation(
+      db,
+      user,
+      input,
+      'confirm-bgy-zero-0001',
+      { now: new Date('2026-11-03T10:12:00.000Z') },
+    );
+    expect(historicReplay).toEqual(expect.objectContaining({
+      replayed: true,
+      confirmation: expect.objectContaining({
+        id: created.confirmation.id,
+        confirmedAvailableQty: 0,
+        confirmedAt: '2026-11-02T10:10:00.000Z',
+        expiresAt: '2026-11-03T10:10:00.000Z',
+      }),
+    }));
+    const persisted = await db.prepare(`
+      SELECT confirmed_available_qty FROM sku_inventory_confirmations
+      WHERE tenant_id = ? AND sku_id = 'sku-service'
+    `).bind(tenantId).first<{ confirmed_available_qty: number }>();
+    expect(Number(persisted?.confirmed_available_qty)).toBe(1);
+  });
+
+  it('MUKU 已知仓库可用量优先于人工 0，仓库源陈旧仍阻断', async () => {
+    await upsertMukuSkuMapping(db, user, {
+      mukuSku: 'MUKU-CHAIR', skuId: 'sku-service',
+    }, 'map-known-muku-0001');
+    await upsertSkuInventoryConfirmation(db, user, {
+      skuId: 'sku-service',
+      confirmedAvailableQty: 0,
+      note: '人工核对为零，但 MUKU 已知值必须优先',
+    }, 'confirm-known-muku-0001', { now });
+
+    const known = await getPurchasePlanning(db, user, { now });
+    expect(known.rows[0]).toEqual(expect.objectContaining({
+      decision: 'buy',
+      mukuAvailableQty: 6,
+      effectiveAvailableQty: 6,
+      availableQtySource: 'muku',
+      recommendedQty: 3,
+      inventoryConfirmation: expect.objectContaining({ active: true, used: false }),
+    }));
+
+    await db.prepare(`
+      UPDATE muku_inventory_records SET source_updated_at = '2026-10-29T10:00:00.000Z'
+      WHERE tenant_id = ? AND snapshot_id = 'snapshot-inventory' AND inventory_kind = 'warehouse'
+    `).bind(tenantId).run();
+    const staleSource = await getPurchasePlanning(db, user, { now });
+    expect(staleSource.rows[0]).toEqual(expect.objectContaining({
+      decision: 'blocked',
+      mukuAvailableQty: 6,
+      effectiveAvailableQty: 6,
+      availableQtySource: 'muku',
+      recommendedQty: null,
+    }));
+    expect(staleSource.rows[0].blockers).toContain('inventory_source_stale');
+  });
+
+  it('HYZ 仅有 5 件 MUKU 在途时，人工 0 解锁可用量但在途继续只展示不抵扣', async () => {
+    await db.prepare(`
+      UPDATE skus SET code = 'HYZ-046-01', name = 'HYZ 测试商品'
+      WHERE tenant_id = ? AND id = 'sku-service'
+    `).bind(tenantId).run();
+    await upsertMukuSkuMapping(db, user, {
+      mukuSku: 'MUKU-CHAIR', skuId: 'sku-service',
+    }, 'map-hyz-transit-0001');
+    await db.prepare(`
+      UPDATE muku_inventory_records
+      SET inventory_kind = 'in_transit', available_qty = NULL, on_hand_qty = 0,
+          inbound_qty = CASE WHEN id = 'inventory-record-1' THEN 5 ELSE 0 END
+      WHERE tenant_id = ? AND snapshot_id = 'snapshot-inventory' AND sku = 'MUKU-CHAIR'
+    `).bind(tenantId).run();
+
+    const unknown = await getPurchasePlanning(db, user, { now });
+    expect(unknown.rows[0]).toEqual(expect.objectContaining({
+      skuCode: 'HYZ-046-01',
+      decision: 'blocked',
+      mukuAvailableQty: null,
+      effectiveAvailableQty: null,
+      mukuInboundQty: 5,
+      recommendedQty: null,
+    }));
+    expect(unknown.rows[0].blockers).toEqual(expect.arrayContaining([
+      'muku_sku_missing_from_snapshot',
+      'muku_available_unknown',
+      'inventory_source_time_unknown',
+    ]));
+
+    await upsertSkuInventoryConfirmation(db, user, {
+      skuId: 'sku-service',
+      confirmedAvailableQty: 0,
+      note: '仓库人工核对：HYZ 可用库存为 0，在途保持展示',
+    }, 'confirm-hyz-zero-0001', { now });
+    const confirmed = await getPurchasePlanning(db, user, { now });
+    expect(confirmed.rows[0]).toEqual(expect.objectContaining({
+      decision: 'buy',
+      mukuAvailableQty: null,
+      effectiveAvailableQty: 0,
+      availableQtySource: 'manual_confirmation',
+      mukuInboundQty: 5,
+      recommendedQty: 9,
+    }));
+    expect(confirmed.rows[0].blockers).not.toContain('muku_sku_missing_from_snapshot');
+    expect(confirmed.rows[0].blockers).not.toContain('muku_available_unknown');
+    expect(confirmed.rows[0].blockers).not.toContain('inventory_source_time_unknown');
+    expect(confirmed.rows[0].calculationParts).toEqual(expect.objectContaining({
+      effectiveAvailableQty: 0,
+      mukuInboundQty: 5,
+      mukuInboundDeducted: false,
+      rawOrderGapQty: 9,
+    }));
   });
 
   it('服务端按建议精确分配部分数量，幂等重放且旧版本拒绝零写入', async () => {
@@ -637,6 +871,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0009_shocking_iron_lad.sql',
     '../drizzle/0010_mute_eternity.sql',
     '../drizzle/0011_dazzling_menace.sql',
+    '../drizzle/0012_square_slyde.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

@@ -68,6 +68,12 @@ export const upsertSkuProcurementPolicySchema = z.object({
   preferredSupplierId: z.string().trim().min(1).nullable().optional(),
 });
 
+export const upsertSkuInventoryConfirmationSchema = z.object({
+  skuId: z.string().trim().min(1),
+  confirmedAvailableQty: z.number().int().min(0).max(100_000_000),
+  note: z.string().trim().min(3).max(500),
+});
+
 const purchasePlanningSelectionSchema = z.object({
   planRowId: z.string().trim().min(1),
   recommendationVersion: z.string().trim().min(16).max(128),
@@ -154,6 +160,7 @@ export type ShopifyWebhookProcessInput = z.infer<typeof shopifyWebhookProcessSch
 export type CreatePurchaseRequestInput = z.infer<typeof createPurchaseRequestSchema>;
 export type UpsertMukuSkuMappingInput = z.infer<typeof upsertMukuSkuMappingSchema>;
 export type UpsertSkuProcurementPolicyInput = z.infer<typeof upsertSkuProcurementPolicySchema>;
+export type UpsertSkuInventoryConfirmationInput = z.infer<typeof upsertSkuInventoryConfirmationSchema>;
 export type CreatePlanningPurchaseRequestInput = z.infer<typeof createPlanningPurchaseRequestSchema>;
 export type PurchaseRequestActionInput = z.infer<typeof purchaseRequestActionSchema>;
 export type CreateSupplierInput = z.infer<typeof createSupplierSchema>;

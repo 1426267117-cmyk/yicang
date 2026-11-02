@@ -143,7 +143,9 @@ type PurchasePlanningRow = {
     inventorySourceUpdatedAt: string | null; riskSourceUpdatedAt: string | null;
   }>;
   orderDemandQty: number; activeRequestQty: number; unallocatedDemandQty: number;
-  mukuAvailableQty: number | null; mukuInboundQty: number | null;
+  mukuAvailableQty: number | null; effectiveAvailableQty: number | null;
+  availableQtySource: 'muku' | 'manual_confirmation' | 'unknown';
+  mukuInboundQty: number | null;
   inventoryScope: 'all_muku_warehouses';
   erpPurchaseChainCoverageQty: number; erpOpenPoQty: number; erpReceivedQty: number;
   sales30d: number | null; safetyDays: number; safetyStockQty: number | null;
@@ -155,6 +157,8 @@ type PurchasePlanningRow = {
   };
   calculationParts: {
     orderDemandQty: number; safetyStockQty: number | null; mukuAvailableQty: number | null;
+    effectiveAvailableQty: number | null;
+    availableQtySource: 'muku' | 'manual_confirmation' | 'unknown';
     erpPurchaseChainCoverageQty: number; mukuInboundQty: number | null;
     mukuInboundDeducted: false; erpOpenPoDeductedSeparately: false;
     rawOrderGapQty: number | null; rawTotalGapQty: number | null;
@@ -167,6 +171,11 @@ type PurchasePlanningRow = {
     inventoryOldestRecordUpdatedAt: string | null; inventorySourceMaxAgeMinutes: number;
     latestReceiptAt: string | null; receiptReflectedInMuku: boolean | null;
   };
+  inventoryConfirmation: {
+    id: string; confirmedAvailableQty: number; scope: 'all_warehouses';
+    confirmedAt: string; expiresAt: string; note: string;
+    confirmedBy: string; confirmedByEmail: string; active: boolean; used: boolean;
+  } | null;
   conversion: {
     eligibleOrderQty: number; blockedRecommendationQty: number;
     safetyOnlyQty: number; policyRoundingQty: number;
@@ -1533,10 +1542,10 @@ function PurchasePlanningTable({ planning, rows, selectedPlanRowIds, toggleRow, 
   toggleRow: (id: string) => void; openPolicy: (row: PurchasePlanningRow) => void;
   canMap: boolean; busy: string; hasQuery: boolean;
 }) {
-  return <div className="table-wrap module-table"><table className="purchase-planning-table"><thead><tr><th className="selection-cell">选择</th><th>ERP SKU / MUKU SKU</th><th>订单需求 / 安全库存</th><th>MUKU 可用 / 在途</th><th>ERP 覆盖 / 已收展示</th><th>建议采购</th><th>状态与依据</th><th>操作</th></tr></thead><tbody>{rows.length ? rows.map((row) => {
+  return <div className="table-wrap module-table"><table className="purchase-planning-table"><thead><tr><th className="selection-cell">选择</th><th>ERP SKU / MUKU SKU</th><th>订单需求 / 安全库存</th><th>有效可用 / 在途</th><th>ERP 覆盖 / 已收展示</th><th>建议采购</th><th>状态与依据</th><th>操作</th></tr></thead><tbody>{rows.length ? rows.map((row) => {
     const convertible = planningRowConvertible(row, planning.readiness, planning.orderSourceReadiness);
     const matchedSkus = row.mukuSkus.map((source) => source.sku).join('、');
-    return <tr key={row.planRowId} className={row.decision === 'blocked' ? 'planning-row-blocked' : ''}><td className="selection-cell"><input className="purchase-check" type="checkbox" aria-label={`选择 ${row.skuCode}`} checked={selectedPlanRowIds.has(row.planRowId)} disabled={!convertible || Boolean(busy)} onChange={() => toggleRow(row.planRowId)} /></td><td><strong>{row.skuCode}</strong><small className="cell-sub">{row.skuName}</small><small className="cell-sub planning-match">{matchedSkus || (row.mukuMatchStatus === 'ambiguous' ? 'MUKU SKU 存在歧义' : '尚未映射 MUKU SKU')}</small></td><td><strong>{row.orderDemandQty} / {formatOptionalQuantity(row.safetyStockQty)}</strong><small className="cell-sub">近 30 天销量：{formatOptionalQuantity(row.sales30d)}</small></td><td><strong>{formatOptionalQuantity(row.mukuAvailableQty)} / {formatOptionalQuantity(row.mukuInboundQty)}</strong><small className="cell-sub">在途仅展示，不抵扣</small></td><td><strong>{row.erpPurchaseChainCoverageQty}</strong><small className="cell-sub">PO 未收 {row.erpOpenPoQty} · 已收 {row.erpReceivedQty}（仅展示）</small></td><td><strong className="planning-recommendation">{formatOptionalQuantity(row.recommendedQty)}</strong><small className="cell-sub">可转官方订单 {row.conversion.eligibleOrderQty} 件</small>{row.conversion.blockedRecommendationQty > 0 && <small className="cell-sub attention-text">另有 {row.conversion.blockedRecommendationQty} 件不可自动转</small>}</td><td><span className={`status-pill planning-status-${row.decision}`}>{planningDecisionLabel(row.decision)}</span><details className="planning-explanation"><summary>查看计算依据</summary><div><p><b>公式：</b>{formatPlanningEquation(row)}</p>{row.explanations.map((text, index) => <p key={`${row.planRowId}-explanation-${index}`}>{text}</p>)}{[...row.blockers, ...row.warnings].map((reason) => <p className="attention-text" key={`${row.planRowId}-${reason}`}>{planningReasonLabel(reason)}</p>)}<p className="planning-source-note">库存源更新时间：{formatOptionalTime(row.sourceTimes.inventoryRecordUpdatedAt)}</p></div></details></td><td><div className="row-actions planning-row-actions">{canMap && <button disabled={Boolean(busy)} onClick={() => openPolicy(row)}>采购策略</button>}{convertible ? <span className="terminal-label">勾选后批量转申请</span> : <span className="terminal-label">{!planning.orderSourceReadiness ? '官方订单源未就绪' : row.conversion.eligibleOrderQty <= 0 && row.blockers.length === 0 ? '暂无可转订单缺口' : planningPrimaryBlocker(row)}</span>}</div></td></tr>;
+    return <tr key={row.planRowId} className={row.decision === 'blocked' ? 'planning-row-blocked' : ''}><td className="selection-cell"><input className="purchase-check" type="checkbox" aria-label={`选择 ${row.skuCode}`} checked={selectedPlanRowIds.has(row.planRowId)} disabled={!convertible || Boolean(busy)} onChange={() => toggleRow(row.planRowId)} /></td><td><strong>{row.skuCode}</strong><small className="cell-sub">{row.skuName}</small><small className="cell-sub planning-match">{matchedSkus || (row.mukuMatchStatus === 'ambiguous' ? 'MUKU SKU 存在歧义' : '尚未映射 MUKU SKU')}</small></td><td><strong>{row.orderDemandQty} / {formatOptionalQuantity(row.safetyStockQty)}</strong><small className="cell-sub">近 30 天销量：{formatOptionalQuantity(row.sales30d)}</small></td><td><strong>{formatOptionalQuantity(row.effectiveAvailableQty)} / {formatOptionalQuantity(row.mukuInboundQty)}</strong><small className="cell-sub">{planningAvailableSourceLabel(row)}</small><small className="cell-sub">在途仅展示，不抵扣</small></td><td><strong>{row.erpPurchaseChainCoverageQty}</strong><small className="cell-sub">PO 未收 {row.erpOpenPoQty} · 已收 {row.erpReceivedQty}（仅展示）</small></td><td><strong className="planning-recommendation">{formatOptionalQuantity(row.recommendedQty)}</strong><small className="cell-sub">可转官方订单 {row.conversion.eligibleOrderQty} 件</small>{row.conversion.blockedRecommendationQty > 0 && <small className="cell-sub attention-text">另有 {row.conversion.blockedRecommendationQty} 件不可自动转</small>}</td><td><span className={`status-pill planning-status-${row.decision}`}>{planningDecisionLabel(row.decision)}</span><details className="planning-explanation"><summary>查看计算依据</summary><div><p><b>公式：</b>{formatPlanningEquation(row)}</p>{row.explanations.map((text, index) => <p key={`${row.planRowId}-explanation-${index}`}>{text}</p>)}{[...row.blockers, ...row.warnings].map((reason) => <p className="attention-text" key={`${row.planRowId}-${reason}`}>{planningReasonLabel(reason)}</p>)}<p className="planning-source-note">原始 MUKU 可用量：{formatOptionalQuantity(row.mukuAvailableQty)} · 有效可用量来源：{planningAvailableSourceLabel(row)} · 库存源更新时间：{formatOptionalTime(row.sourceTimes.inventoryRecordUpdatedAt)}</p></div></details></td><td><div className="row-actions planning-row-actions">{canMap && <button disabled={Boolean(busy)} onClick={() => openPolicy(row)}>采购策略</button>}{convertible ? <span className="terminal-label">勾选后批量转申请</span> : <span className="terminal-label">{!planning.orderSourceReadiness ? '官方订单源未就绪' : row.conversion.eligibleOrderQty <= 0 && row.blockers.length === 0 ? '暂无可转订单缺口' : planningPrimaryBlocker(row)}</span>}</div></td></tr>;
   }) : <tr><td className="empty-cell" colSpan={8}>{hasQuery ? '没有符合当前搜索条件的采购建议' : '暂无可计算的 ERP SKU；接入真实订单或设置采购策略后会出现在这里'}</td></tr>}</tbody></table></div>;
 }
 
@@ -2113,6 +2122,8 @@ function planningReasonLabel(reason: string) {
     safety_stock_without_purchase_demand: '安全库存部分没有真实订单需求，不能自动转申请',
     policy_rounding_exceeds_order_gap: 'MOQ 或包装取整超出真实订单缺口',
     order_demand_already_in_active_request: '部分订单需求已进入有效采购申请',
+    manual_inventory_confirmation: 'MUKU 可用量缺失，当前使用 24 小时内的人工库存确认',
+    manual_inventory_confirmation_expired: '人工库存确认已过期，已恢复库存未知阻断',
   };
   return labels[reason] ?? reason;
 }
@@ -2135,10 +2146,22 @@ function planningPrimaryBlocker(row: PurchasePlanningRow) {
 
 function formatPlanningEquation(row: PurchasePlanningRow) {
   const safety = row.calculationParts.safetyStockQty === null ? '未知（按 0 暂算）' : String(row.calculationParts.safetyStockQty);
-  const available = row.calculationParts.mukuAvailableQty === null ? '未知' : String(row.calculationParts.mukuAvailableQty);
+  const available = row.calculationParts.effectiveAvailableQty === null ? '未知' : String(row.calculationParts.effectiveAvailableQty);
   const raw = row.calculationParts.rawTotalGapQty === null ? '未知' : String(row.calculationParts.rawTotalGapQty);
   const rounded = row.calculationParts.roundedRecommendedQty === null ? '未知' : String(row.calculationParts.roundedRecommendedQty);
   return `max(0, ${row.calculationParts.orderDemandQty} + ${safety} - ${available} - ${row.calculationParts.erpPurchaseChainCoverageQty}) = ${raw}，策略取整后 ${rounded}`;
+}
+
+function planningAvailableSourceLabel(row: PurchasePlanningRow) {
+  if (row.availableQtySource === 'manual_confirmation') {
+    const expiry = row.inventoryConfirmation?.expiresAt;
+    return `人工确认${expiry ? ` · 有效至 ${formatOptionalTime(expiry)}` : ''}`;
+  }
+  if (row.availableQtySource === 'muku') return 'MUKU 仓库源';
+  if (row.inventoryConfirmation && !row.inventoryConfirmation.active) {
+    return `可用库存未知 · 人工确认已于 ${formatOptionalTime(row.inventoryConfirmation.expiresAt)} 过期`;
+  }
+  return '可用库存未知';
 }
 
 function optionalFormInteger(data: FormData, name: string) {
