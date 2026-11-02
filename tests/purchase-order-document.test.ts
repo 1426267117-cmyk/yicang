@@ -79,7 +79,25 @@ describe('采购单交付文档', () => {
 
   it('打印 HTML 转义供应商、SKU、商品和备注，不输出客户或凭证字段', () => {
     const order = sourceOrder({
-      supplier: { id: 'supplier-1', code: 'SUP<&>', name: '<script>alert(1)</script>' },
+      supplier: {
+        id: 'supplier-1',
+        code: 'SUP<&>',
+        name: '<script>alert(1)</script>',
+        contactName: '<img src=x onerror=alert(2)>',
+        contactPhone: '010<&>',
+        contactEmail: 'buyer<&>@example.invalid',
+        address: '<svg onload=alert(3)>',
+      },
+      deliveryWarehouse: {
+        id: 'warehouse-1',
+        code: 'WH<&>',
+        name: '华南<script>仓',
+        contactName: '收货人<&>',
+        contactPhone: '020<&>',
+        address: '<iframe src=bad>',
+      },
+      paymentTerms: '月结 < 30 天',
+      tradeTerms: 'FOB & 深圳',
       note: '交期 < 7 天 & 不得替换',
       lines: [{ ...sourceOrder().lines[0], skuCode: '<img src=x>', skuName: '桌子 & "椅子"' }],
       lineCount: 1,
@@ -92,13 +110,35 @@ describe('采购单交付文档', () => {
     expect(html).toContain('&lt;img src=x&gt;');
     expect(html).toContain('桌子 &amp; &quot;椅子&quot;');
     expect(html).toContain('交期 &lt; 7 天 &amp; 不得替换');
+    expect(html).toContain('&lt;img src=x onerror=alert(2)&gt;');
+    expect(html).toContain('&lt;iframe src=bad&gt;');
+    expect(html).toContain('月结 &lt; 30 天');
+    expect(html).toContain('FOB &amp; 深圳');
     expect(html).not.toContain('<script>alert(1)</script>');
     expect(html).not.toMatch(/customer|token|credential/i);
   });
 
   it('CSV 防止公式注入并保留最小货币单位和准确合计', () => {
     const order = sourceOrder({
-      supplier: { id: 'supplier-1', code: '=2+2', name: '  +SUM(A1:A2)' },
+      supplier: {
+        id: 'supplier-1',
+        code: '=2+2',
+        name: '  +SUM(A1:A2)',
+        contactName: '@联系人',
+        contactPhone: '+8613800000000',
+        contactEmail: '=FORMULA@example.invalid',
+        address: '-危险地址',
+      },
+      deliveryWarehouse: {
+        id: 'warehouse-1',
+        code: '=WH',
+        name: '+仓库',
+        contactName: '@收货人',
+        contactPhone: '-020',
+        address: '=危险收货地址',
+      },
+      paymentTerms: '=付款公式',
+      tradeTerms: '+贸易公式',
       note: '\t@危险公式',
       lines: [
         { ...sourceOrder().lines[0], skuCode: '-SKU', skuName: '=HYPERLINK("bad")' },
@@ -112,6 +152,10 @@ describe('采购单交付文档', () => {
     expect(csv).toContain("'\t@危险公式");
     expect(csv).toContain("'-SKU");
     expect(csv).toContain("'=HYPERLINK(");
+    expect(csv).toContain("'@联系人");
+    expect(csv).toContain("'=危险收货地址");
+    expect(csv).toContain("'=付款公式");
+    expect(csv).toContain("'+贸易公式");
     expect(csv).toContain('1234,2468,CNY');
     expect(csv).toContain('250,750,CNY');
     expect(csv).toContain('合计,,,5,1,4,,3218,CNY');
@@ -127,6 +171,28 @@ describe('采购单交付文档', () => {
     expect(document.totalAmountMinor).toBeNull();
     expect(renderPurchaseOrderHtml(document)).toContain('待补齐全部单价后计算');
     expect(renderPurchaseOrderCsv(document)).toContain('合计,,,5,1,4,,,CNY');
+  });
+
+  it('未提供联系人、收货仓和条款时明确显示未填写，不伪装成 0', () => {
+    const order = sourceOrder({
+      supplier: {
+        id: 'supplier-1', code: 'SUP-01', name: '测试供应商',
+        contactName: null, contactPhone: null, contactEmail: null, address: null,
+      },
+      deliveryWarehouse: null,
+      expectedDeliveryAt: null,
+      paymentTerms: null,
+      tradeTerms: null,
+    });
+    const document = buildPurchaseOrderDocument(order);
+    const html = renderPurchaseOrderHtml(document);
+    const csv = renderPurchaseOrderCsv(document);
+
+    expect(html).toContain('<span>收货仓库</span><strong>未填写</strong>');
+    expect(html).toContain('<span>付款条款</span><strong>未填写</strong>');
+    expect(csv).toContain('预计交期,未填写');
+    expect(csv).toContain('贸易条款,未填写');
+    expect(csv).not.toContain('预计交期,0');
   });
 
   it('金额乘法超过安全整数范围时不输出不准确的行金额或合计', () => {
@@ -159,7 +225,26 @@ function sourceOrder(overrides: Partial<SourceOrder> = {}): SourceOrder {
     purchaseRequestId: 'request-1',
     purchaseRequestNo: 'CG261102-TEST',
     purchaserMemberId: 'member-buyer',
-    supplier: { id: 'supplier-1', code: 'SUP-01', name: '测试供应商' },
+    supplier: {
+      id: 'supplier-1',
+      code: 'SUP-01',
+      name: '测试供应商',
+      contactName: '王供应商',
+      contactPhone: '13800000000',
+      contactEmail: 'supplier@example.invalid',
+      address: '佛山市供应商路 8 号',
+    },
+    deliveryWarehouse: {
+      id: 'warehouse-1',
+      code: 'MAIN',
+      name: '主仓',
+      contactName: '仓库收货员',
+      contactPhone: '020-12345678',
+      address: '深圳市测试路 1 号',
+    },
+    expectedDeliveryAt: '2026-11-12',
+    paymentTerms: '月结 30 天',
+    tradeTerms: 'FOB 深圳',
     status: 'issued',
     currency: 'CNY',
     note: '按确认样品采购',

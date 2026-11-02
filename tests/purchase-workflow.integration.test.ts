@@ -418,6 +418,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0013_guarded_withdrawal.sql',
     '../drizzle/0014_clever_silvermane.sql',
     '../drizzle/0015_true_tigra.sql',
+    '../drizzle/0016_brief_doomsday.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

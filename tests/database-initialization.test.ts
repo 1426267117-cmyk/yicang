@@ -29,6 +29,20 @@ describe('数据库初始化', () => {
     expect(sql).not.toMatch(/INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+(platform_stores|platform_orders|platform_order_lines|platform_refunds|platform_fulfillments)/i);
   });
 
+  it('采购下单字段迁移仅追加可空列，不覆盖或删除历史记录', () => {
+    const sql = readFileSync(
+      new URL('../drizzle/0016_brief_doomsday.sql', import.meta.url),
+      'utf8',
+    );
+    expect(sql).toContain('ALTER TABLE `suppliers` ADD `contact_name` text');
+    expect(sql).toContain('ALTER TABLE `warehouses` ADD `address` text');
+    expect(sql).toContain('ALTER TABLE `purchase_orders` ADD `delivery_warehouse_id` text');
+    expect(sql).toContain('ALTER TABLE `purchase_orders` ADD `supplier_name_snapshot` text');
+    expect(sql).toContain('ALTER TABLE `purchase_orders` ADD `delivery_address_snapshot` text');
+    expect(sql).not.toMatch(/\b(?:DELETE|UPDATE|DROP|TRUNCATE|REPLACE)\b/i);
+    expect(sql).not.toMatch(/\bADD\s+`[^`]+`\s+\w+\s+NOT\s+NULL\b/i);
+  });
+
   it('开发开放模式保留管理员联调，正式模式强制名单和成员角色', () => {
     const dbSource = readFileSync(new URL('../lib/db.ts', import.meta.url), 'utf8');
     const syncSource = readFileSync(

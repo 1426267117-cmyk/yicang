@@ -32,6 +32,9 @@ export const warehouses = sqliteTable('warehouses', {
   tenantId: text('tenant_id').notNull().references(() => tenants.id),
   code: text('code').notNull(),
   name: text('name').notNull(),
+  contactName: text('contact_name'),
+  contactPhone: text('contact_phone'),
+  address: text('address'),
   createdAt: text('created_at').notNull(),
 }, (table) => [uniqueIndex('uq_warehouses_tenant_code').on(table.tenantId, table.code)]);
 
@@ -402,6 +405,10 @@ export const suppliers = sqliteTable('suppliers', {
   tenantId: text('tenant_id').notNull().references(() => tenants.id),
   code: text('code').notNull(),
   name: text('name').notNull(),
+  contactName: text('contact_name'),
+  contactPhone: text('contact_phone'),
+  contactEmail: text('contact_email'),
+  address: text('address'),
   note: text('note'),
   active: integer('active', { mode: 'boolean' }).notNull().default(true),
   version: integer('version').notNull().default(1),
@@ -465,6 +472,21 @@ export const purchaseOrders = sqliteTable('purchase_orders', {
   orderNo: text('order_no').notNull(),
   purchaseRequestId: text('purchase_request_id').notNull().references(() => purchaseRequests.id),
   supplierId: text('supplier_id').notNull().references(() => suppliers.id),
+  deliveryWarehouseId: text('delivery_warehouse_id').references(() => warehouses.id),
+  expectedDeliveryAt: text('expected_delivery_at'),
+  paymentTerms: text('payment_terms'),
+  tradeTerms: text('trade_terms'),
+  supplierCodeSnapshot: text('supplier_code_snapshot'),
+  supplierNameSnapshot: text('supplier_name_snapshot'),
+  supplierContactNameSnapshot: text('supplier_contact_name_snapshot'),
+  supplierContactPhoneSnapshot: text('supplier_contact_phone_snapshot'),
+  supplierContactEmailSnapshot: text('supplier_contact_email_snapshot'),
+  supplierAddressSnapshot: text('supplier_address_snapshot'),
+  deliveryWarehouseCodeSnapshot: text('delivery_warehouse_code_snapshot'),
+  deliveryWarehouseNameSnapshot: text('delivery_warehouse_name_snapshot'),
+  deliveryContactNameSnapshot: text('delivery_contact_name_snapshot'),
+  deliveryContactPhoneSnapshot: text('delivery_contact_phone_snapshot'),
+  deliveryAddressSnapshot: text('delivery_address_snapshot'),
   status: text('status', {
     enum: ['draft', 'issued', 'partially_received', 'received', 'closed_short', 'cancelled'],
   }).notNull(),
@@ -489,6 +511,7 @@ export const purchaseOrders = sqliteTable('purchase_orders', {
     .where(sql`${table.status} <> 'cancelled'`),
   index('idx_purchase_orders_status').on(table.tenantId, table.status, table.updatedAt),
   index('idx_purchase_orders_supplier').on(table.tenantId, table.supplierId, table.updatedAt),
+  index('idx_purchase_orders_delivery_warehouse').on(table.tenantId, table.deliveryWarehouseId, table.updatedAt),
 ]);
 
 export const purchaseOrderLines = sqliteTable('purchase_order_lines', {

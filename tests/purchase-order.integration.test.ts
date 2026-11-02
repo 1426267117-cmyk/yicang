@@ -219,6 +219,118 @@ describe('正式采购单与到货入库闭环', () => {
     }, 'purchase-order-create-0002')).rejects.toMatchObject({ code: 'PURCHASE_ORDER_ALREADY_EXISTS' });
   });
 
+  it('采购单保存供应商与收货信息快照，并拒绝引用其他租户仓库', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-DELIVERY',
+      name: '交付测试供应商',
+      contactName: '陈供应商',
+      contactPhone: '13800000000',
+      contactEmail: 'supplier@example.invalid',
+      address: '佛山市供应商路 8 号',
+    }, 'supplier-delivery-fields-0001');
+    const warehouse = await createWarehouse(db, user, {
+      code: 'RECEIVE',
+      name: '采购收货仓',
+      contactName: '林收货员',
+      contactPhone: '0755-12345678',
+      address: '深圳市收货路 18 号 A 栋',
+    }, 'warehouse-delivery-fields-0001');
+
+    expect(supplier.supplier).toEqual(expect.objectContaining({
+      contactName: '陈供应商',
+      contactPhone: '13800000000',
+      contactEmail: 'supplier@example.invalid',
+      address: '佛山市供应商路 8 号',
+    }));
+    expect(warehouse.warehouse).toEqual(expect.objectContaining({
+      contactName: '林收货员',
+      contactPhone: '0755-12345678',
+      address: '深圳市收货路 18 号 A 栋',
+    }));
+
+    await expect(createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      deliveryWarehouseId: 'warehouse-other-tenant',
+    }, 'purchase-order-cross-tenant-warehouse-0001')).rejects.toMatchObject({
+      status: 404,
+      code: 'PURCHASE_DELIVERY_WAREHOUSE_NOT_FOUND',
+    });
+
+    const created = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      deliveryWarehouseId: warehouse.warehouse.id,
+      expectedDeliveryAt: '2026-11-15',
+      paymentTerms: '月结 30 天',
+      tradeTerms: 'FOB 深圳',
+    }, 'purchase-order-delivery-fields-0001');
+    expect(created.purchaseOrder).toEqual(expect.objectContaining({
+      expectedDeliveryAt: '2026-11-15',
+      paymentTerms: '月结 30 天',
+      tradeTerms: 'FOB 深圳',
+      supplier: expect.objectContaining({
+        name: '交付测试供应商',
+        contactName: '陈供应商',
+        address: '佛山市供应商路 8 号',
+      }),
+      deliveryWarehouse: expect.objectContaining({
+        id: warehouse.warehouse.id,
+        code: 'RECEIVE',
+        contactName: '林收货员',
+        address: '深圳市收货路 18 号 A 栋',
+      }),
+    }));
+
+    await db.batch([
+      db.prepare(`
+        UPDATE suppliers
+        SET name = '供应商新名称', contact_name = '新联系人', address = '供应商新地址'
+        WHERE tenant_id = ? AND id = ?
+      `).bind(tenantId, supplier.supplier.id),
+      db.prepare(`
+        UPDATE warehouses
+        SET name = '仓库新名称', contact_name = '新收货员', address = '仓库新地址'
+        WHERE tenant_id = ? AND id = ?
+      `).bind(tenantId, warehouse.warehouse.id),
+    ]);
+    const document = await loadPurchaseOrderDocument(db, user, created.purchaseOrder.id);
+    expect(document.supplier).toEqual(expect.objectContaining({
+      name: '交付测试供应商',
+      contactName: '陈供应商',
+      address: '佛山市供应商路 8 号',
+    }));
+    expect(document.deliveryWarehouse).toEqual(expect.objectContaining({
+      name: '采购收货仓',
+      contactName: '林收货员',
+      address: '深圳市收货路 18 号 A 栋',
+    }));
+
+    await db.prepare(`
+      UPDATE purchase_orders
+      SET supplier_code_snapshot = NULL,
+        supplier_name_snapshot = NULL,
+        supplier_contact_name_snapshot = NULL,
+        supplier_contact_phone_snapshot = NULL,
+        supplier_contact_email_snapshot = NULL,
+        supplier_address_snapshot = NULL,
+        delivery_warehouse_id = NULL,
+        delivery_warehouse_code_snapshot = NULL,
+        delivery_warehouse_name_snapshot = NULL,
+        delivery_contact_name_snapshot = NULL,
+        delivery_contact_phone_snapshot = NULL,
+        delivery_address_snapshot = NULL
+      WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, created.purchaseOrder.id).run();
+    const legacyCompatible = await loadPurchaseOrderDocument(db, user, created.purchaseOrder.id);
+    expect(legacyCompatible.supplier).toEqual(expect.objectContaining({
+      name: '供应商新名称',
+      contactName: '新联系人',
+      address: '供应商新地址',
+    }));
+    expect(legacyCompatible.deliveryWarehouse).toBeNull();
+  });
+
   it('只有来源申请指定的采购负责人可生成、确认或取消采购单', async () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-OWNER', name: '负责人权限测试供应商',
@@ -879,6 +991,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0009_shocking_iron_lad.sql',
     '../drizzle/0014_clever_silvermane.sql',
     '../drizzle/0015_true_tigra.sql',
+    '../drizzle/0016_brief_doomsday.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

@@ -14,6 +14,10 @@ type SupplierRow = {
   id: string;
   code: string;
   name: string;
+  contact_name: string | null;
+  contact_phone: string | null;
+  contact_email: string | null;
+  address: string | null;
   note: string | null;
   active: number;
   version: number;
@@ -26,6 +30,9 @@ type WarehouseRow = {
   id: string;
   code: string;
   name: string;
+  contact_name: string | null;
+  contact_phone: string | null;
+  address: string | null;
   created_at: string;
 };
 
@@ -38,6 +45,19 @@ type PurchaseOrderRow = {
   supplier_id: string;
   supplier_code: string;
   supplier_name: string;
+  supplier_contact_name: string | null;
+  supplier_contact_phone: string | null;
+  supplier_contact_email: string | null;
+  supplier_address: string | null;
+  delivery_warehouse_id: string | null;
+  delivery_warehouse_code: string | null;
+  delivery_warehouse_name: string | null;
+  delivery_contact_name: string | null;
+  delivery_contact_phone: string | null;
+  delivery_address: string | null;
+  expected_delivery_at: string | null;
+  payment_terms: string | null;
+  trade_terms: string | null;
   status: PurchaseOrderStatus;
   currency: string | null;
   note: string | null;
@@ -144,19 +164,20 @@ export async function getProcurementWorkspaceData(db: D1Database, user: UserCont
     summaryRow,
   ] = await Promise.all([
     db.prepare(`
-      SELECT id, code, name, note, active, version, created_at, updated_at
+      SELECT id, code, name, contact_name, contact_phone, contact_email, address,
+        note, active, version, created_at, updated_at
       FROM suppliers
       WHERE tenant_id = ?
       ORDER BY active DESC, name, code
       LIMIT 500
     `).bind(user.tenantId).all<SupplierRow>(),
     db.prepare(`
-      SELECT id, code, name
+      SELECT id, code, name, contact_name, contact_phone, address, created_at
       FROM warehouses
       WHERE tenant_id = ?
       ORDER BY code, name
       LIMIT 500
-    `).bind(user.tenantId).all<{ id: string; code: string; name: string }>(),
+    `).bind(user.tenantId).all<WarehouseRow>(),
     db.prepare(`${PURCHASE_ORDER_SELECT}
       WHERE po.tenant_id = ?
       GROUP BY po.id
@@ -249,7 +270,7 @@ export async function getProcurementWorkspaceData(db: D1Database, user: UserCont
   const purchaseReceipts = receiptRows.results.map((row) => mapPurchaseReceipt(row, linesByReceipt.get(row.id) ?? []));
   return {
     suppliers: supplierRows.results.map(mapSupplier),
-    warehouses: warehouseRows.results.map((row) => ({ id: row.id, code: row.code, name: row.name })),
+    warehouses: warehouseRows.results.map(mapWarehouse),
     purchaseOrders,
     purchaseReceipts,
     procurementSummary: {
@@ -279,6 +300,9 @@ export async function createWarehouse(
   const normalized = {
     code: input.code.trim().toUpperCase(),
     name: input.name.trim(),
+    contactName: input.contactName?.trim() || null,
+    contactPhone: input.contactPhone?.trim() || null,
+    address: input.address?.trim() || null,
   };
   const requestHash = await hashPayload(normalized);
   const replay = await readWarehouseReplay(db, user.tenantId, requestHash, idempotencyKey);
@@ -291,9 +315,19 @@ export async function createWarehouse(
   try {
     await db.batch([
       db.prepare(`
-        INSERT INTO warehouses (id, tenant_id, code, name, created_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).bind(warehouseId, user.tenantId, normalized.code, normalized.name, now),
+        INSERT INTO warehouses (
+          id, tenant_id, code, name, contact_name, contact_phone, address, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        warehouseId,
+        user.tenantId,
+        normalized.code,
+        normalized.name,
+        normalized.contactName,
+        normalized.contactPhone,
+        normalized.address,
+        now,
+      ),
       auditStatement(db, user, {
         action: 'CREATE_WAREHOUSE',
         entityType: 'warehouse',
@@ -304,6 +338,9 @@ export async function createWarehouse(
           warehouseId,
           code: normalized.code,
           name: normalized.name,
+          contactName: normalized.contactName,
+          contactPhone: normalized.contactPhone,
+          address: normalized.address,
         }),
         idempotencyKey,
         now,
@@ -335,6 +372,10 @@ export async function createSupplier(
   const normalized = {
     code: input.code.trim().toUpperCase(),
     name: input.name.trim(),
+    contactName: input.contactName?.trim() || null,
+    contactPhone: input.contactPhone?.trim() || null,
+    contactEmail: input.contactEmail?.trim() || null,
+    address: input.address?.trim() || null,
     note: input.note?.trim() || null,
   };
   const requestHash = await hashPayload(normalized);
@@ -351,19 +392,32 @@ export async function createSupplier(
   const actorMemberId = await resolveActorMemberId(db, user);
   const now = new Date().toISOString();
   const supplierId = crypto.randomUUID();
-  const afterJson = stableJson({ requestHash, code: normalized.code, name: normalized.name });
+  const afterJson = stableJson({
+    requestHash,
+    code: normalized.code,
+    name: normalized.name,
+    contactName: normalized.contactName,
+    contactPhone: normalized.contactPhone,
+    contactEmail: normalized.contactEmail,
+    address: normalized.address,
+  });
   try {
     await db.batch([
       db.prepare(`
         INSERT INTO suppliers (
-          id, tenant_id, code, name, note, active, version, idempotency_key,
+          id, tenant_id, code, name, contact_name, contact_phone, contact_email, address,
+          note, active, version, idempotency_key,
           request_hash, created_by_member_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?)
       `).bind(
         supplierId,
         user.tenantId,
         normalized.code,
         normalized.name,
+        normalized.contactName,
+        normalized.contactPhone,
+        normalized.contactEmail,
+        normalized.address,
         normalized.note,
         idempotencyKey,
         requestHash,
@@ -402,6 +456,10 @@ export async function createPurchaseOrder(
   const normalized = {
     purchaseRequestId: input.purchaseRequestId.trim(),
     supplierId: input.supplierId.trim(),
+    deliveryWarehouseId: input.deliveryWarehouseId?.trim() || null,
+    expectedDeliveryAt: input.expectedDeliveryAt ?? null,
+    paymentTerms: input.paymentTerms?.trim() || null,
+    tradeTerms: input.tradeTerms?.trim() || null,
     currency: input.currency?.trim().toUpperCase() || null,
     note: input.note?.trim() || null,
     lineCosts: [...(input.lineCosts ?? [])]
@@ -420,12 +478,29 @@ export async function createPurchaseOrder(
     return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, replay.id), replayed: true };
   }
 
-  const [supplier, request, requestLines] = await Promise.all([
+  const [supplier, deliveryWarehouse, request, requestLines] = await Promise.all([
     db.prepare(`
-      SELECT id FROM suppliers
+      SELECT id, code, name, contact_name, contact_phone, contact_email, address
+      FROM suppliers
       WHERE tenant_id = ? AND id = ? AND active = 1
       LIMIT 1
-    `).bind(user.tenantId, normalized.supplierId).first<{ id: string }>(),
+    `).bind(user.tenantId, normalized.supplierId).first<{
+      id: string;
+      code: string;
+      name: string;
+      contact_name: string | null;
+      contact_phone: string | null;
+      contact_email: string | null;
+      address: string | null;
+    }>(),
+    normalized.deliveryWarehouseId
+      ? db.prepare(`
+          SELECT id, code, name, contact_name, contact_phone, address, created_at
+          FROM warehouses
+          WHERE tenant_id = ? AND id = ?
+          LIMIT 1
+        `).bind(user.tenantId, normalized.deliveryWarehouseId).first<WarehouseRow>()
+      : Promise.resolve(null),
     db.prepare(`
       SELECT id, request_no, status FROM purchase_requests
       WHERE tenant_id = ? AND id = ?
@@ -436,6 +511,9 @@ export async function createPurchaseOrder(
     loadRequestLines(db, user.tenantId, normalized.purchaseRequestId),
   ]);
   if (!supplier) throw new HttpError(404, '供应商不存在或已停用', 'PURCHASE_SUPPLIER_NOT_FOUND');
+  if (normalized.deliveryWarehouseId && !deliveryWarehouse) {
+    throw new HttpError(404, '收货仓库不存在或不在当前数据范围内', 'PURCHASE_DELIVERY_WAREHOUSE_NOT_FOUND');
+  }
   if (!request) throw new HttpError(404, '采购申请不存在或不在当前数据范围内', 'PURCHASE_REQUEST_NOT_FOUND');
   if (request.status !== 'approved') {
     throw new HttpError(409, '只有已批准的采购申请才能生成正式采购单', 'PURCHASE_REQUEST_NOT_APPROVED');
@@ -457,16 +535,41 @@ export async function createPurchaseOrder(
   const statements: D1PreparedStatement[] = [
     db.prepare(`
       INSERT INTO purchase_orders (
-        id, tenant_id, order_no, purchase_request_id, supplier_id, status,
+        id, tenant_id, order_no, purchase_request_id, supplier_id,
+        delivery_warehouse_id, expected_delivery_at, payment_terms, trade_terms,
+        supplier_code_snapshot, supplier_name_snapshot,
+        supplier_contact_name_snapshot, supplier_contact_phone_snapshot,
+        supplier_contact_email_snapshot, supplier_address_snapshot,
+        delivery_warehouse_code_snapshot, delivery_warehouse_name_snapshot,
+        delivery_contact_name_snapshot, delivery_contact_phone_snapshot,
+        delivery_address_snapshot, status,
         currency, note, action_note, version, idempotency_key, request_hash,
-        last_action_key, created_by_member_id, issued_at, cancelled_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, NULL, 1, ?, ?, ?, ?, NULL, NULL, ?, ?)
+        last_action_key, created_by_member_id, issued_at, closed_at, cancelled_at, created_at, updated_at
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft',
+        ?, ?, NULL, 1, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?
+      )
     `).bind(
       purchaseOrderId,
       user.tenantId,
       orderNo,
       normalized.purchaseRequestId,
       normalized.supplierId,
+      normalized.deliveryWarehouseId,
+      normalized.expectedDeliveryAt,
+      normalized.paymentTerms,
+      normalized.tradeTerms,
+      supplier.code,
+      supplier.name,
+      supplier.contact_name,
+      supplier.contact_phone,
+      supplier.contact_email,
+      supplier.address,
+      deliveryWarehouse?.code ?? null,
+      deliveryWarehouse?.name ?? null,
+      deliveryWarehouse?.contact_name ?? null,
+      deliveryWarehouse?.contact_phone ?? null,
+      deliveryWarehouse?.address ?? null,
       normalized.currency,
       normalized.note,
       idempotencyKey,
@@ -510,6 +613,10 @@ export async function createPurchaseOrder(
       orderNo,
       purchaseRequestId: normalized.purchaseRequestId,
       supplierId: normalized.supplierId,
+      deliveryWarehouseId: normalized.deliveryWarehouseId,
+      expectedDeliveryAt: normalized.expectedDeliveryAt,
+      paymentTerms: normalized.paymentTerms,
+      tradeTerms: normalized.tradeTerms,
       lineCount: requestLines.length,
     }),
     idempotencyKey,
@@ -833,7 +940,8 @@ export async function createPurchaseReceipt(
 
 export async function getSupplier(db: D1Database, tenantId: string, supplierId: string) {
   const row = await db.prepare(`
-    SELECT id, code, name, note, active, version, created_at, updated_at
+    SELECT id, code, name, contact_name, contact_phone, contact_email, address,
+      note, active, version, created_at, updated_at
     FROM suppliers
     WHERE tenant_id = ? AND id = ?
     LIMIT 1
@@ -844,18 +952,13 @@ export async function getSupplier(db: D1Database, tenantId: string, supplierId: 
 
 export async function getWarehouse(db: D1Database, tenantId: string, warehouseId: string) {
   const row = await db.prepare(`
-    SELECT id, code, name, created_at
+    SELECT id, code, name, contact_name, contact_phone, address, created_at
     FROM warehouses
     WHERE tenant_id = ? AND id = ?
     LIMIT 1
   `).bind(tenantId, warehouseId).first<WarehouseRow>();
   if (!row) throw new HttpError(404, '仓库不存在或不在当前数据范围内', 'WAREHOUSE_NOT_FOUND');
-  return {
-    id: row.id,
-    code: row.code,
-    name: row.name,
-    createdAt: row.created_at,
-  };
+  return mapWarehouse(row);
 }
 
 export async function getPurchaseOrder(db: D1Database, tenantId: string, purchaseOrderId: string) {
@@ -894,8 +997,29 @@ const PURCHASE_ORDER_SELECT = `
     pr.request_no AS purchase_request_no,
     pr.purchaser_member_id,
     po.supplier_id,
-    supplier.code AS supplier_code,
-    supplier.name AS supplier_name,
+    COALESCE(po.supplier_code_snapshot, supplier.code) AS supplier_code,
+    COALESCE(po.supplier_name_snapshot, supplier.name) AS supplier_name,
+    CASE WHEN po.supplier_name_snapshot IS NOT NULL
+      THEN po.supplier_contact_name_snapshot ELSE supplier.contact_name END AS supplier_contact_name,
+    CASE WHEN po.supplier_name_snapshot IS NOT NULL
+      THEN po.supplier_contact_phone_snapshot ELSE supplier.contact_phone END AS supplier_contact_phone,
+    CASE WHEN po.supplier_name_snapshot IS NOT NULL
+      THEN po.supplier_contact_email_snapshot ELSE supplier.contact_email END AS supplier_contact_email,
+    CASE WHEN po.supplier_name_snapshot IS NOT NULL
+      THEN po.supplier_address_snapshot ELSE supplier.address END AS supplier_address,
+    po.delivery_warehouse_id,
+    CASE WHEN po.delivery_warehouse_name_snapshot IS NOT NULL
+      THEN po.delivery_warehouse_code_snapshot ELSE delivery_warehouse.code END AS delivery_warehouse_code,
+    COALESCE(po.delivery_warehouse_name_snapshot, delivery_warehouse.name) AS delivery_warehouse_name,
+    CASE WHEN po.delivery_warehouse_name_snapshot IS NOT NULL
+      THEN po.delivery_contact_name_snapshot ELSE delivery_warehouse.contact_name END AS delivery_contact_name,
+    CASE WHEN po.delivery_warehouse_name_snapshot IS NOT NULL
+      THEN po.delivery_contact_phone_snapshot ELSE delivery_warehouse.contact_phone END AS delivery_contact_phone,
+    CASE WHEN po.delivery_warehouse_name_snapshot IS NOT NULL
+      THEN po.delivery_address_snapshot ELSE delivery_warehouse.address END AS delivery_address,
+    po.expected_delivery_at,
+    po.payment_terms,
+    po.trade_terms,
     po.status,
     po.currency,
     po.note,
@@ -912,6 +1036,9 @@ const PURCHASE_ORDER_SELECT = `
   FROM purchase_orders po
   JOIN purchase_requests pr ON pr.id = po.purchase_request_id AND pr.tenant_id = po.tenant_id
   JOIN suppliers supplier ON supplier.id = po.supplier_id AND supplier.tenant_id = po.tenant_id
+  LEFT JOIN warehouses delivery_warehouse
+    ON delivery_warehouse.id = po.delivery_warehouse_id
+    AND delivery_warehouse.tenant_id = po.tenant_id
   LEFT JOIN purchase_order_lines line ON line.purchase_order_id = po.id AND line.tenant_id = po.tenant_id
 `;
 
@@ -989,11 +1116,27 @@ function mapSupplier(row: SupplierRow) {
     id: row.id,
     code: row.code,
     name: row.name,
+    contactName: row.contact_name,
+    contactPhone: row.contact_phone,
+    contactEmail: row.contact_email,
+    address: row.address,
     note: row.note,
     active: row.active === 1,
     version: Number(row.version),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function mapWarehouse(row: WarehouseRow) {
+  return {
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    contactName: row.contact_name,
+    contactPhone: row.contact_phone,
+    address: row.address,
+    createdAt: row.created_at,
   };
 }
 
@@ -1004,7 +1147,26 @@ function mapPurchaseOrder(row: PurchaseOrderRow, lines: ReturnType<typeof mapPur
     purchaseRequestId: row.purchase_request_id,
     purchaseRequestNo: row.purchase_request_no,
     purchaserMemberId: row.purchaser_member_id,
-    supplier: { id: row.supplier_id, code: row.supplier_code, name: row.supplier_name },
+    supplier: {
+      id: row.supplier_id,
+      code: row.supplier_code,
+      name: row.supplier_name,
+      contactName: row.supplier_contact_name,
+      contactPhone: row.supplier_contact_phone,
+      contactEmail: row.supplier_contact_email,
+      address: row.supplier_address,
+    },
+    deliveryWarehouse: row.delivery_warehouse_id ? {
+      id: row.delivery_warehouse_id,
+      code: row.delivery_warehouse_code,
+      name: row.delivery_warehouse_name,
+      contactName: row.delivery_contact_name,
+      contactPhone: row.delivery_contact_phone,
+      address: row.delivery_address,
+    } : null,
+    expectedDeliveryAt: row.expected_delivery_at,
+    paymentTerms: row.payment_terms,
+    tradeTerms: row.trade_terms,
     status: row.status,
     currency: row.currency,
     note: row.note,
@@ -1313,6 +1475,9 @@ function translateProcurementError(error: unknown): unknown {
   const message = error instanceof Error ? error.message : String(error);
   if (message.includes('INVALID_PURCHASE_SUPPLIER')) {
     return new HttpError(409, '供应商不存在或已停用', 'PURCHASE_SUPPLIER_NOT_FOUND');
+  }
+  if (message.includes('INVALID_PURCHASE_DELIVERY_WAREHOUSE')) {
+    return new HttpError(409, '收货仓库不存在或不在当前数据范围内', 'PURCHASE_DELIVERY_WAREHOUSE_NOT_FOUND');
   }
   if (message.includes('PURCHASE_REQUEST_NOT_APPROVED')) {
     return new HttpError(409, '只有已批准的采购申请才能生成正式采购单', 'PURCHASE_REQUEST_NOT_APPROVED');

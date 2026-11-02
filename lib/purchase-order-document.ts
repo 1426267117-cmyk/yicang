@@ -97,6 +97,19 @@ export function renderPurchaseOrderHtml(order: PurchaseOrderDocument) {
     <header><div><p>易仓 ERP · 正式采购单</p><h1>${escapeHtml(order.orderNo)}</h1></div><span class="badge">${escapeHtml(status)}</span></header>
     <section class="meta">
       <div><span>供应商</span><strong>${escapeHtml(order.supplier.name)}（${escapeHtml(order.supplier.code)}）</strong></div>
+      <div><span>供应商联系人</span><strong>${escapeHtml(displayValue(order.supplier.contactName))}</strong></div>
+      <div><span>供应商电话</span><strong>${escapeHtml(displayValue(order.supplier.contactPhone))}</strong></div>
+      <div><span>供应商邮箱</span><strong>${escapeHtml(displayValue(order.supplier.contactEmail))}</strong></div>
+      <div><span>供应商地址</span><strong>${escapeHtml(displayValue(order.supplier.address))}</strong></div>
+      <div><span>收货仓库</span><strong>${escapeHtml(order.deliveryWarehouse
+        ? `${displayValue(order.deliveryWarehouse.name)}（${displayValue(order.deliveryWarehouse.code)}）`
+        : '未填写')}</strong></div>
+      <div><span>收货联系人</span><strong>${escapeHtml(displayValue(order.deliveryWarehouse?.contactName))}</strong></div>
+      <div><span>收货电话</span><strong>${escapeHtml(displayValue(order.deliveryWarehouse?.contactPhone))}</strong></div>
+      <div><span>完整收货地址</span><strong>${escapeHtml(displayValue(order.deliveryWarehouse?.address))}</strong></div>
+      <div><span>预计交期</span><strong>${escapeHtml(formatExpectedDelivery(order.expectedDeliveryAt))}</strong></div>
+      <div><span>付款条款</span><strong>${escapeHtml(displayValue(order.paymentTerms))}</strong></div>
+      <div><span>贸易条款</span><strong>${escapeHtml(displayValue(order.tradeTerms))}</strong></div>
       <div><span>来源申请单</span><strong>${escapeHtml(order.purchaseRequestNo)}</strong></div>
       <div><span>币种</span><strong>${escapeHtml(order.currency ?? '未指定')}</strong></div>
       <div><span>创建时间（UTC）</span><strong>${escapeHtml(formatTimestamp(order.createdAt))}</strong></div>
@@ -121,6 +134,18 @@ export function renderPurchaseOrderCsv(order: PurchaseOrderDocument) {
     ['状态', statusLabel(order.status)],
     ['供应商编码', spreadsheetText(order.supplier.code)],
     ['供应商名称', spreadsheetText(order.supplier.name)],
+    ['供应商联系人', spreadsheetText(displayValue(order.supplier.contactName))],
+    ['供应商电话', spreadsheetText(displayValue(order.supplier.contactPhone))],
+    ['供应商邮箱', spreadsheetText(displayValue(order.supplier.contactEmail))],
+    ['供应商地址', spreadsheetText(displayValue(order.supplier.address))],
+    ['收货仓库编码', spreadsheetText(displayValue(order.deliveryWarehouse?.code))],
+    ['收货仓库名称', spreadsheetText(displayValue(order.deliveryWarehouse?.name))],
+    ['收货联系人', spreadsheetText(displayValue(order.deliveryWarehouse?.contactName))],
+    ['收货电话', spreadsheetText(displayValue(order.deliveryWarehouse?.contactPhone))],
+    ['完整收货地址', spreadsheetText(displayValue(order.deliveryWarehouse?.address))],
+    ['预计交期', spreadsheetText(formatExpectedDelivery(order.expectedDeliveryAt))],
+    ['付款条款', spreadsheetText(displayValue(order.paymentTerms))],
+    ['贸易条款', spreadsheetText(displayValue(order.tradeTerms))],
     ['来源申请单', spreadsheetText(order.purchaseRequestNo)],
     ['币种', spreadsheetText(order.currency ?? '')],
     ['创建时间（UTC）', formatTimestamp(order.createdAt)],
@@ -175,6 +200,15 @@ function formatTimestamp(value: string | null) {
   if (!value) return '—';
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : value;
+}
+
+function formatExpectedDelivery(value: string | null) {
+  if (!value) return '未填写';
+  return /^\d{4}-\d{2}-\d{2}$/u.test(value) ? value : formatTimestamp(value);
+}
+
+function displayValue(value: string | null | undefined) {
+  return value || '未填写';
 }
 
 function statusLabel(status: PurchaseOrder['status']) {

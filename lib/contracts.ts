@@ -107,12 +107,22 @@ export const purchaseRequestActionSchema = z.object({
 export const createSupplierSchema = z.object({
   code: z.string().trim().min(1).max(40).transform((value) => value.toUpperCase()),
   name: z.string().trim().min(1).max(120),
+  contactName: z.string().trim().max(120).optional(),
+  contactPhone: z.string().trim().max(60).optional(),
+  contactEmail: z.string().trim().max(254).refine(
+    (value) => value === '' || z.email().safeParse(value).success,
+    '邮箱格式不正确',
+  ).optional(),
+  address: z.string().trim().max(1000).optional(),
   note: z.string().trim().max(500).optional(),
 });
 
 export const createWarehouseSchema = z.object({
   code: z.string().trim().min(1).max(40).transform((value) => value.toUpperCase()),
   name: z.string().trim().min(1).max(120),
+  contactName: z.string().trim().max(120).optional(),
+  contactPhone: z.string().trim().max(60).optional(),
+  address: z.string().trim().max(1000).optional(),
 });
 
 const purchaseOrderLineCostSchema = z.object({
@@ -123,6 +133,13 @@ const purchaseOrderLineCostSchema = z.object({
 export const createPurchaseOrderSchema = z.object({
   purchaseRequestId: z.string().trim().min(1),
   supplierId: z.string().trim().min(1),
+  deliveryWarehouseId: z.string().trim().min(1).optional(),
+  expectedDeliveryAt: z.union([
+    z.iso.date(),
+    z.iso.datetime({ offset: true }),
+  ]).optional(),
+  paymentTerms: z.string().trim().max(500).optional(),
+  tradeTerms: z.string().trim().max(500).optional(),
   currency: z.string().trim().length(3).transform((value) => value.toUpperCase()).optional(),
   note: z.string().trim().max(500).optional(),
   lineCosts: z.array(purchaseOrderLineCostSchema).max(500).optional(),
