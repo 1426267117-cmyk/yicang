@@ -62,8 +62,61 @@ export const purchaseRequestActionSchema = z.object({
   }
 });
 
+export const createSupplierSchema = z.object({
+  code: z.string().trim().min(1).max(40).transform((value) => value.toUpperCase()),
+  name: z.string().trim().min(1).max(120),
+  note: z.string().trim().max(500).optional(),
+});
+
+const purchaseOrderLineCostSchema = z.object({
+  purchaseRequestLineId: z.string().trim().min(1),
+  unitCostMinor: z.number().int().min(0).max(10_000_000_000),
+});
+
+export const createPurchaseOrderSchema = z.object({
+  purchaseRequestId: z.string().trim().min(1),
+  supplierId: z.string().trim().min(1),
+  currency: z.string().trim().length(3).transform((value) => value.toUpperCase()).optional(),
+  note: z.string().trim().max(500).optional(),
+  lineCosts: z.array(purchaseOrderLineCostSchema).max(500).optional(),
+}).superRefine((value, context) => {
+  if (value.lineCosts?.length && !value.currency) {
+    context.addIssue({ code: 'custom', message: '填写采购单价时必须指定币种', path: ['currency'] });
+  }
+  const lineIds = value.lineCosts?.map((line) => line.purchaseRequestLineId) ?? [];
+  if (new Set(lineIds).size !== lineIds.length) {
+    context.addIssue({ code: 'custom', message: '采购申请明细价格不能重复填写', path: ['lineCosts'] });
+  }
+});
+
+export const purchaseOrderActionSchema = z.object({
+  action: z.enum(['issue', 'cancel']),
+  note: z.string().trim().max(500).optional(),
+});
+
+const purchaseReceiptLineSchema = z.object({
+  purchaseOrderLineId: z.string().trim().min(1),
+  quantity: z.number().int().positive().max(1_000_000),
+});
+
+export const createPurchaseReceiptSchema = z.object({
+  warehouseId: z.string().trim().min(1),
+  receivedAt: z.iso.datetime({ offset: true }).optional(),
+  note: z.string().trim().max(500).optional(),
+  lines: z.array(purchaseReceiptLineSchema).min(1).max(500),
+}).superRefine((value, context) => {
+  const lineIds = value.lines.map((line) => line.purchaseOrderLineId);
+  if (new Set(lineIds).size !== lineIds.length) {
+    context.addIssue({ code: 'custom', message: '同一次收货不能重复填写采购单明细', path: ['lines'] });
+  }
+});
+
 export type CreateOrderInput = z.infer<typeof createOrderSchema>;
 export type ShopifyOrderSyncInput = z.infer<typeof shopifyOrderSyncSchema>;
 export type ShopifyWebhookProcessInput = z.infer<typeof shopifyWebhookProcessSchema>;
 export type CreatePurchaseRequestInput = z.infer<typeof createPurchaseRequestSchema>;
 export type PurchaseRequestActionInput = z.infer<typeof purchaseRequestActionSchema>;
+export type CreateSupplierInput = z.infer<typeof createSupplierSchema>;
+export type CreatePurchaseOrderInput = z.infer<typeof createPurchaseOrderSchema>;
+export type PurchaseOrderActionInput = z.infer<typeof purchaseOrderActionSchema>;
+export type CreatePurchaseReceiptInput = z.infer<typeof createPurchaseReceiptSchema>;

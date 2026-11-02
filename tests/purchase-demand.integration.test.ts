@@ -284,6 +284,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0006_soft_wither.sql',
     '../drizzle/0007_worried_stone_men.sql',
     '../drizzle/0008_nifty_mimic.sql',
+    '../drizzle/0009_shocking_iron_lad.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

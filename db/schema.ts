@@ -380,6 +380,137 @@ export const purchaseRequestLines = sqliteTable('purchase_request_lines', {
   check('ck_purchase_request_lines_quantity_positive', sql`${table.requestedQuantity} > 0`),
 ]);
 
+export const suppliers = sqliteTable('suppliers', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  code: text('code').notNull(),
+  name: text('name').notNull(),
+  note: text('note'),
+  active: integer('active', { mode: 'boolean' }).notNull().default(true),
+  version: integer('version').notNull().default(1),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  createdByMemberId: text('created_by_member_id').notNull().references(() => members.id),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_suppliers_tenant_code').on(table.tenantId, table.code),
+  uniqueIndex('uq_suppliers_tenant_idempotency').on(table.tenantId, table.idempotencyKey),
+  index('idx_suppliers_tenant_active').on(table.tenantId, table.active, table.name),
+]);
+
+export const purchaseOrders = sqliteTable('purchase_orders', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  orderNo: text('order_no').notNull(),
+  purchaseRequestId: text('purchase_request_id').notNull().references(() => purchaseRequests.id),
+  supplierId: text('supplier_id').notNull().references(() => suppliers.id),
+  status: text('status', {
+    enum: ['draft', 'issued', 'partially_received', 'received', 'cancelled'],
+  }).notNull(),
+  currency: text('currency'),
+  note: text('note'),
+  actionNote: text('action_note'),
+  version: integer('version').notNull().default(1),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  lastActionKey: text('last_action_key').notNull(),
+  createdByMemberId: text('created_by_member_id').notNull().references(() => members.id),
+  issuedAt: text('issued_at'),
+  cancelledAt: text('cancelled_at'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_purchase_orders_number').on(table.tenantId, table.orderNo),
+  uniqueIndex('uq_purchase_orders_idempotency').on(table.tenantId, table.idempotencyKey),
+  uniqueIndex('uq_purchase_orders_active_request')
+    .on(table.tenantId, table.purchaseRequestId)
+    .where(sql`${table.status} <> 'cancelled'`),
+  index('idx_purchase_orders_status').on(table.tenantId, table.status, table.updatedAt),
+  index('idx_purchase_orders_supplier').on(table.tenantId, table.supplierId, table.updatedAt),
+]);
+
+export const purchaseOrderLines = sqliteTable('purchase_order_lines', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  purchaseOrderId: text('purchase_order_id').notNull().references(() => purchaseOrders.id),
+  purchaseRequestLineId: text('purchase_request_line_id').notNull().references(() => purchaseRequestLines.id),
+  skuId: text('sku_id').notNull().references(() => skus.id),
+  skuCodeSnapshot: text('sku_code_snapshot').notNull(),
+  skuNameSnapshot: text('sku_name_snapshot').notNull(),
+  orderedQuantity: integer('ordered_quantity').notNull(),
+  receivedQuantity: integer('received_quantity').notNull().default(0),
+  unitCostMinor: integer('unit_cost_minor'),
+  currency: text('currency'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_purchase_order_lines_request_line').on(table.purchaseOrderId, table.purchaseRequestLineId),
+  index('idx_purchase_order_lines_order').on(table.tenantId, table.purchaseOrderId),
+  index('idx_purchase_order_lines_sku').on(table.tenantId, table.skuId),
+  check('ck_purchase_order_lines_ordered_positive', sql`${table.orderedQuantity} > 0`),
+  check('ck_purchase_order_lines_received_range', sql`${table.receivedQuantity} >= 0 AND ${table.receivedQuantity} <= ${table.orderedQuantity}`),
+  check('ck_purchase_order_lines_cost_non_negative', sql`${table.unitCostMinor} IS NULL OR ${table.unitCostMinor} >= 0`),
+]);
+
+export const purchaseReceipts = sqliteTable('purchase_receipts', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  receiptNo: text('receipt_no').notNull(),
+  purchaseOrderId: text('purchase_order_id').notNull().references(() => purchaseOrders.id),
+  warehouseId: text('warehouse_id').notNull().references(() => warehouses.id),
+  status: text('status', { enum: ['posted'] }).notNull(),
+  note: text('note'),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  createdByMemberId: text('created_by_member_id').notNull().references(() => members.id),
+  receivedAt: text('received_at').notNull(),
+  createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_purchase_receipts_number').on(table.tenantId, table.receiptNo),
+  uniqueIndex('uq_purchase_receipts_idempotency').on(table.tenantId, table.idempotencyKey),
+  index('idx_purchase_receipts_order').on(table.tenantId, table.purchaseOrderId, table.createdAt),
+  index('idx_purchase_receipts_warehouse').on(table.tenantId, table.warehouseId, table.createdAt),
+]);
+
+export const purchaseReceiptLines = sqliteTable('purchase_receipt_lines', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  purchaseReceiptId: text('purchase_receipt_id').notNull().references(() => purchaseReceipts.id),
+  purchaseOrderLineId: text('purchase_order_line_id').notNull().references(() => purchaseOrderLines.id),
+  skuId: text('sku_id').notNull().references(() => skus.id),
+  warehouseId: text('warehouse_id').notNull().references(() => warehouses.id),
+  quantity: integer('quantity').notNull(),
+  createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_purchase_receipt_lines_order_line').on(table.purchaseReceiptId, table.purchaseOrderLineId),
+  index('idx_purchase_receipt_lines_receipt').on(table.tenantId, table.purchaseReceiptId),
+  index('idx_purchase_receipt_lines_order_line').on(table.tenantId, table.purchaseOrderLineId),
+  check('ck_purchase_receipt_lines_quantity_positive', sql`${table.quantity} > 0`),
+]);
+
+export const inventoryInboundMovements = sqliteTable('inventory_inbound_movements', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  purchaseReceiptId: text('purchase_receipt_id').notNull().references(() => purchaseReceipts.id),
+  purchaseReceiptLineId: text('purchase_receipt_line_id').notNull().references(() => purchaseReceiptLines.id),
+  purchaseOrderId: text('purchase_order_id').notNull().references(() => purchaseOrders.id),
+  purchaseOrderLineId: text('purchase_order_line_id').notNull().references(() => purchaseOrderLines.id),
+  skuId: text('sku_id').notNull().references(() => skus.id),
+  warehouseId: text('warehouse_id').notNull().references(() => warehouses.id),
+  type: text('type', { enum: ['purchase_receipt'] }).notNull(),
+  onHandDelta: integer('on_hand_delta').notNull(),
+  operationKey: text('operation_key').notNull(),
+  createdBy: text('created_by').notNull(),
+  createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_inventory_inbound_tenant_operation').on(table.tenantId, table.operationKey),
+  uniqueIndex('uq_inventory_inbound_receipt_line').on(table.purchaseReceiptLineId),
+  index('idx_inventory_inbound_order').on(table.tenantId, table.purchaseOrderId, table.createdAt),
+  index('idx_inventory_inbound_sku_warehouse').on(table.tenantId, table.skuId, table.warehouseId, table.createdAt),
+  check('ck_inventory_inbound_delta_positive', sql`${table.onHandDelta} > 0`),
+]);
+
 export const platformRefunds = sqliteTable('platform_refunds', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),

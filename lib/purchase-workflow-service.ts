@@ -8,6 +8,7 @@ import {
   type UserContext,
 } from './db';
 import { getPurchaseDemands } from './purchase-demand-service';
+import { getProcurementWorkspaceData } from './purchase-order-service';
 
 export type PurchaseRequestStatus =
   | 'draft'
@@ -182,6 +183,7 @@ export async function getPurchaseWorkspace(db: D1Database, user: UserContext) {
     cancelled: requests.filter((request) => request.status === 'cancelled').length,
     needsAttention: requests.filter((request) => request.needsAttention).length,
   };
+  const procurement = await getProcurementWorkspaceData(db, user);
 
   return {
     ok: true as const,
@@ -208,6 +210,7 @@ export async function getPurchaseWorkspace(db: D1Database, user: UserContext) {
       role: member.role,
     })),
     skuOptions: skuOptions.results.map((sku) => ({ id: sku.id, code: sku.code, name: sku.name })),
+    ...procurement,
     readOnly: false as const,
   };
 }

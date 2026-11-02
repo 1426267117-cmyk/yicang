@@ -15,17 +15,23 @@ export type Permission =
   | 'purchase:create'
   | 'purchase:submit'
   | 'purchase:review'
-  | 'purchase:mapping';
+  | 'purchase:mapping'
+  | 'purchase:supplier:create'
+  | 'purchase:order:create'
+  | 'purchase:order:issue'
+  | 'inventory:receive';
 
 export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
   admin: [
     'orders:read', 'orders:create', 'orders:approve', 'orders:ship', 'orders:cancel',
     'audit:read', 'connectors:read', 'connectors:sync',
     'purchase:read', 'purchase:create', 'purchase:submit', 'purchase:review', 'purchase:mapping',
+    'purchase:supplier:create', 'purchase:order:create', 'purchase:order:issue', 'inventory:receive',
   ],
   operator: [
     'orders:read', 'orders:create', 'orders:ship', 'orders:cancel', 'connectors:read',
     'purchase:read', 'purchase:create', 'purchase:submit', 'purchase:mapping',
+    'purchase:supplier:create', 'purchase:order:create', 'purchase:order:issue', 'inventory:receive',
   ],
   viewer: ['orders:read', 'connectors:read', 'purchase:read'],
 };

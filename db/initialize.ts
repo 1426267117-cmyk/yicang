@@ -16,14 +16,19 @@ async function initialize(db: D1Database) {
     WHERE type = 'table' AND name IN (
       'tenants', 'platform_orders', 'platform_order_write_leases',
       'connector_credentials', 'purchase_demands',
-      'purchase_requests', 'purchase_request_lines'
+      'purchase_requests', 'purchase_request_lines',
+      'suppliers', 'purchase_orders', 'purchase_order_lines',
+      'purchase_receipts', 'purchase_receipt_lines', 'inventory_inbound_movements'
     )
   `).all<{ name: string }>();
   const names = new Set(schema.results.map((row) => row.name));
   if (!names.has('tenants') || !names.has('platform_orders')
     || !names.has('platform_order_write_leases')
     || !names.has('connector_credentials') || !names.has('purchase_demands')
-    || !names.has('purchase_requests') || !names.has('purchase_request_lines')) {
+    || !names.has('purchase_requests') || !names.has('purchase_request_lines')
+    || !names.has('suppliers') || !names.has('purchase_orders')
+    || !names.has('purchase_order_lines') || !names.has('purchase_receipts')
+    || !names.has('purchase_receipt_lines') || !names.has('inventory_inbound_movements')) {
     throw new Error('DATABASE_MIGRATIONS_PENDING');
   }
   await db.prepare('PRAGMA optimize').run();
