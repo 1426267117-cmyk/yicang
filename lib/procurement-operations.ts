@@ -1,6 +1,7 @@
 import type { MukuFreshnessReport } from './muku-freshness-service';
 import { resolveMukuConfig } from './connectors/muku/config';
 import {
+  invalidShopifyEnvironmentStoreKeys,
   isShopifyStoreKey,
   readyShopifyEnvironmentStoreKeys,
 } from './connectors/shopify/config';
@@ -48,6 +49,8 @@ export function buildProcurementOperationsStatus(input: {
     ...readyShopifyEnvironmentStoreKeys(input.runtimeEnv),
     ...(input.shopifyAuthorizedStoreKeys ?? []).filter(isShopifyStoreKey),
   ]);
+  const invalidShopifyEnvironmentStores = invalidShopifyEnvironmentStoreKeys(input.runtimeEnv);
+  const shopifyEnvironmentConfigurationValid = invalidShopifyEnvironmentStores.length === 0;
   const shopifySourceConfigured = configuredShopifyStoreKeys.size > 0;
   const mukuEndpointReady = internalJobAuthConfigured && mukuSourceConfigured;
   const shopifyEndpointReady = internalJobAuthConfigured && shopifySourceConfigured;
@@ -72,6 +75,9 @@ export function buildProcurementOperationsStatus(input: {
       : null,
     !shopifyExternalScheduleConfigured
       ? '尚未确认外部调度器会定期调用 Shopify 增量补漏入口。'
+      : null,
+    !shopifyEnvironmentConfigurationValid
+      ? `有 ${invalidShopifyEnvironmentStores.length} 个 Shopify 环境店凭证配置无效；已阻断自动化闭环，请逐店修复。`
       : null,
   ].filter((reason): reason is string => reason !== null);
 
@@ -99,6 +105,7 @@ export function buildProcurementOperationsStatus(input: {
     internalJobAuthConfigured,
     automationReady: mukuEndpointReady
       && shopifyEndpointReady
+      && shopifyEnvironmentConfigurationValid
       && mukuExternalScheduleConfigured
       && shopifyExternalScheduleConfigured,
     muku: {
@@ -123,8 +130,12 @@ export function buildProcurementOperationsStatus(input: {
       protectedEndpoint: SHOPIFY_RECONCILE_ENDPOINT,
       endpointReady: shopifyEndpointReady,
       sourceConfigured: shopifySourceConfigured,
+      invalidEnvironmentStoreCount: invalidShopifyEnvironmentStores.length,
+      invalidEnvironmentStoreKeys: invalidShopifyEnvironmentStores,
       externalScheduleConfigured: shopifyExternalScheduleConfigured,
-      automationReady: shopifyEndpointReady && shopifyExternalScheduleConfigured,
+      automationReady: shopifyEndpointReady
+        && shopifyExternalScheduleConfigured
+        && shopifyEnvironmentConfigurationValid,
       recommendedIntervalMinutes: recommendedShopifyInterval(input.orderSyncMaxAgeMinutes),
       maxAgeMinutes: input.orderSyncMaxAgeMinutes,
       lastSuccessAt: latestTimestamp(shopifyStores.map((store) => store.lastSuccessAt)),

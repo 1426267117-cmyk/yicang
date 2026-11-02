@@ -111,6 +111,14 @@ export function readyShopifyEnvironmentStoreKeys(
   });
 }
 
+export function invalidShopifyEnvironmentStoreKeys(
+  runtimeEnv: Record<string, unknown>,
+): ShopifyStoreKey[] {
+  const ready = new Set(readyShopifyEnvironmentStoreKeys(runtimeEnv));
+  return configuredShopifyEnvironmentStoreKeys(runtimeEnv)
+    .filter((storeKey) => !ready.has(storeKey));
+}
+
 export function hasShopifyAppCredentials(config: ShopifyCredentialConfig) {
   return Boolean(config.clientId && config.clientSecret);
 }

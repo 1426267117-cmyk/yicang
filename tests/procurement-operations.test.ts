@@ -136,6 +136,34 @@ describe('采购数据自动化运维状态', () => {
     expect(status.shopify.configurationBlockers.join('；')).not.toContain('OAuth 授权');
   });
 
+  it('好店与坏店并存时入口可用但自动化闭环必须阻断', () => {
+    const status = buildProcurementOperationsStatus({
+      freshness: freshMukuReport(),
+      orderSources: [shopifySource()],
+      orderSyncMaxAgeMinutes: 30,
+      runtimeEnv: {
+        ERP_INTERNAL_JOB_TOKEN: internalToken,
+        MUKU_DASHBOARD_API_KEY: mukuKey,
+        ERP_MUKU_EXTERNAL_SCHEDULE_CONFIGURED: true,
+        ERP_SHOPIFY_RECONCILE_SCHEDULE_CONFIGURED: true,
+        SHOPIFY_ZIMASYA_ADMIN_ACCESS_TOKEN: 'test-bad-store-token',
+        SHOPIFY_ZIMASYA_SHOP_DOMAIN: 'not-a-shopify-domain.example',
+        SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'test-good-store-token',
+      },
+    });
+
+    expect(status.shopify).toEqual(expect.objectContaining({
+      sourceConfigured: true,
+      endpointReady: true,
+      externalScheduleConfigured: true,
+      automationReady: false,
+      invalidEnvironmentStoreCount: 1,
+      invalidEnvironmentStoreKeys: ['zimasya'],
+    }));
+    expect(status.shopify.configurationBlockers.join('；')).toContain('环境店凭证配置无效');
+    expect(status.automationReady).toBe(false);
+  });
+
   it('尚未生成平台店铺时也能从 D1 OAuth 授权口径判断入口就绪', () => {
     const status = buildProcurementOperationsStatus({
       freshness: freshMukuReport(),
