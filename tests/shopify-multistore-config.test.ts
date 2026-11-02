@@ -3,6 +3,7 @@ import {
   inspectShopifyStoreConfiguration,
   SHOPIFY_STORE_CANDIDATES,
 } from '../lib/connectors/shopify/config';
+import { shopifyOrderSyncSchema } from '../lib/contracts';
 
 describe('Shopify 四店配置隔离', () => {
   it('四家候选店都使用独立固定键、域名和环境变量前缀', () => {
@@ -30,5 +31,20 @@ describe('Shopify 四店配置隔离', () => {
     expect(results.anzhap).toMatchObject({ ok: true, errorCode: null });
     expect(results.bizfurniz).toMatchObject({ ok: true, errorCode: null });
     expect(JSON.stringify(results)).not.toContain('not-a-shopify-domain');
+  });
+
+  it('同步请求契约接受四家固定店铺并拒绝未知店铺', () => {
+    for (const candidate of SHOPIFY_STORE_CANDIDATES) {
+      expect(shopifyOrderSyncSchema.safeParse({
+        storeKey: candidate.key,
+        mode: 'incremental',
+        maxPages: 20,
+      }).success).toBe(true);
+    }
+    expect(shopifyOrderSyncSchema.safeParse({
+      storeKey: 'unverified-store',
+      mode: 'incremental',
+      maxPages: 20,
+    }).success).toBe(false);
   });
 });
