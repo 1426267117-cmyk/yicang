@@ -43,6 +43,7 @@ CREATE TABLE `muku_inventory_detail_records` (
 	`stock_status` text,
 	`package_barcode` text,
 	`product_dimensions` text,
+	`package_dimensions` text,
 	`product_color_style` text,
 	`packaging_type` text,
 	`reserved_order_no` text,

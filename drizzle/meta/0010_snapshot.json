@@ -1598,6 +1598,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "package_dimensions": {
+          "name": "package_dimensions",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "product_color_style": {
           "name": "product_color_style",
           "type": "text",

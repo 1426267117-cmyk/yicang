@@ -593,16 +593,18 @@ function buildRecordInsert(
       INSERT INTO muku_inventory_detail_records (
         id, tenant_id, snapshot_id, stable_key, record_key, source_id, source_snapshot_id,
         source_kind, warehouse_code, warehouse_name, region, sku, cabinet_no, received_at,
-        note, stock_status, package_barcode, product_dimensions, product_color_style, packaging_type,
+        note, stock_status, package_barcode, product_dimensions, package_dimensions,
+        product_color_style, packaging_type,
         reserved_order_no, inbound_batch, sequence_no, parent_spu, parent_record, category,
         estimated_arrival_at, age_days, quantity, stock_unit_qty, source_updated_at, ingested_at,
         raw_json, raw_hash, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(...common, stringValue(value.recordKey), stringValue(value.sourceId), stringValue(value.snapshotId),
       stringValue(value.sourceKind), stringValue(value.warehouseCode), stringValue(value.warehouseName),
       stringValue(value.region), stringValue(value.sku), stringValue(value.cabinetNo), stringValue(value.receivedAt),
       stringValue(value.note), stringValue(value.stockStatus), stringValue(value.packageBarcode),
-      stringValue(value.productDimensions), stringValue(value.productColorStyle), stringValue(value.packagingType),
+      stringValue(value.productDimensions), stringValue(value.packageDimensions),
+      stringValue(value.productColorStyle), stringValue(value.packagingType),
       stringValue(value.reservedOrderNo), stringValue(value.inboundBatch), stringValue(value.sequenceNo),
       stringValue(value.parentSpu), stringValue(value.parentRecord), stringValue(value.category),
       stringValue(value.estimatedArrivalAt), integerValue(value.ageDays), integerValue(value.quantity),

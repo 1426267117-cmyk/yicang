@@ -16,6 +16,7 @@ import type { UserContext } from '../lib/db';
 import { ROLE_PERMISSIONS } from '../lib/domain';
 import {
   getMukuInventory,
+  getMukuInventoryDetails,
   getMukuInventoryRisk,
   getMukuRuns,
   getMukuStatus,
@@ -139,6 +140,61 @@ describe('MUKU 只读快照同步', () => {
       WHERE tenant_id = ? AND dataset = 'inventory'
     `).bind(tenantId).first<{ status: string; last_error_code: string }>();
     expect(state).toEqual({ status: 'delayed', last_error_code: 'MUKU_EMPTY_DATASET' });
+  });
+
+  it('库存明细分别保存并返回产品尺寸和包装尺寸', async () => {
+    client.set('inventory-details', [
+      {
+        recordKey: 'detail-package-01',
+        sourceId: 'inventory-file',
+        snapshotId: 'source-snapshot-1',
+        sourceKind: 'file',
+        warehouseCode: 'WH-US',
+        warehouseName: '美国仓',
+        sku: 'PACKAGE-01',
+        productDimensions: '100 x 50 x 20 cm',
+        packageDimensions: '110 x 60 x 30 cm',
+        sourceUpdatedAt: '2026-11-02T01:00:00Z',
+        ingestedAt: '2026-11-02T01:01:00Z',
+      },
+      {
+        recordKey: 'detail-package-02',
+        sourceId: 'inventory-file',
+        snapshotId: 'source-snapshot-1',
+        sourceKind: 'file',
+        warehouseCode: 'WH-US',
+        sku: 'PACKAGE-NULL',
+        productDimensions: null,
+        packageDimensions: null,
+      },
+    ]);
+    await syncMukuDatasets({
+      db,
+      user,
+      client,
+      datasets: ['inventory-details'],
+      idempotencyKey: 'muku-package-dimensions-0001',
+    });
+
+    const details = await getMukuInventoryDetails(db, user, {
+      sku: 'PACKAGE-01',
+      page: 1,
+      pageSize: 20,
+    });
+    expect(details.data).toEqual([expect.objectContaining({
+      sku: 'PACKAGE-01',
+      productDimensions: '100 x 50 x 20 cm',
+      packageDimensions: '110 x 60 x 30 cm',
+    })]);
+    const nullDimensions = await getMukuInventoryDetails(db, user, {
+      sku: 'PACKAGE-NULL',
+      page: 1,
+      pageSize: 20,
+    });
+    expect(nullDimensions.data[0]).toEqual(expect.objectContaining({
+      productDimensions: null,
+      packageDimensions: null,
+    }));
   });
 
   it('映射风险和来源状态的 nullable 字段，状态 API 只读取 active 快照', async () => {
