@@ -13,6 +13,7 @@
 MUKU 只读出口
   -> ERP 后端连接器（鉴权、超时、限流重试、完整分页）
   -> ERP 独立快照（旧快照保留，完整新快照成功后才切换）
+  -> ERP 新鲜度判定（库存采购安全门）
   -> 库存页中的“MUKU 只读库存 / 库存风险”
 ```
 
@@ -35,11 +36,27 @@ MUKU 清单中其余数据集已识别，后续按业务阶段接入：履约单
 - 每次同步先拉完全部分页并校验记录数，再切换有效快照；空数据、分页不完整、鉴权失败或网络失败都不替换上一份有效快照。
 - 重复同步通过幂等键和内容哈希防重，不重复生成同一业务结果。
 
+## 自动保持新鲜与采购安全门
+
+- `GET /api/connectors/muku/status` 会返回 `freshness`。默认要求 `inventory` 同时存在有效快照、状态可用、上游 `generatedAt` 与 ERP `lastSuccessAt` 均不超过 30 分钟，才设置 `readyForProcurement=true`。
+- 缺少快照、时间未知/无效、超过阈值，或最近同步处于 `failed/delayed` 时，响应会给出明确的 `blockingReasons`；未知状态不会按 `0` 或“正常”处理。
+- 状态页请求只在连接已配置且刷新到期时，用 `waitUntil` 在响应后触发后台刷新。请求不会等待 MUKU 全量分页，10 分钟内也不会重复尝试。
+- 刷新期间仍读取上一份 active 快照；只有完整分页校验成功才切换。失败会保留旧快照，但采购安全门会阻止把失败状态当成最新库存。
+- 阈值可通过后端变量 `MUKU_FRESHNESS_MAX_AGE_MINUTES` 调整（默认 30，允许 5～1440）；限频可通过 `MUKU_AUTO_REFRESH_MIN_INTERVAL_MINUTES` 调整（默认 10，允许 1～1440）。
+
+### 受保护的任务入口
+
+部署平台可使用已有 `ERP_INTERNAL_JOB_TOKEN`，以 `Authorization: Bearer <token>` 调用 `POST /api/connectors/muku/refresh`。空请求体按“到期才刷新”执行；仅在人工故障处理时可传 `{"force":true}`。接口和错误响应都使用 `Cache-Control: no-store`，不会返回 MUKU API Key。
+
+当前工程只提供受保护的任务入口，没有声明 Cloudflare Cron、Sites 定时器或 Codex automation 已经配置。生产若需要无人访问页面时仍定时刷新，必须由实际部署环境的调度器调用此接口；建议每 5～10 分钟触发一次，由服务端限频和幂等逻辑决定是否真正拉取。
+
 ## 本地配置与验证
 
 1. 在 `.env.local` 或部署平台的后端 Secret 中设置：
    - `MUKU_DASHBOARD_BASE_URL`
    - `MUKU_DASHBOARD_API_KEY`
+   - `ERP_INTERNAL_JOB_TOKEN`（仅部署调度需要，至少 32 个随机字符）
+   - 可选：`MUKU_FRESHNESS_MAX_AGE_MINUTES`、`MUKU_AUTO_REFRESH_MIN_INTERVAL_MINUTES`
 2. 启动 ERP 后，在库存页点击“测试连接”。
 3. 测试成功后点击“同步 MUKU 只读数据”。
 4. 在“MUKU 只读库存”和“库存风险”页签核对记录数、数据时间、时区和来源状态。
