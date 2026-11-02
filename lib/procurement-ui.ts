@@ -1,3 +1,7 @@
+export const DIRECT_PURCHASE_REQUEST_DISABLED_CODE = 'DIRECT_PURCHASE_REQUEST_DISABLED';
+export const DIRECT_PURCHASE_REQUEST_DISABLED_MESSAGE =
+  '订单需求明细仅供查看；请从“今日采购建议”按最新库存、在途和数据时效生成采购申请';
+
 export function activePurchaseRequestIds(
   purchaseOrders: Array<{ purchaseRequestId: string; status: string }>,
 ) {

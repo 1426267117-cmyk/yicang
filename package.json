@@ -11,7 +11,7 @@
     "start": "vinext start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern node_modules_incomplete_20260901",
     "test": "vitest run --config vitest.config.ts",
-    "test:procurement-acceptance": "vitest run --config vitest.config.ts --maxWorkers=1 --no-file-parallelism tests/purchase-demand.integration.test.ts tests/purchase-mapping.integration.test.ts tests/purchase-planning.integration.test.ts tests/purchase-workflow.integration.test.ts tests/purchase-order.integration.test.ts tests/shopify-sync-service.integration.test.ts tests/muku-freshness.integration.test.ts",
+    "test:procurement-acceptance": "vitest run --config vitest.config.ts --maxWorkers=1 --no-file-parallelism tests/direct-purchase-request-route.test.ts tests/purchase-demand.integration.test.ts tests/purchase-mapping.integration.test.ts tests/purchase-planning.integration.test.ts tests/purchase-workflow.integration.test.ts tests/purchase-order.integration.test.ts tests/shopify-sync-service.integration.test.ts tests/muku-freshness.integration.test.ts",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
