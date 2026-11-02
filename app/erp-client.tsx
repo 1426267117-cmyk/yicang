@@ -5,7 +5,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 type ModuleKey = 'dashboard' | 'platform' | 'orders' | 'inventory' | 'purchase' | 'warehouse' | 'logistics' | 'finance' | 'reports';
 type OrderStatus = 'pending_review' | 'reserved' | 'shipped' | 'cancelled';
 type OrderAction = 'approve' | 'ship' | 'cancel';
-type Permission = 'orders:read' | 'orders:create' | 'orders:approve' | 'orders:ship' | 'orders:cancel' | 'audit:read' | 'connectors:read' | 'connectors:sync';
+type Permission = 'orders:read' | 'orders:create' | 'orders:approve' | 'orders:ship' | 'orders:cancel' | 'audit:read' | 'connectors:read' | 'connectors:sync' | 'purchase:read' | 'purchase:mapping' | 'purchase:create' | 'purchase:submit' | 'purchase:review';
 
 type ErpOrder = {
   id: string; orderNo: string; channel: string; destination: string; customerName: string;
@@ -38,18 +38,48 @@ type PurchaseDemand = {
   normalizedSku: string | null; mappedSkuId: string | null; mappedSkuCode: string | null;
   mappedSkuName: string | null; title: string | null; name: string | null;
   orderedQuantity: number; currentQuantity: number | null; unfulfilledQuantity: number | null;
-  requiredQuantity: number; status: PurchaseDemandStatus; reasonCode: string | null;
+  requiredQuantity: number; allocatedQuantity?: number; availableQuantity?: number;
+  status: PurchaseDemandStatus; reasonCode: string | null;
   sourceUpdatedAt: string; firstSeenAt: string; lastRefreshedAt: string; updatedAt: string;
+};
+
+type PurchaseMember = { id: string; displayName: string; role: 'admin' | 'operator' | 'viewer' };
+type PurchaseSkuOption = { id: string; code: string; name: string };
+type PurchaseRequestStatus = 'draft' | 'pending_review' | 'approved' | 'rejected' | 'cancelled';
+type PurchaseRequestLine = {
+  id: string; demandId: string; skuId: string; skuCode?: string | null; skuName?: string | null;
+  rawSku?: string | null; requestedQuantity: number; sourceRequiredQuantity?: number;
+};
+type PurchaseRequest = {
+  id: string; requestNo: string; status: PurchaseRequestStatus;
+  buyer: PurchaseMember | null; reviewer: PurchaseMember | null; creator: PurchaseMember | null;
+  purchaser?: PurchaseMember | null;
+  purchaserMemberId?: string; purchaserName?: string; reviewerMemberId?: string; reviewerName?: string; creatorName?: string;
+  lineCount: number; totalQuantity: number; note: string | null; reviewNote: string | null;
+  needsAttention: boolean; createdAt: string; updatedAt: string; lines: PurchaseRequestLine[];
+};
+
+type PurchaseDemandSummary = {
+  total: number; open: number; needsMapping: number; notRequired: number;
+  openQuantity: number; needsMappingQuantity: number; availableQuantity?: number;
 };
 
 type PurchaseDemandsPayload = {
   ok: true;
   readOnly: true;
   demands: PurchaseDemand[];
-  summary: {
-    total: number; open: number; needsMapping: number; notRequired: number;
-    openQuantity: number; needsMappingQuantity: number;
-  };
+  summary: PurchaseDemandSummary;
+};
+
+type PurchaseRequestSummary = {
+  total: number; draft: number; pendingReview: number; approved: number; rejected: number; cancelled: number;
+};
+
+type PurchaseWorkspacePayload = {
+  ok: true; readOnly?: boolean; demands: PurchaseDemand[]; summary: PurchaseDemandSummary & Partial<PurchaseRequestSummary>;
+  requests: PurchaseRequest[];
+  requestSummary?: PurchaseRequestSummary;
+  members: PurchaseMember[]; skuOptions: PurchaseSkuOption[];
 };
 
 type ShopifyStatus = {
@@ -127,6 +157,12 @@ const purchaseDemandReasonLabel: Record<string, string> = {
   sku_ambiguous: 'SKU 映射存在歧义', sku_unmapped: 'SKU 尚未映射',
 };
 
+const purchaseRequestStatusLabel: Record<PurchaseRequestStatus, string> = {
+  draft: '草稿', pending_review: '待复审', approved: '已批准', rejected: '已驳回', cancelled: '已取消',
+};
+
+type PurchaseTab = 'pending' | 'mapping' | 'requests' | 'history';
+
 const plannedModules: Record<Exclude<ModuleKey, 'dashboard' | 'platform' | 'orders' | 'inventory'>, {
   title: string; desc: string; source: string;
 }> = {
@@ -137,14 +173,18 @@ const plannedModules: Record<Exclude<ModuleKey, 'dashboard' | 'platform' | 'orde
   reports: { title: '数据报表', desc: '基于可信业务明细生成统一口径报表', source: '已入库的真实业务明细' },
 };
 
-const emptyPurchaseSummary: PurchaseDemandsPayload['summary'] = {
+const emptyPurchaseSummary: PurchaseDemandSummary = {
   total: 0, open: 0, needsMapping: 0, notRequired: 0, openQuantity: 0, needsMappingQuantity: 0,
+};
+
+const emptyPurchaseRequestSummary: PurchaseRequestSummary = {
+  total: 0, draft: 0, pendingReview: 0, approved: 0, rejected: 0, cancelled: 0,
 };
 
 export default function ErpClient() {
   const [active, setActive] = useState<ModuleKey>('dashboard');
   const [payload, setPayload] = useState<ErpPayload | null>(null);
-  const [purchasePayload, setPurchasePayload] = useState<PurchaseDemandsPayload | null>(null);
+  const [purchasePayload, setPurchasePayload] = useState<PurchaseWorkspacePayload | null>(null);
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatus | null>(null);
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(true);
@@ -156,6 +196,11 @@ export default function ErpClient() {
   const [submitting, setSubmitting] = useState(false);
   const [actionBusy, setActionBusy] = useState('');
   const [syncBusy, setSyncBusy] = useState('');
+  const [purchaseTab, setPurchaseTab] = useState<PurchaseTab>('pending');
+  const [selectedDemandIds, setSelectedDemandIds] = useState<Set<string>>(new Set());
+  const [mappingDemand, setMappingDemand] = useState<PurchaseDemand | null>(null);
+  const [showPurchaseRequest, setShowPurchaseRequest] = useState(false);
+  const [purchaseBusy, setPurchaseBusy] = useState('');
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -165,13 +210,18 @@ export default function ErpClient() {
       if (response.status === 401) { setAuthRequired(true); return; }
       if (!response.ok || !('ok' in body) || body.ok !== true) throw new Error('message' in body ? body.message : '业务数据加载失败');
       setPayload(body);
-      const purchaseResponse = await fetch('/api/purchase/demands', { cache: 'no-store' });
-      const purchaseBody = await purchaseResponse.json() as PurchaseDemandsPayload | { message?: string };
+      let purchaseResponse = await fetch('/api/purchase/workspace', { cache: 'no-store' });
+      if (purchaseResponse.status === 404) purchaseResponse = await fetch('/api/purchase/demands', { cache: 'no-store' });
+      const purchaseBody = await purchaseResponse.json() as PurchaseWorkspacePayload | PurchaseDemandsPayload | { message?: string };
       if (purchaseResponse.status === 401) { setAuthRequired(true); return; }
       if (!purchaseResponse.ok || !('ok' in purchaseBody) || purchaseBody.ok !== true) {
         throw new Error('message' in purchaseBody ? purchaseBody.message : '采购需求加载失败');
       }
-      setPurchasePayload(purchaseBody);
+      const normalizedPurchase = normalizePurchaseWorkspace(purchaseBody);
+      setPurchasePayload(normalizedPurchase);
+      setSelectedDemandIds((current) => new Set([...current].filter((id) => normalizedPurchase.demands.some(
+        (demand) => demand.id === id && demand.status === 'open' && demandAvailableQuantity(demand) > 0,
+      ))));
       const connectorResponse = await fetch('/api/connectors/shopify/status', { cache: 'no-store' });
       if (connectorResponse.ok) setShopifyStatus(await connectorResponse.json() as ShopifyStatus);
       setAuthRequired(false);
@@ -258,6 +308,19 @@ export default function ErpClient() {
       demand.reasonCode ? (purchaseDemandReasonLabel[demand.reasonCode] ?? demand.reasonCode) : '',
     ].some((value) => value.toLowerCase().includes(term)));
   }, [purchasePayload, query]);
+  const filteredPurchaseRequests = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    if (!term) return purchasePayload?.requests ?? [];
+    return (purchasePayload?.requests ?? []).filter((request) => [
+      request.requestNo,
+      request.buyer?.displayName ?? '',
+      request.reviewer?.displayName ?? '',
+      request.creator?.displayName ?? '',
+      purchaseRequestStatusLabel[request.status],
+      request.note ?? '',
+      ...request.lines.flatMap((line) => [line.skuCode ?? '', line.skuName ?? '', line.rawSku ?? '']),
+    ].some((value) => value.toLowerCase().includes(term)));
+  }, [purchasePayload, query]);
 
   function switchModule(key: ModuleKey) { setActive(key); setQuery(''); }
   function flash(message: string) { setToast(message); window.setTimeout(() => setToast(''), 2800); }
@@ -337,6 +400,111 @@ export default function ErpClient() {
     } finally { setSyncBusy(''); }
   }
 
+  function togglePurchaseDemand(id: string) {
+    setSelectedDemandIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  async function submitSkuMapping(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!mappingDemand) return;
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const mode = String(data.get('mappingMode') ?? 'existing');
+    const payloadBody = mode === 'new'
+      ? { demandId: mappingDemand.id, newSku: { code: String(data.get('newSkuCode') ?? ''), name: String(data.get('newSkuName') ?? '') } }
+      : { demandId: mappingDemand.id, skuId: String(data.get('skuId') ?? '') };
+    setPurchaseBusy(`mapping:${mappingDemand.id}`); setError('');
+    try {
+      const response = await fetch('/api/purchase/mappings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify(payloadBody),
+      });
+      const body = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(body.message ?? 'SKU 映射失败');
+      setMappingDemand(null);
+      await loadData();
+      setPurchaseTab('pending');
+      flash('SKU 已映射，相关真实订单需求已进入待采购');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'SKU 映射失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
+  async function submitPurchaseRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
+    const intent = submitter?.value === 'submit' ? 'submit' : 'draft';
+    setPurchaseBusy('create-request'); setError('');
+    try {
+      const response = await fetch('/api/purchase/requests', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          demandIds: [...selectedDemandIds],
+          purchaserMemberId: String(data.get('purchaserMemberId') ?? ''),
+          reviewerMemberId: String(data.get('reviewerMemberId') ?? ''),
+          note: String(data.get('note') ?? '').trim() || undefined,
+        }),
+      });
+      const body = await response.json() as { message?: string; request?: { id?: string } };
+      if (!response.ok) throw new Error(body.message ?? '采购申请创建失败');
+      if (intent === 'submit') {
+        if (!body.request?.id) throw new Error('采购申请已创建，但返回结果缺少申请标识，请刷新后提交');
+        const submitResponse = await fetch(`/api/purchase/requests/${body.request.id}/actions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+          body: JSON.stringify({ action: 'submit' }),
+        });
+        const submitBody = await submitResponse.json() as { message?: string };
+        if (!submitResponse.ok) throw new Error(submitBody.message ?? '采购申请已保存为草稿，但提交复审失败');
+      }
+      setShowPurchaseRequest(false); setSelectedDemandIds(new Set());
+      await loadData();
+      setPurchaseTab('requests');
+      flash(intent === 'submit' ? '采购申请已创建并提交复审' : '采购申请草稿已保存');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '采购申请创建失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
+  async function runPurchaseRequestAction(request: PurchaseRequest, action: 'submit' | 'approve' | 'reject' | 'cancel') {
+    let note = '';
+    if (action === 'reject') {
+      const reason = window.prompt(`请输入驳回 ${request.requestNo} 的原因，需求将被释放但历史不会删除：`);
+      if (reason === null) return;
+      note = reason.trim();
+      if (!note) { setError('驳回时必须填写原因'); return; }
+    } else {
+      const message = action === 'approve'
+        ? `确认批准 ${request.requestNo}？批准后需求将保持占用，避免重复采购。`
+        : action === 'cancel'
+          ? `确认取消 ${request.requestNo}？需求会重新释放，申请历史不会删除。`
+          : `确认提交 ${request.requestNo} 进入复审？`;
+      if (!window.confirm(message)) return;
+    }
+    setPurchaseBusy(`${request.id}:${action}`); setError('');
+    try {
+      const response = await fetch(`/api/purchase/requests/${request.id}/actions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({ action, note: note || undefined }),
+      });
+      const body = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(body.message ?? '采购申请操作失败');
+      await loadData();
+      flash(action === 'submit' ? '已提交复审' : action === 'approve' ? '复审已批准' : action === 'reject' ? '已驳回并释放需求' : '草稿已取消并释放需求');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '采购申请操作失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
   const activeLabel = nav.find((item) => item.key === active)?.label ?? '工作台';
   const displayName = payload?.user.displayName || '未登录';
   const initials = displayName.slice(0, 2).toUpperCase();
@@ -369,13 +537,15 @@ export default function ErpClient() {
             {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}
             {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
             {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} />}
-            {active === 'purchase' && <PurchaseDemandView demands={filteredPurchaseDemands} summary={purchasePayload?.summary ?? emptyPurchaseSummary} hasQuery={Boolean(query.trim())} />}
+            {active === 'purchase' && <PurchaseWorkspaceView demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} hasQuery={Boolean(query.trim())} />}
             {!['dashboard','platform','orders','inventory','purchase'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
           </>
         ) : <LoadingState message={error || '暂时无法加载业务数据'} />}
       </section>
 
       {showOrder && payload && <OrderModal inventory={payload.inventory} submitting={submitting} error={error} onClose={() => { if (!submitting) { setShowOrder(false); setError(''); } }} onSubmit={submitOrder} />}
+      {mappingDemand && purchasePayload && <SkuMappingModal demand={mappingDemand} skuOptions={purchasePayload.skuOptions} busy={purchaseBusy.startsWith('mapping:')} error={error} onClose={() => { if (!purchaseBusy) { setMappingDemand(null); setError(''); } }} onSubmit={submitSkuMapping} />}
+      {showPurchaseRequest && purchasePayload && <PurchaseRequestModal demands={purchasePayload.demands.filter((demand) => selectedDemandIds.has(demand.id))} members={purchasePayload.members} busy={purchaseBusy === 'create-request'} error={error} onClose={() => { if (!purchaseBusy) { setShowPurchaseRequest(false); setError(''); } }} onSubmit={submitPurchaseRequest} />}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
     </main>
   );
@@ -440,20 +610,63 @@ function InventoryView({ inventory, summary, hasInventoryData, hasQuery }: { inv
   </div>;
 }
 
-function PurchaseDemandView({ demands, summary, hasQuery }: {
-  demands: PurchaseDemand[];
-  summary: PurchaseDemandsPayload['summary'];
+function PurchaseWorkspaceView({ demands, requests, workspace, tab, setTab, selectedDemandIds, toggleDemand, openMapping, openRequest, can, busy, runAction, hasQuery }: {
+  demands: PurchaseDemand[]; requests: PurchaseRequest[]; workspace: PurchaseWorkspacePayload | null;
+  tab: PurchaseTab; setTab: (tab: PurchaseTab) => void; selectedDemandIds: Set<string>;
+  toggleDemand: (id: string) => void; openMapping: (demand: PurchaseDemand) => void; openRequest: () => void;
+  can: (permission: Permission) => boolean; busy: string;
+  runAction: (request: PurchaseRequest, action: 'submit' | 'approve' | 'reject' | 'cancel') => void;
   hasQuery: boolean;
 }) {
+  const summary = workspace?.summary ?? emptyPurchaseSummary;
+  const requestSummary = workspace?.requestSummary ?? emptyPurchaseRequestSummary;
+  const availableQuantity = summary.availableQuantity ?? demands.filter((demand) => demand.status === 'open').reduce((sum, demand) => sum + demandAvailableQuantity(demand), 0);
   const stats = [
-    ['开放采购数量', String(summary.openQuantity), '仅已映射且未履约'],
-    ['开放需求行', String(summary.open), '可进入后续采购流程'],
-    ['待 SKU 映射', String(summary.needsMapping), `涉及 ${summary.needsMappingQuantity} 件，不可下单`],
-    ['无需采购', String(summary.notRequired), '取消、测试或已履约'],
+    ['待采购数量', String(availableQuantity), '可选需求的剩余件数'],
+    ['待 SKU 映射', String(summary.needsMapping), `涉及 ${summary.needsMappingQuantity} 件`],
+    ['待复审申请', String(requestSummary.pendingReview), '已提交，等待复审'],
+    ['已批准申请', String(requestSummary.approved), '已锁定，避免重复采购'],
   ];
-  return <div className="content module-content"><div className="module-head"><div><p>Shopify 订单事实 / 自动采购投影</p><h1>采购需求池</h1><span>由同步后的真实订单行自动维护；当前仅供核对，不会向 Shopify 写入，也不会生成供应商采购单。</span></div><div className="ledger-chip">服务端只读维护</div></div><StatCards stats={stats} />
-    <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active" disabled>全部需求</button></div><span>共 {summary.total} 条历史保留记录；当前显示 {demands.length} 条</span></div><div className="table-wrap module-table"><table><thead><tr><th>店铺 / 订单</th><th>订单行</th><th>平台 SKU / ERP SKU</th><th>商品</th><th>当前 / 未履约</th><th>采购数量</th><th>需求状态</th><th>原因</th><th>订单更新时间</th></tr></thead><tbody>{demands.length ? demands.map((demand) => <tr key={demand.id}><td><strong>{demand.storeName}</strong><small className="cell-sub">{demand.sourceOrderName ?? demand.sourceOrderId}</small></td><td>{demand.sourceOrderLineId}</td><td><strong>{demand.rawSku?.trim() || '缺少 SKU'}</strong><small className="cell-sub">{demand.mappedSkuCode ? `已映射：${demand.mappedSkuCode}` : '未映射到 ERP SKU'}</small></td><td>{demand.title ?? demand.name ?? '未提供商品名'}{demand.mappedSkuName && <small className="cell-sub">{demand.mappedSkuName}</small>}</td><td>{formatOptionalQuantity(demand.currentQuantity)} / {formatOptionalQuantity(demand.unfulfilledQuantity)}</td><td><strong>{demand.requiredQuantity}</strong></td><td><span className={`status-pill ${demand.status === 'open' ? 'success' : demand.status === 'not_required' ? 'status-cancelled' : ''}`}>{purchaseDemandStatusLabel[demand.status]}</span>{demand.status === 'needs_mapping' && <small className="cell-sub">映射前不可下单</small>}</td><td>{demand.reasonCode ? (purchaseDemandReasonLabel[demand.reasonCode] ?? demand.reasonCode) : '已满足开放条件'}</td><td>{formatTime(demand.sourceUpdatedAt)}</td></tr>) : <tr><td className="empty-cell" colSpan={9}>{hasQuery ? '没有符合当前搜索条件的采购需求' : '暂无由真实平台订单生成的采购需求；系统不会填充模拟记录'}</td></tr>}</tbody></table></div><div className="pagination"><span>订单同步或 webhook 完整落库后自动幂等刷新，历史记录不会删除</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div></article>
+  const visibleDemands = tab === 'pending'
+    ? demands.filter((demand) => demand.status === 'open' && demandAvailableQuantity(demand) > 0)
+    : tab === 'mapping' ? demands.filter((demand) => demand.status === 'needs_mapping') : [];
+  const visibleRequests = tab === 'requests'
+    ? requests.filter((request) => request.status === 'draft' || request.status === 'pending_review')
+    : requests.filter((request) => ['approved', 'rejected', 'cancelled'].includes(request.status));
+  const selectedDemands = (workspace?.demands ?? []).filter((demand) => selectedDemandIds.has(demand.id));
+  const selectedQuantity = selectedDemands.reduce((sum, demand) => sum + demandAvailableQuantity(demand), 0);
+  const tabs: Array<[PurchaseTab, string, number]> = [
+    ['pending', '待处理需求', summary.open],
+    ['mapping', '待 SKU 映射', summary.needsMapping],
+    ['requests', '采购申请', requestSummary.draft + requestSummary.pendingReview],
+    ['history', '历史记录', requestSummary.approved + requestSummary.rejected + requestSummary.cancelled],
+  ];
+  return <div className="content module-content"><div className="module-head"><div><p>真实订单 / 采购执行</p><h1>采购工作台</h1><span>真实订单自动形成采购需求；完成 SKU 映射后，可生成采购申请并进入复审。系统不会向 Shopify 写入。</span></div><div className="ledger-chip">需求防重复 · 历史不删除</div></div><StatCards stats={stats} />
+    <article className="card data-card purchase-workspace-card"><div className="data-toolbar purchase-toolbar"><div>{tabs.map(([key, label, count]) => <button key={key} className={tab === key ? 'tab-active' : ''} onClick={() => setTab(key)}>{label}<b>{count}</b></button>)}</div><span>{tab === 'pending' ? `可采购 ${availableQuantity} 件` : tab === 'mapping' ? '映射后自动进入待处理' : `共 ${requests.length} 张申请`}</span></div>
+      {tab === 'pending' || tab === 'mapping' ? <>
+        {tab === 'pending' && <div className="purchase-selection"><div><strong>已选 {selectedDemandIds.size} 行 / {selectedQuantity} 件</strong><span>每条需求只能进入一张有效采购申请</span></div><button className="primary-button" disabled={!selectedDemandIds.size || !can('purchase:create') || Boolean(busy)} onClick={openRequest}><span>＋</span>生成采购申请</button></div>}
+        <PurchaseDemandTable demands={visibleDemands} selectable={tab === 'pending'} selectedDemandIds={selectedDemandIds} toggleDemand={toggleDemand} openMapping={openMapping} canMap={can('purchase:mapping')} busy={busy} emptyMessage={hasQuery ? '没有符合当前搜索条件的需求' : tab === 'pending' ? '暂无可采购需求；待映射 SKU 完成后会出现在这里' : '暂无待映射的真实订单行'} />
+      </> : <PurchaseRequestTable requests={visibleRequests} can={can} busy={busy} runAction={runAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购申请' : tab === 'requests' ? '暂无草稿或待复审申请，可从待处理需求生成' : '暂无已结束的采购申请'} />}
+      <div className="pagination"><span>订单取消、退款或履约变化会重新校验需求；所有申请和复审记录永久保留</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div>
+    </article>
   </div>;
+}
+
+function PurchaseDemandTable({ demands, selectable, selectedDemandIds, toggleDemand, openMapping, canMap, busy, emptyMessage }: {
+  demands: PurchaseDemand[]; selectable: boolean; selectedDemandIds: Set<string>; toggleDemand: (id: string) => void;
+  openMapping: (demand: PurchaseDemand) => void; canMap: boolean; busy: string; emptyMessage: string;
+}) {
+  return <div className="table-wrap module-table"><table className="purchase-demand-table"><thead><tr>{selectable && <th className="selection-cell">选择</th>}<th>店铺 / 订单</th><th>平台 SKU / ERP SKU</th><th>商品</th><th>需求 / 已占 / 可采购</th><th>状态</th><th>操作</th><th>订单更新时间</th></tr></thead><tbody>{demands.length ? demands.map((demand) => {
+    const available = demandAvailableQuantity(demand);
+    return <tr key={demand.id}>{selectable && <td className="selection-cell"><input className="purchase-check" type="checkbox" aria-label={`选择 ${demand.rawSku ?? demand.sourceOrderLineId}`} checked={selectedDemandIds.has(demand.id)} disabled={available <= 0 || Boolean(busy)} onChange={() => toggleDemand(demand.id)} /></td>}<td><strong>{demand.storeName}</strong><small className="cell-sub">{demand.sourceOrderName ?? demand.sourceOrderId}</small></td><td><strong>{demand.rawSku?.trim() || '缺少 SKU'}</strong><small className="cell-sub">{demand.mappedSkuCode ? `ERP：${demand.mappedSkuCode}` : '尚未映射 ERP SKU'}</small></td><td>{demand.title ?? demand.name ?? '未提供商品名'}{demand.mappedSkuName && <small className="cell-sub">{demand.mappedSkuName}</small>}</td><td><strong>{demand.requiredQuantity} / {demand.allocatedQuantity ?? 0} / {available}</strong><small className="cell-sub">当前 / 未履约：{formatOptionalQuantity(demand.currentQuantity)} / {formatOptionalQuantity(demand.unfulfilledQuantity)}</small></td><td><span className={`status-pill ${demand.status === 'open' ? 'success' : ''}`}>{purchaseDemandStatusLabel[demand.status]}</span><small className="cell-sub">{demand.reasonCode ? (purchaseDemandReasonLabel[demand.reasonCode] ?? demand.reasonCode) : '已满足采购条件'}</small></td><td><div className="row-actions">{demand.status === 'needs_mapping' && canMap && demand.rawSku?.trim() && <button disabled={Boolean(busy)} onClick={() => openMapping(demand)}>映射 SKU</button>}{demand.status === 'needs_mapping' && !demand.rawSku?.trim() && <span className="terminal-label">平台未提供 SKU</span>}{demand.status === 'open' && <span className="terminal-label">{available > 0 ? '可生成申请' : '已进入申请'}</span>}</div></td><td>{formatTime(demand.sourceUpdatedAt)}</td></tr>;
+  }) : <tr><td className="empty-cell" colSpan={selectable ? 8 : 7}>{emptyMessage}</td></tr>}</tbody></table></div>;
+}
+
+function PurchaseRequestTable({ requests, can, busy, runAction, emptyMessage }: {
+  requests: PurchaseRequest[]; can: (permission: Permission) => boolean; busy: string;
+  runAction: (request: PurchaseRequest, action: 'submit' | 'approve' | 'reject' | 'cancel') => void; emptyMessage: string;
+}) {
+  return <div className="table-wrap module-table"><table className="purchase-request-table"><thead><tr><th>申请单</th><th>采购负责人</th><th>复审人</th><th>明细 / 件数</th><th>状态</th><th>备注</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{requests.length ? requests.map((request) => <tr key={request.id}><td><strong>{request.requestNo}</strong><small className="cell-sub">创建：{request.creator?.displayName ?? '系统成员'}</small></td><td>{request.buyer?.displayName ?? '待指定'}</td><td>{request.reviewer?.displayName ?? '待指定'}</td><td>{request.lineCount} 行 / {request.totalQuantity} 件</td><td><span className={`status-pill purchase-status-${request.status}`}>{purchaseRequestStatusLabel[request.status]}</span>{request.needsAttention && <small className="cell-sub attention-text">源订单已变化，需复核</small>}</td><td>{request.reviewNote ?? request.note ?? '—'}</td><td>{formatTime(request.updatedAt)}</td><td><div className="row-actions">{request.status === 'draft' && can('purchase:submit') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'submit')}>{busy === `${request.id}:submit` ? '提交中…' : '提交复审'}</button>}{request.status === 'draft' && can('purchase:submit') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'cancel')}>取消</button>}{request.status === 'pending_review' && can('purchase:review') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'approve')}>{busy === `${request.id}:approve` ? '复审中…' : '批准'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'reject')}>驳回</button></>}{['approved','rejected','cancelled'].includes(request.status) && <span className="terminal-label">历史已保留</span>}</div></td></tr>) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
 function PlannedModule({ module }: { module: (typeof plannedModules)[keyof typeof plannedModules] }) {
@@ -474,6 +687,24 @@ function OrderModal({ inventory, submitting, error, onClose, onSubmit }: { inven
   return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal order-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>新建销售订单</h2><p>订单先进入待审核；审核后才会预占库存</p></div><button type="button" onClick={onClose} disabled={submitting}>×</button></div><div className="form-grid"><label>销售渠道<select name="channel" required><option>Amazon US</option><option>Shopify</option><option>eBay DE</option><option>TikTok Shop</option></select></label><label>目的国家<select name="destination" required><option>美国</option><option>英国</option><option>德国</option><option>法国</option><option>加拿大</option></select></label><label className="full">客户名称<input name="customer" placeholder="请输入客户名称" required minLength={2} /></label><label className="full">SKU 与履约仓<select name="inventory" required>{inventory.map((item) => <option key={item.id} value={item.id}>{item.skuCode} · {item.skuName} · {item.warehouseName}（可售 {item.availableQty}）</option>)}</select></label><label>订购数量<input name="quantity" type="number" min="1" max="999" defaultValue="1" required /></label><label>币种<select name="currency" required><option value="USD">USD 美元</option><option value="EUR">EUR 欧元</option><option value="GBP">GBP 英镑</option><option value="CNY">CNY 人民币</option></select></label><label className="full">订单原币金额<input name="amount" type="number" min="0.01" step="0.01" placeholder="0.00" required /></label>{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>安全规则</span>服务端生成订单号 · 重复提交不会重复建单 · 所有动作自动审计</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={submitting}>取消</button><button className="primary-button" type="submit" disabled={submitting}>{submitting ? '正在安全写入…' : '创建待审核订单'}</button></div></form></div>;
 }
 
+function SkuMappingModal({ demand, skuOptions, busy, error, onClose, onSubmit }: {
+  demand: PurchaseDemand; skuOptions: PurchaseSkuOption[]; busy: boolean; error: string;
+  onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const [mode, setMode] = useState<'existing' | 'new'>(skuOptions.length ? 'existing' : 'new');
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal purchase-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>映射 ERP SKU</h2><p>同店铺、同平台 SKU 的需求会一起更新</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="mapping-context"><strong>{demand.storeName} · {demand.sourceOrderName ?? demand.sourceOrderId}</strong><span>{demand.title ?? demand.name ?? '未提供商品名'}</span><code>{demand.rawSku?.trim() || '平台未提供 SKU'}</code></div><div className="form-grid"><label className="full mapping-choice"><span><input type="radio" name="mappingMode" value="existing" checked={mode === 'existing'} disabled={!skuOptions.length} onChange={() => setMode('existing')} /> 选择已有 ERP SKU</span>{mode === 'existing' && <select name="skuId" required>{skuOptions.map((sku) => <option key={sku.id} value={sku.id}>{sku.code} · {sku.name}</option>)}</select>}</label><label className="full mapping-choice"><span><input type="radio" name="mappingMode" value="new" checked={mode === 'new'} onChange={() => setMode('new')} /> 新建并映射</span></label>{mode === 'new' && <><label>ERP SKU 编码<input name="newSkuCode" required placeholder={demand.normalizedSku ?? demand.rawSku ?? '例如 BF-001'} /></label><label>ERP SKU 名称<input name="newSkuName" required placeholder={demand.title ?? demand.name ?? '请输入商品名称'} /></label></>}{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>映射规则</span>保留平台原始 SKU · 映射可追溯 · 不会修改 Shopify 商品</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || !demand.rawSku?.trim()}>{busy ? '正在保存…' : '保存映射'}</button></div></form></div>;
+}
+
+function PurchaseRequestModal({ demands, members, busy, error, onClose, onSubmit }: {
+  demands: PurchaseDemand[]; members: PurchaseMember[]; busy: boolean; error: string;
+  onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const totalQuantity = demands.reduce((sum, demand) => sum + demandAvailableQuantity(demand), 0);
+  const defaultBuyer = members[0]?.id ?? '';
+  const defaultReviewer = members[1]?.id ?? defaultBuyer;
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal purchase-request-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>生成采购申请</h2><p>已选 {demands.length} 行，共 {totalQuantity} 件</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="purchase-selected-list">{demands.slice(0, 5).map((demand) => <div key={demand.id}><strong>{demand.mappedSkuCode ?? demand.rawSku ?? '未识别 SKU'}</strong><span>{demand.title ?? demand.name ?? demand.sourceOrderLineId}</span><b>{demandAvailableQuantity(demand)} 件</b></div>)}{demands.length > 5 && <small>另有 {demands.length - 5} 行已选需求</small>}</div><div className="form-grid"><label>采购负责人<select name="purchaserMemberId" defaultValue={defaultBuyer} required>{members.map((member) => <option key={member.id} value={member.id}>{member.displayName}</option>)}</select></label><label>复审人<select name="reviewerMemberId" defaultValue={defaultReviewer} required>{members.map((member) => <option key={member.id} value={member.id}>{member.displayName}</option>)}</select></label><label className="full">采购备注<textarea name="note" rows={3} maxLength={500} placeholder="可填写交期、供应商沟通或特殊要求" /></label>{!members.length && <div className="form-error full">当前没有可分配成员，请先让业务人员登录一次 ERP。</div>}{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>开发阶段</span>当前允许负责人和复审人为同一人；上线前可启用岗位分离。重复需求不会生成第二张有效申请。</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button type="submit" value="draft" disabled={busy || !members.length}>{busy ? '处理中…' : '保存草稿'}</button><button className="primary-button" type="submit" value="submit" disabled={busy || !members.length}>{busy ? '处理中…' : '创建并提交复审'}</button></div></form></div>;
+}
+
 function Status({ status }: { status: OrderStatus }) {
   return <span className={`status-pill status-${status}`}>{statusLabel[status]}</span>;
 }
@@ -489,6 +720,69 @@ function AuthRequired() {
 
 function LoadingState({ message = '正在建立安全业务上下文…' }: { message?: string }) {
   return <div className="content loading-state"><span className="loader" /><p>{message}</p></div>;
+}
+
+function normalizePurchaseWorkspace(body: PurchaseWorkspacePayload | PurchaseDemandsPayload): PurchaseWorkspacePayload {
+  const demands = (body.demands ?? []).map((demand) => ({
+    ...demand,
+    allocatedQuantity: Math.max(0, demand.allocatedQuantity ?? 0),
+    availableQuantity: Math.max(0, demand.availableQuantity ?? demand.requiredQuantity - (demand.allocatedQuantity ?? 0)),
+  }));
+  if ('requests' in body) {
+    const requests = Array.isArray(body.requests) ? body.requests.map((request) => ({
+      ...request,
+      buyer: request.buyer ?? request.purchaser ?? (request.purchaserName ? {
+        id: request.purchaserMemberId ?? '', displayName: request.purchaserName, role: 'operator' as const,
+      } : null),
+      reviewer: request.reviewer ?? (request.reviewerName ? {
+        id: request.reviewerMemberId ?? '', displayName: request.reviewerName, role: 'operator' as const,
+      } : null),
+      creator: request.creator ?? (request.creatorName ? {
+        id: '', displayName: request.creatorName, role: 'operator' as const,
+      } : null),
+      lines: Array.isArray(request.lines) ? request.lines.map((line) => ({
+        ...line,
+        demandId: line.demandId ?? (line as PurchaseRequestLine & { purchaseDemandId?: string }).purchaseDemandId ?? '',
+      })) : [],
+      lineCount: request.lineCount ?? request.lines?.length ?? 0,
+      totalQuantity: request.totalQuantity ?? request.lines?.reduce((sum, line) => sum + line.requestedQuantity, 0) ?? 0,
+      note: request.note ?? null,
+      reviewNote: request.reviewNote ?? null,
+      needsAttention: Boolean(request.needsAttention),
+    })) : [];
+    return {
+      ...body,
+      demands,
+      summary: body.summary ?? emptyPurchaseSummary,
+      requests,
+      requestSummary: body.requestSummary ?? summarizePurchaseRequests(requests),
+      members: Array.isArray(body.members) ? body.members : [],
+      skuOptions: Array.isArray(body.skuOptions) ? body.skuOptions : [],
+    };
+  }
+  return {
+    ok: true,
+    readOnly: true,
+    demands,
+    summary: body.summary ?? emptyPurchaseSummary,
+    requests: [],
+    requestSummary: emptyPurchaseRequestSummary,
+    members: [],
+    skuOptions: [],
+  };
+}
+
+function summarizePurchaseRequests(requests: PurchaseRequest[]) {
+  return requests.reduce((summary, request) => {
+    summary.total += 1;
+    if (request.status === 'pending_review') summary.pendingReview += 1;
+    else summary[request.status] += 1;
+    return summary;
+  }, { ...emptyPurchaseRequestSummary });
+}
+
+function demandAvailableQuantity(demand: PurchaseDemand) {
+  return Math.max(0, demand.availableQuantity ?? demand.requiredQuantity - (demand.allocatedQuantity ?? 0));
 }
 
 function formatMoney(amountMinor: number, currency: string) {
