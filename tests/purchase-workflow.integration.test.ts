@@ -194,6 +194,35 @@ describe('采购申请闭环', () => {
     expect(approved.request.status).toBe('approved');
   });
 
+  it('创建申请时负责人必须可提交，复审人必须具备管理员复审权限', async () => {
+    await db.prepare(`UPDATE members SET role = 'viewer' WHERE tenant_id = ? AND id = 'member-buyer'`)
+      .bind(tenantId).run();
+    await expect(createPurchaseRequest(db, user, {
+      demandIds: [demandId],
+      purchaserMemberId: 'member-buyer',
+      reviewerMemberId: 'member-reviewer',
+    }, 'invalid-viewer-purchaser-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_PURCHASER_PERMISSION_REQUIRED',
+    });
+
+    await db.batch([
+      db.prepare(`UPDATE members SET role = 'operator' WHERE tenant_id = ? AND id = 'member-buyer'`)
+        .bind(tenantId),
+      db.prepare(`UPDATE members SET role = 'operator' WHERE tenant_id = ? AND id = 'member-reviewer'`)
+        .bind(tenantId),
+    ]);
+    await expect(createPurchaseRequest(db, user, {
+      demandIds: [demandId],
+      purchaserMemberId: 'member-buyer',
+      reviewerMemberId: 'member-reviewer',
+    }, 'invalid-operator-reviewer-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_REVIEWER_PERMISSION_REQUIRED',
+    });
+    const requests = await db.prepare(`SELECT COUNT(*) AS count FROM purchase_requests WHERE tenant_id = ?`)
+      .bind(tenantId).first<{ count: number }>();
+    expect(Number(requests?.count ?? 0)).toBe(0);
+  });
+
   it('正式模式强制岗位分离，开发开放模式明确允许同人试运行', async () => {
     const sameAssigneeInput = {
       demandIds: [demandId],
@@ -290,7 +319,7 @@ describe('采购申请闭环', () => {
     const supplier = await createSupplier(db, user, {
       code: 'WITHDRAW-GUARD', name: '撤回保护测试供应商',
     }, 'supplier-withdraw-guard-0001');
-    await createPurchaseOrder(db, user, {
+    await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: created.request.id,
       supplierId: supplier.supplier.id,
       currency: 'CNY',
@@ -381,6 +410,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0008_nifty_mimic.sql',
     '../drizzle/0009_shocking_iron_lad.sql',
     '../drizzle/0013_guarded_withdrawal.sql',
+    '../drizzle/0014_clever_silvermane.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

@@ -80,6 +80,8 @@ type PurchaseReceiptRow = {
   created_at: string;
   line_count: number;
   total_quantity: number;
+  corrected_quantity: number;
+  correction_count: number;
 };
 
 type PurchaseReceiptLineRow = {
@@ -185,7 +187,9 @@ export async function getProcurementWorkspaceData(db: D1Database, user: UserCont
         .filter((order) => order.status === 'issued' || order.status === 'partially_received')
         .reduce((total, order) => total + order.lines.reduce((sum, line) => sum + line.remainingQuantity, 0), 0),
       receiptCount: purchaseReceipts.length,
-      receivedQuantity: purchaseReceipts.reduce((total, receipt) => total + receipt.totalQuantity, 0),
+      correctionCount: purchaseReceipts.reduce((total, receipt) => total + receipt.correctionCount, 0),
+      correctedQuantity: purchaseReceipts.reduce((total, receipt) => total + receipt.correctedQuantity, 0),
+      receivedQuantity: purchaseReceipts.reduce((total, receipt) => total + receipt.netQuantity, 0),
     },
   };
 }
@@ -331,6 +335,7 @@ export async function createPurchaseOrder(
       .sort((left, right) => left.purchaseRequestLineId.localeCompare(right.purchaseRequestLineId)),
   };
   const requestHash = await hashPayload(normalized);
+  const actorMemberId = await assertPurchaseRequestPurchaser(db, user, normalized.purchaseRequestId);
   const replay = await db.prepare(`
     SELECT id, request_hash FROM purchase_orders
     WHERE tenant_id = ? AND idempotency_key = ?
@@ -341,7 +346,7 @@ export async function createPurchaseOrder(
     return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, replay.id), replayed: true };
   }
 
-  const [supplier, request, requestLines, actorMemberId] = await Promise.all([
+  const [supplier, request, requestLines] = await Promise.all([
     db.prepare(`
       SELECT id FROM suppliers
       WHERE tenant_id = ? AND id = ? AND active = 1
@@ -355,7 +360,6 @@ export async function createPurchaseOrder(
       id: string; request_no: string; status: string;
     }>(),
     loadRequestLines(db, user.tenantId, normalized.purchaseRequestId),
-    resolveActorMemberId(db, user),
   ]);
   if (!supplier) throw new HttpError(404, '供应商不存在或已停用', 'PURCHASE_SUPPLIER_NOT_FOUND');
   if (!request) throw new HttpError(404, '采购申请不存在或不在当前数据范围内', 'PURCHASE_REQUEST_NOT_FOUND');
@@ -467,6 +471,7 @@ export async function executePurchaseOrderAction(
   const normalized = { action: input.action, note: input.note?.trim() || null };
   const requestHash = await hashPayload(normalized);
   const auditAction = input.action === 'issue' ? 'ISSUE_PURCHASE_ORDER' : 'CANCEL_PURCHASE_ORDER';
+  await assertPurchaseOrderPurchaser(db, user, purchaseOrderId);
   const replay = await readActionReplay(db, user.tenantId, purchaseOrderId, auditAction, requestHash, idempotencyKey);
   if (replay) return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: true };
 
@@ -834,7 +839,24 @@ const PURCHASE_RECEIPT_SELECT = `
     receipt.received_at,
     receipt.created_at,
     COUNT(line.id) AS line_count,
-    COALESCE(SUM(line.quantity), 0) AS total_quantity
+    COALESCE(SUM(line.quantity), 0) AS total_quantity,
+    COALESCE((
+      SELECT SUM(correction_line.quantity)
+      FROM purchase_receipt_correction_lines correction_line
+      JOIN purchase_receipt_corrections correction
+        ON correction.id = correction_line.correction_id
+        AND correction.tenant_id = correction_line.tenant_id
+      WHERE correction.tenant_id = receipt.tenant_id
+        AND correction.purchase_receipt_id = receipt.id
+        AND correction.status = 'posted'
+    ), 0) AS corrected_quantity,
+    COALESCE((
+      SELECT COUNT(*)
+      FROM purchase_receipt_corrections correction
+      WHERE correction.tenant_id = receipt.tenant_id
+        AND correction.purchase_receipt_id = receipt.id
+        AND correction.status = 'posted'
+    ), 0) AS correction_count
   FROM purchase_receipts receipt
   JOIN purchase_orders po ON po.id = receipt.purchase_order_id AND po.tenant_id = receipt.tenant_id
   JOIN warehouses warehouse ON warehouse.id = receipt.warehouse_id AND warehouse.tenant_id = receipt.tenant_id
@@ -908,6 +930,8 @@ function mapPurchaseOrderLine(row: PurchaseOrderLineRow) {
 }
 
 function mapPurchaseReceipt(row: PurchaseReceiptRow, lines: ReturnType<typeof mapPurchaseReceiptLine>[]) {
+  const originalQuantity = Number(row.total_quantity);
+  const correctedQuantity = Number(row.corrected_quantity);
   return {
     id: row.id,
     receiptNo: row.receipt_no,
@@ -919,7 +943,12 @@ function mapPurchaseReceipt(row: PurchaseReceiptRow, lines: ReturnType<typeof ma
     receivedAt: row.received_at,
     createdAt: row.created_at,
     lineCount: Number(row.line_count),
-    totalQuantity: Number(row.total_quantity),
+    // totalQuantity stays as the immutable posted receipt quantity for compatibility.
+    totalQuantity: originalQuantity,
+    originalQuantity,
+    correctedQuantity,
+    netQuantity: Math.max(0, originalQuantity - correctedQuantity),
+    correctionCount: Number(row.correction_count),
     lines,
   };
 }
@@ -986,6 +1015,58 @@ async function loadReceiptTargetLines(
     WHERE tenant_id = ? AND purchase_order_id = ? AND id IN (${placeholders})
   `).bind(tenantId, purchaseOrderId, ...lineIds).all<ReceiptTargetLineRow>();
   return rows.results;
+}
+
+async function assertPurchaseRequestPurchaser(
+  db: D1Database,
+  user: UserContext,
+  purchaseRequestId: string,
+) {
+  const request = await db.prepare(`
+    SELECT purchaser_member_id
+    FROM purchase_requests
+    WHERE tenant_id = ? AND id = ?
+    LIMIT 1
+  `).bind(user.tenantId, purchaseRequestId).first<{ purchaser_member_id: string }>();
+  if (!request) {
+    throw new HttpError(404, '采购申请不存在或不在当前数据范围内', 'PURCHASE_REQUEST_NOT_FOUND');
+  }
+  const actorMemberId = await resolveActorMemberId(db, user);
+  if (request.purchaser_member_id !== actorMemberId) {
+    throw new HttpError(
+      403,
+      '只有该申请指定的采购负责人可以生成正式采购单',
+      'PURCHASE_ORDER_PURCHASER_REQUIRED',
+    );
+  }
+  return actorMemberId;
+}
+
+async function assertPurchaseOrderPurchaser(
+  db: D1Database,
+  user: UserContext,
+  purchaseOrderId: string,
+) {
+  const order = await db.prepare(`
+    SELECT request.purchaser_member_id
+    FROM purchase_orders purchase_order
+    JOIN purchase_requests request
+      ON request.id = purchase_order.purchase_request_id
+      AND request.tenant_id = purchase_order.tenant_id
+    WHERE purchase_order.tenant_id = ? AND purchase_order.id = ?
+    LIMIT 1
+  `).bind(user.tenantId, purchaseOrderId).first<{ purchaser_member_id: string }>();
+  if (!order) {
+    throw new HttpError(404, '采购单不存在或不在当前数据范围内', 'PURCHASE_ORDER_NOT_FOUND');
+  }
+  const actorMemberId = await resolveActorMemberId(db, user);
+  if (order.purchaser_member_id !== actorMemberId) {
+    throw new HttpError(
+      403,
+      '只有来源申请指定的采购负责人可以确认或取消采购单',
+      'PURCHASE_ORDER_PURCHASER_REQUIRED',
+    );
+  }
 }
 
 async function resolveActorMemberId(db: D1Database, user: UserContext) {

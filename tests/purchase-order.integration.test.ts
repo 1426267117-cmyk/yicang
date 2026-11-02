@@ -11,6 +11,10 @@ import type { UserContext } from '../lib/db';
 import { ROLE_PERMISSIONS } from '../lib/domain';
 import { loadPurchaseOrderDocument } from '../lib/purchase-order-document';
 import {
+  createPurchaseReceiptCorrection,
+  listPurchaseReceiptCorrections,
+} from '../lib/purchase-receipt-correction-service';
+import {
   createPurchaseOrder,
   createPurchaseReceipt,
   createSupplier,
@@ -142,7 +146,7 @@ describe('正式采购单与到货入库闭环', () => {
     expect(supplierReplay.replayed).toBe(true);
     expect(supplierReplay.supplier.id).toBe(supplier.supplier.id);
 
-    const created = await createPurchaseOrder(db, user, {
+    const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
       currency: 'usd',
@@ -162,7 +166,7 @@ describe('正式采购单与到货入库闭环', () => {
       orderedQuantity: 5, remainingQuantity: 5, unitCostMinor: 1250,
     }));
 
-    const replay = await createPurchaseOrder(db, user, {
+    const replay = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
       currency: 'USD',
@@ -175,17 +179,52 @@ describe('正式采购单与到货入库闭环', () => {
     expect(replay.replayed).toBe(true);
     expect(replay.purchaseOrder.id).toBe(created.purchaseOrder.id);
 
-    await expect(createPurchaseOrder(db, user, {
+    await expect(createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
     }, 'purchase-order-create-0002')).rejects.toMatchObject({ code: 'PURCHASE_ORDER_ALREADY_EXISTS' });
+  });
+
+  it('只有来源申请指定的采购负责人可生成、确认或取消采购单', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-OWNER', name: '负责人权限测试供应商',
+    }, 'supplier-create-owner-0001');
+
+    await expect(createPurchaseOrder(db, user, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+    }, 'purchase-order-owner-denied-0001')).rejects.toMatchObject({
+      status: 403,
+      code: 'PURCHASE_ORDER_PURCHASER_REQUIRED',
+    });
+
+    const created = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+    }, 'purchase-order-owner-create-0001');
+    await expect(executePurchaseOrderAction(db, user, created.purchaseOrder.id, {
+      action: 'issue',
+    }, 'purchase-order-owner-admin-denied-0001')).rejects.toMatchObject({
+      status: 403,
+      code: 'PURCHASE_ORDER_PURCHASER_REQUIRED',
+    });
+    await expect(executePurchaseOrderAction(db, reviewerUser, created.purchaseOrder.id, {
+      action: 'cancel',
+    }, 'purchase-order-owner-reviewer-denied-0001')).rejects.toMatchObject({
+      status: 403,
+      code: 'PURCHASE_ORDER_PURCHASER_REQUIRED',
+    });
+    const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'issue',
+    }, 'purchase-order-owner-issue-0001');
+    expect(issued.purchaseOrder.status).toBe('issued');
   });
 
   it('采购单文档允许只读角色按当前租户读取，并拒绝跨租户标识', async () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-DOC', name: '采购单文档供应商',
     }, 'supplier-create-document-0001');
-    const created = await createPurchaseOrder(db, user, {
+    const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
       currency: 'CNY',
@@ -225,12 +264,12 @@ describe('正式采购单与到货入库闭环', () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-02', name: '分批到货供应商',
     }, 'supplier-create-1001');
-    const created = await createPurchaseOrder(db, user, {
+    const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
       currency: 'USD',
     }, 'purchase-order-create-1001');
-    const issued = await executePurchaseOrderAction(db, user, created.purchaseOrder.id, {
+    const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
       action: 'issue', note: '确认发给供应商',
     }, 'purchase-order-issue-1001');
     expect(issued.purchaseOrder.status).toBe('issued');
@@ -289,26 +328,202 @@ describe('正式采购单与到货入库闭环', () => {
     expect(workspace.purchaseReceipts).toHaveLength(2);
   });
 
+  it('收货错录通过追加冲正恢复库存和采购单状态，原收货记录保持不变', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-CORRECTION', name: '冲正测试供应商',
+    }, 'supplier-create-correction-0001');
+    const created = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      currency: 'CNY',
+    }, 'purchase-order-create-correction-0001');
+    const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'issue', note: '测试收货冲正',
+    }, 'purchase-order-issue-correction-0001');
+    const orderLineId = issued.purchaseOrder.lines[0].id;
+    const posted = await createPurchaseReceipt(db, user, created.purchaseOrder.id, {
+      warehouseId: 'warehouse-main',
+      note: '误将 5 件全部登记到货',
+      lines: [{ purchaseOrderLineId: orderLineId, quantity: 5 }],
+    }, 'purchase-receipt-correction-source-0001');
+    const receiptLineId = posted.receipt.lines[0].id;
+    expect(posted.purchaseOrder.status).toBe('received');
+    expect(await inventoryOnHand(db)).toBe(5);
+
+    const partial = await createPurchaseReceiptCorrection(db, user, posted.receipt.id, {
+      reason: '实际只到货 3 件，冲正多录的 2 件',
+      lines: [{ purchaseReceiptLineId: receiptLineId, quantity: 2 }],
+    }, 'purchase-receipt-correction-0001');
+    expect(partial.replayed).toBe(false);
+    expect(partial.correction).toEqual(expect.objectContaining({
+      purchaseReceiptId: posted.receipt.id,
+      purchaseOrderId: created.purchaseOrder.id,
+      totalQuantity: 2,
+      status: 'posted',
+    }));
+    expect(partial.purchaseOrder).toEqual(expect.objectContaining({
+      status: 'partially_received', receivedQuantity: 3,
+    }));
+    expect(partial.purchaseReceipt).toEqual(expect.objectContaining({
+      id: posted.receipt.id, status: 'posted', totalQuantity: 5,
+    }));
+    expect(partial.purchaseReceipt.lines[0].quantity).toBe(5);
+    expect(await inventoryOnHand(db)).toBe(3);
+    const partialWorkspace = await getProcurementWorkspaceData(db, user);
+    expect(partialWorkspace.purchaseReceipts[0]).toEqual(expect.objectContaining({
+      totalQuantity: 5,
+      originalQuantity: 5,
+      correctedQuantity: 2,
+      netQuantity: 3,
+      correctionCount: 1,
+    }));
+    expect(partialWorkspace.procurementSummary).toEqual(expect.objectContaining({
+      receivedQuantity: 3,
+      correctedQuantity: 2,
+      correctionCount: 1,
+    }));
+
+    const replay = await createPurchaseReceiptCorrection(db, user, posted.receipt.id, {
+      reason: '实际只到货 3 件，冲正多录的 2 件',
+      lines: [{ purchaseReceiptLineId: receiptLineId, quantity: 2 }],
+    }, 'purchase-receipt-correction-0001');
+    expect(replay.replayed).toBe(true);
+    expect(replay.correction.id).toBe(partial.correction.id);
+    expect(await inventoryOnHand(db)).toBe(3);
+
+    const final = await createPurchaseReceiptCorrection(db, user, posted.receipt.id, {
+      reason: '复核发现本批实际未到货，冲正剩余 3 件',
+      lines: [{ purchaseReceiptLineId: receiptLineId, quantity: 3 }],
+    }, 'purchase-receipt-correction-0002');
+    expect(final.purchaseOrder).toEqual(expect.objectContaining({
+      status: 'issued', receivedQuantity: 0,
+    }));
+    expect(await inventoryOnHand(db)).toBe(0);
+    const fullyCorrectedWorkspace = await getProcurementWorkspaceData(db, user);
+    expect(fullyCorrectedWorkspace.purchaseReceipts[0]).toEqual(expect.objectContaining({
+      originalQuantity: 5,
+      correctedQuantity: 5,
+      netQuantity: 0,
+      correctionCount: 2,
+    }));
+    expect(fullyCorrectedWorkspace.procurementSummary).toEqual(expect.objectContaining({
+      receivedQuantity: 0,
+      correctedQuantity: 5,
+      correctionCount: 2,
+    }));
+
+    const corrections = await listPurchaseReceiptCorrections(db, user, posted.receipt.id);
+    expect(corrections).toHaveLength(2);
+    expect(corrections.reduce((sum, correction) => sum + correction.totalQuantity, 0)).toBe(5);
+    const facts = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM purchase_receipts WHERE tenant_id = ?) AS receipts,
+        (SELECT COUNT(*) FROM purchase_receipt_lines WHERE tenant_id = ?) AS receipt_lines,
+        (SELECT COUNT(*) FROM purchase_receipt_corrections WHERE tenant_id = ?) AS corrections,
+        (SELECT SUM(on_hand_delta) FROM inventory_receipt_correction_movements WHERE tenant_id = ?) AS correction_delta,
+        (SELECT COUNT(*) FROM audit_logs WHERE tenant_id = ? AND action = 'CORRECT_PURCHASE_RECEIPT') AS audits
+    `).bind(tenantId, tenantId, tenantId, tenantId, tenantId).first<{
+      receipts: number; receipt_lines: number; corrections: number; correction_delta: number; audits: number;
+    }>();
+    expect(facts).toEqual(expect.objectContaining({
+      receipts: 1,
+      receipt_lines: 1,
+      corrections: 2,
+      correction_delta: -5,
+      audits: 2,
+    }));
+
+    const correctedReceipt = await createPurchaseReceipt(db, user, created.purchaseOrder.id, {
+      warehouseId: 'warehouse-main',
+      note: '重新登记真实到货',
+      lines: [{ purchaseOrderLineId: orderLineId, quantity: 5 }],
+    }, 'purchase-receipt-after-correction-0001');
+    expect(correctedReceipt.purchaseOrder.status).toBe('received');
+    expect(await inventoryOnHand(db)).toBe(5);
+  });
+
+  it('冲正不能超过原收货、不能扣减已占用库存，且受权限和租户隔离保护', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-CORRECTION-GUARD', name: '冲正边界供应商',
+    }, 'supplier-create-correction-guard-0001');
+    const created = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+    }, 'purchase-order-create-correction-guard-0001');
+    const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+      action: 'issue',
+    }, 'purchase-order-issue-correction-guard-0001');
+    const posted = await createPurchaseReceipt(db, user, created.purchaseOrder.id, {
+      warehouseId: 'warehouse-main',
+      lines: [{ purchaseOrderLineId: issued.purchaseOrder.lines[0].id, quantity: 3 }],
+    }, 'purchase-receipt-correction-guard-source-0001');
+    const receiptLineId = posted.receipt.lines[0].id;
+
+    await expect(createPurchaseReceiptCorrection(db, user, posted.receipt.id, {
+      reason: '错误地尝试超量冲正',
+      lines: [{ purchaseReceiptLineId: receiptLineId, quantity: 4 }],
+    }, 'purchase-receipt-correction-guard-0001')).rejects.toMatchObject({
+      code: 'PURCHASE_RECEIPT_CORRECTION_EXCEEDS_RECEIPT',
+    });
+
+    await db.prepare(`
+      UPDATE inventory_balances SET reserved_qty = 2
+      WHERE tenant_id = ? AND sku_id = 'sku-service-po' AND warehouse_id = 'warehouse-main'
+    `).bind(tenantId).run();
+    await expect(createPurchaseReceiptCorrection(db, user, posted.receipt.id, {
+      reason: '库存已有占用时不能冲正到可用量为负',
+      lines: [{ purchaseReceiptLineId: receiptLineId, quantity: 2 }],
+    }, 'purchase-receipt-correction-guard-0002')).rejects.toMatchObject({
+      code: 'PURCHASE_RECEIPT_CORRECTION_INVENTORY_UNAVAILABLE',
+    });
+
+    const viewer: UserContext = { ...user, role: 'viewer', permissions: ROLE_PERMISSIONS.viewer };
+    await expect(createPurchaseReceiptCorrection(db, viewer, posted.receipt.id, {
+      reason: '只读账号不能冲正',
+      lines: [{ purchaseReceiptLineId: receiptLineId, quantity: 1 }],
+    }, 'purchase-receipt-correction-guard-0003')).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+
+    const otherTenantUser: UserContext = {
+      ...user,
+      id: 'auth-other-correction',
+      email: 'other-correction@example.invalid',
+      tenantId: 'tenant-other',
+      tenantName: '其他租户',
+    };
+    await expect(createPurchaseReceiptCorrection(db, otherTenantUser, posted.receipt.id, {
+      reason: '其他租户不能访问本租户收货单',
+      lines: [{ purchaseReceiptLineId: receiptLineId, quantity: 1 }],
+    }, 'purchase-receipt-correction-guard-0004')).rejects.toMatchObject({
+      code: 'PURCHASE_RECEIPT_NOT_FOUND',
+    });
+
+    const count = await db.prepare(`
+      SELECT COUNT(*) AS count FROM purchase_receipt_corrections WHERE tenant_id = ?
+    `).bind(tenantId).first<{ count: number }>();
+    expect(Number(count?.count)).toBe(0);
+    expect(await inventoryOnHand(db)).toBe(3);
+  });
+
   it('取消草稿保留历史并允许重新转单，且其他租户无法操作', async () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-04', name: '取消与隔离测试供应商',
     }, 'supplier-create-3001');
-    const first = await createPurchaseOrder(db, user, {
+    const first = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
     }, 'purchase-order-create-3001');
 
-    const cancelled = await executePurchaseOrderAction(db, user, first.purchaseOrder.id, {
+    const cancelled = await executePurchaseOrderAction(db, buyerUser, first.purchaseOrder.id, {
       action: 'cancel', note: '供应商暂时无法交货',
     }, 'purchase-order-cancel-3001');
     expect(cancelled.purchaseOrder.status).toBe('cancelled');
-    await expect(executePurchaseOrderAction(db, user, first.purchaseOrder.id, {
+    await expect(executePurchaseOrderAction(db, buyerUser, first.purchaseOrder.id, {
       action: 'issue',
     }, 'purchase-order-issue-3001')).rejects.toMatchObject({
       code: 'INVALID_PURCHASE_ORDER_TRANSITION',
     });
 
-    const replacement = await createPurchaseOrder(db, user, {
+    const replacement = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
       note: '原单取消后重新下单',
@@ -357,7 +572,7 @@ describe('正式采购单与到货入库闭环', () => {
       SET source_updated_at = ?, updated_at = ?
       WHERE tenant_id = ?
     `).bind('2026-11-02T12:00:00.000Z', '2026-11-02T12:00:00.000Z', tenantId).run();
-    await expect(createPurchaseOrder(db, user, {
+    await expect(createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
     }, 'purchase-order-create-2001')).rejects.toMatchObject({ code: 'PURCHASE_REQUEST_NEEDS_ATTENTION' });
@@ -367,7 +582,7 @@ describe('正式采购单与到货入库闭环', () => {
       SET source_updated_at = '2026-11-02T12:00:00.000Z'
       WHERE tenant_id = ? AND request_id = ?
     `).bind(tenantId, approvedRequestId).run();
-    const created = await createPurchaseOrder(db, user, {
+    const created = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
     }, 'purchase-order-create-2002');
@@ -376,7 +591,7 @@ describe('正式采购单与到货入库闭环', () => {
       lines: [{ purchaseOrderLineId: created.purchaseOrder.lines[0].id, quantity: 1 }],
     }, 'purchase-receipt-create-2001')).rejects.toMatchObject({ code: 'PURCHASE_ORDER_NOT_RECEIVABLE' });
 
-    await executePurchaseOrderAction(db, user, created.purchaseOrder.id, {
+    await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
       action: 'issue',
     }, 'purchase-order-issue-2001');
     await expect(createPurchaseReceipt(db, user, created.purchaseOrder.id, {
@@ -491,6 +706,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0007_worried_stone_men.sql',
     '../drizzle/0008_nifty_mimic.sql',
     '../drizzle/0009_shocking_iron_lad.sql',
+    '../drizzle/0014_clever_silvermane.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {
