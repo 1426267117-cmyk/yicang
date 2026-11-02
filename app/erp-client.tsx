@@ -19,6 +19,7 @@ import {
   receiptCorrectionAvailability,
   validateReceiptCorrectionDraft,
 } from '../lib/procurement-ui';
+import { purchaseAssignmentBlock } from '../lib/purchase-assignment-ui';
 
 type ModuleKey = 'dashboard' | 'platform' | 'orders' | 'inventory' | 'purchase' | 'warehouse' | 'logistics' | 'finance' | 'reports';
 type OrderStatus = 'pending_review' | 'reserved' | 'shipped' | 'cancelled';
@@ -75,7 +76,7 @@ type PurchaseRequest = {
   purchaser?: PurchaseMember | null;
   purchaserMemberId?: string; purchaserName?: string; reviewerMemberId?: string; reviewerName?: string; creatorName?: string;
   lineCount: number; totalQuantity: number; note: string | null; reviewNote: string | null;
-  needsAttention: boolean; createdAt: string; updatedAt: string; lines: PurchaseRequestLine[];
+  needsAttention: boolean; version: number; createdAt: string; updatedAt: string; lines: PurchaseRequestLine[];
 };
 
 type PurchaseSupplier = {
@@ -545,6 +546,8 @@ export default function ErpClient() {
   const [showSupplier, setShowSupplier] = useState(false);
   const [showWarehouse, setShowWarehouse] = useState(false);
   const [purchaseOrderRequest, setPurchaseOrderRequest] = useState<PurchaseRequest | null>(null);
+  const [assignmentRequest, setAssignmentRequest] = useState<PurchaseRequest | null>(null);
+  const [assignmentIdempotencyKey, setAssignmentIdempotencyKey] = useState('');
   const [receivingOrder, setReceivingOrder] = useState<PurchaseOrder | null>(null);
   const [purchaseReceiptIdempotencyKey, setPurchaseReceiptIdempotencyKey] = useState('');
   const [correctingReceipt, setCorrectingReceipt] = useState<PurchaseReceipt | null>(null);
@@ -1282,6 +1285,44 @@ export default function ErpClient() {
     } finally { setPurchaseBusy(''); }
   }
 
+  function openPurchaseAssignment(request: PurchaseRequest) {
+    setAssignmentRequest(request);
+    setAssignmentIdempotencyKey(crypto.randomUUID());
+    setError('');
+  }
+
+  async function submitPurchaseAssignment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!assignmentRequest) return;
+    const data = new FormData(event.currentTarget);
+    const key = assignmentIdempotencyKey || crypto.randomUUID();
+    if (!assignmentIdempotencyKey) setAssignmentIdempotencyKey(key);
+    setPurchaseBusy(`reassign:${assignmentRequest.id}`);
+    setError('');
+    try {
+      const response = await fetch(`/api/purchase/requests/${encodeURIComponent(assignmentRequest.id)}/assignment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+        body: JSON.stringify({
+          purchaserMemberId: String(data.get('purchaserMemberId') ?? ''),
+          reviewerMemberId: String(data.get('reviewerMemberId') ?? ''),
+          reason: String(data.get('reason') ?? '').trim(),
+          expectedVersion: assignmentRequest.version,
+        }),
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiMessage(body, '重新指派失败，请刷新后重试'));
+      setAssignmentRequest(null);
+      setAssignmentIdempotencyKey('');
+      await loadData();
+      flash('采购负责人已受控交接，关联未完成采购单的操作权已同步转移');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '采购负责人重新指派失败');
+    } finally {
+      setPurchaseBusy('');
+    }
+  }
+
   async function submitSupplier(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -1567,7 +1608,7 @@ export default function ErpClient() {
             {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}
             {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
             {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} source={inventorySource} setSource={switchInventorySource} mukuStatus={mukuStatus} mukuRuns={mukuRuns} mukuInventory={mukuInventory} mukuRisk={mukuRisk} mukuInventoryRows={filteredMukuInventory} mukuRiskRows={filteredMukuRisk} mukuPage={mukuPage} setMukuPage={setMukuPage} mukuFilters={mukuFilters} applyMukuFilters={applyMukuFilters} mukuBusy={mukuBusy} mukuError={mukuError} canRead={can('connectors:read')} canSync={can('connectors:sync')} testConnection={testMukuConnection} syncReadOnly={syncMukuReadOnly} />}
-            {active === 'purchase' && <PurchaseWorkspaceView planning={purchasePlanning} planningRows={filteredPurchasePlanningRows} planningError={planningError} demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedPlanRowIds={selectedPlanRowIds} togglePlanningRow={togglePlanningRow} openPlanningRequest={() => setShowPlanningRequest(true)} openPlanningMapping={setPlanningMapping} openPlanningPolicy={setPlanningPolicy} openInventoryConfirmation={setInventoryConfirmationRow} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openMemberRoles={() => { void openMemberRoles(); }} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={openPurchaseReceipt} openReceiptCorrection={(receipt) => { void openReceiptCorrection(receipt); }} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
+            {active === 'purchase' && <PurchaseWorkspaceView planning={purchasePlanning} planningRows={filteredPurchasePlanningRows} planningError={planningError} demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedPlanRowIds={selectedPlanRowIds} togglePlanningRow={togglePlanningRow} openPlanningRequest={() => setShowPlanningRequest(true)} openPlanningMapping={setPlanningMapping} openPlanningPolicy={setPlanningPolicy} openInventoryConfirmation={setInventoryConfirmationRow} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openMemberRoles={() => { void openMemberRoles(); }} openPurchaseOrder={setPurchaseOrderRequest} openAssignment={openPurchaseAssignment} openReceipt={openPurchaseReceipt} openReceiptCorrection={(receipt) => { void openReceiptCorrection(receipt); }} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
             {!['dashboard','platform','orders','inventory','purchase'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
           </>
         ) : <LoadingState message={error || '暂时无法加载业务数据'} />}
@@ -1583,6 +1624,7 @@ export default function ErpClient() {
       {showSupplier && <SupplierModal busy={purchaseBusy === 'create-supplier'} error={error} onClose={() => { if (!purchaseBusy) { setShowSupplier(false); setError(''); } }} onSubmit={submitSupplier} />}
       {showWarehouse && <WarehouseModal busy={purchaseBusy === 'create-warehouse'} error={error} onClose={() => { if (!purchaseBusy) { setShowWarehouse(false); setError(''); } }} onSubmit={submitWarehouse} />}
       {showMemberRoles && <MemberRolesModal members={managedMembers} currentUserEmail={payload?.user.email ?? ''} busy={memberRoleBusy} error={memberRoleError} onRetry={() => { void openMemberRoles(); }} onChange={(member, role) => { void updateMemberRole(member, role); }} onClose={() => { if (!memberRoleBusy) { setShowMemberRoles(false); setMemberRoleError(''); } }} />}
+      {assignmentRequest && purchasePayload && <PurchaseAssignmentModal request={assignmentRequest} members={purchasePayload.members} developmentOpenAccess={purchasePayload.developmentOpenAccess} busy={purchaseBusy === `reassign:${assignmentRequest.id}`} error={error} onClose={() => { if (!purchaseBusy) { setAssignmentRequest(null); setAssignmentIdempotencyKey(''); setError(''); } }} onSubmit={submitPurchaseAssignment} />}
       {purchaseOrderRequest && purchasePayload && <PurchaseOrderModal request={purchaseOrderRequest} suppliers={purchasePayload.suppliers} warehouses={purchasePayload.warehouses} busy={purchaseBusy.startsWith('create-order:')} error={error} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} onClose={() => { if (!purchaseBusy) { setPurchaseOrderRequest(null); setError(''); } }} onSubmit={submitPurchaseOrder} />}
       {receivingOrder && <PurchaseReceiptModal order={receivingOrder} busy={purchaseBusy.startsWith('receive:')} error={error} onClose={() => { if (!purchaseBusy) { setReceivingOrder(null); setPurchaseReceiptIdempotencyKey(''); setError(''); } }} onSubmit={submitPurchaseReceipt} />}
       {correctingReceipt && <PurchaseReceiptCorrectionModal key={correctingReceipt.id} receipt={correctingReceipt} corrections={receiptCorrections} historyReady={receiptCorrectionsLoaded} loading={purchaseBusy === `load-corrections:${correctingReceipt.id}`} busy={purchaseBusy === `correct-receipt:${correctingReceipt.id}`} error={receiptCorrectionError} onRetry={() => { void openReceiptCorrection(correctingReceipt); }} onClose={() => { if (!purchaseBusy) { setCorrectingReceipt(null); setReceiptCorrections([]); setReceiptCorrectionsLoaded(false); setReceiptCorrectionIdempotencyKey(''); setReceiptCorrectionError(''); } }} onSubmit={submitReceiptCorrection} />}
@@ -1731,7 +1773,7 @@ function MukuPaginationView({ pagination, currentPage, setPage, busy, fallbackTe
   return <div className="pagination muku-pagination"><span>{fallbackText}</span><div><button aria-label="上一页" disabled={busy || page <= 1} onClick={() => setPage(Math.max(1, page - 1))}>‹</button><button className="current" disabled>{page} / {totalPages}</button><button aria-label="下一页" disabled={busy || !(pagination?.hasNext ?? false)} onClick={() => setPage(page + 1)}>›</button></div></div>;
 }
 
-function PurchaseWorkspaceView({ planning, planningRows, planningError, demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedPlanRowIds, togglePlanningRow, openPlanningRequest, openPlanningMapping, openPlanningPolicy, openInventoryConfirmation, selectedDemandIds, toggleDemand, openMapping, openSupplier, openWarehouse, openMemberRoles, openPurchaseOrder, openReceipt, openReceiptCorrection, can, busy, runAction, runOrderAction, hasQuery }: {
+function PurchaseWorkspaceView({ planning, planningRows, planningError, demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedPlanRowIds, togglePlanningRow, openPlanningRequest, openPlanningMapping, openPlanningPolicy, openInventoryConfirmation, selectedDemandIds, toggleDemand, openMapping, openSupplier, openWarehouse, openMemberRoles, openPurchaseOrder, openAssignment, openReceipt, openReceiptCorrection, can, busy, runAction, runOrderAction, hasQuery }: {
   planning: PurchasePlanningPayload | null; planningRows: PurchasePlanningRow[]; planningError: string;
   demands: PurchaseDemand[]; requests: PurchaseRequest[]; purchaseOrders: PurchaseOrder[]; purchaseReceipts: PurchaseReceipt[];
   workspace: PurchaseWorkspacePayload | null; tab: PurchaseTab; setTab: (tab: PurchaseTab) => void;
@@ -1743,6 +1785,7 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
   openMapping: (demand: PurchaseDemand) => void; openSupplier: () => void; openWarehouse: () => void;
   openMemberRoles: () => void;
   openPurchaseOrder: (request: PurchaseRequest) => void; openReceipt: (order: PurchaseOrder) => void;
+  openAssignment: (request: PurchaseRequest) => void;
   openReceiptCorrection: (receipt: PurchaseReceipt) => void;
   can: (permission: Permission) => boolean; busy: string;
   runAction: (request: PurchaseRequest, action: PurchaseRequestAction) => void;
@@ -1769,6 +1812,7 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
     request.id,
     request.buyer?.displayName ?? request.purchaser?.displayName ?? request.purchaserName ?? '采购负责人',
   ]));
+  const requestsById = new Map(allRequests.map((request) => [request.id, request]));
   const approvedRequests = requests.filter((request) => request.status === 'approved' && !activeRequestIds.has(request.id));
   const activeOrders = purchaseOrders.filter((order) => ['draft', 'issued', 'partially_received'].includes(order.status));
   const closedOrders = purchaseOrders.filter((order) => ['received', 'closed_short', 'cancelled'].includes(order.status));
@@ -1812,11 +1856,11 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
         : tab === 'pending' || tab === 'mapping' ? <>
         {tab === 'pending' && <div className="planning-inline-warning"><strong>只读订单需求</strong> {DIRECT_PURCHASE_REQUEST_DISABLED_MESSAGE}。这里的“未分配”不等于应采购数量。</div>}
         <PurchaseDemandTable demands={visibleDemands} selectable={false} selectedDemandIds={selectedDemandIds} toggleDemand={toggleDemand} openMapping={openMapping} canMap={can('purchase:mapping')} busy={busy} emptyMessage={hasQuery ? '没有符合当前搜索条件的需求' : tab === 'pending' ? '暂无未分配的订单需求；需要采购时请从“今日采购建议”生成申请' : '暂无待映射的真实订单行'} />
-      </> : tab === 'requests' ? <><div className="planning-inline-warning"><strong>{developmentOpenAccess ? '开发试运行模式' : '正式岗位分离'}</strong> {developmentOpenAccess ? '开发期允许当前登录账号继续任何已分配的采购流程，方便换 GPT 账号联调；每次操作仍记录实际账号。' : '采购负责人负责提交，指定复审人负责批准或驳回，且两者必须为不同成员。'}</div><PurchaseRequestTable requests={visibleRequests} currentMemberId={workspace?.currentMemberId ?? null} developmentOpenAccess={developmentOpenAccess} can={can} busy={busy} runAction={runAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购申请' : '暂无草稿或待复审申请；请从“今日采购建议”按最新库存结果生成'} /></>
-        : tab === 'approved' ? <PurchaseRequestTable requests={approvedRequests} currentMemberId={workspace?.currentMemberId ?? null} developmentOpenAccess={developmentOpenAccess} can={can} busy={busy} runAction={runAction} openPurchaseOrder={openPurchaseOrder} emptyMessage={hasQuery ? '没有符合当前搜索条件的已批准申请' : '暂无待转采购单；采购申请批准后会出现在这里'} />
-          : tab === 'orders' ? <PurchaseOrderTable orders={activeOrders} assignedPurchaseRequestIds={assignedPurchaseRequestIds} purchaserNamesByRequestId={purchaserNamesByRequestId} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购单' : '暂无待下单或待到货采购单'} />
+      </> : tab === 'requests' ? <><div className="planning-inline-warning"><strong>{developmentOpenAccess ? '开发试运行模式' : '正式岗位分离'}</strong> {developmentOpenAccess ? '开发期允许当前登录账号继续任何已分配的采购流程，方便换 GPT 账号联调；每次操作仍记录实际账号。' : '采购负责人负责提交，指定复审人负责批准或驳回，且两者必须为不同成员。'}</div><PurchaseRequestTable requests={visibleRequests} currentMemberId={workspace?.currentMemberId ?? null} developmentOpenAccess={developmentOpenAccess} can={can} busy={busy} runAction={runAction} openAssignment={openAssignment} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购申请' : '暂无草稿或待复审申请；请从“今日采购建议”按最新库存结果生成'} /></>
+        : tab === 'approved' ? <PurchaseRequestTable requests={approvedRequests} currentMemberId={workspace?.currentMemberId ?? null} developmentOpenAccess={developmentOpenAccess} can={can} busy={busy} runAction={runAction} openPurchaseOrder={openPurchaseOrder} openAssignment={openAssignment} emptyMessage={hasQuery ? '没有符合当前搜索条件的已批准申请' : '暂无待转采购单；采购申请批准后会出现在这里'} />
+          : tab === 'orders' ? <PurchaseOrderTable orders={activeOrders} assignedPurchaseRequestIds={assignedPurchaseRequestIds} purchaserNamesByRequestId={purchaserNamesByRequestId} requestsById={requestsById} openAssignment={openAssignment} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购单' : '暂无待下单或待到货采购单'} />
             : tab === 'received' ? <PurchaseReceiptTable receipts={purchaseReceipts} canCorrect={can('inventory:receive')} busy={busy} openCorrection={openReceiptCorrection} emptyMessage={hasQuery ? '没有符合当前搜索条件的到货记录' : '暂无到货记录；确认采购单下单后可分批登记到货'} />
-              : <div className="purchase-history-sections"><div><h3>已结束的申请</h3><PurchaseRequestTable requests={historyRequests} currentMemberId={workspace?.currentMemberId ?? null} developmentOpenAccess={developmentOpenAccess} can={can} busy={busy} runAction={runAction} emptyMessage="暂无驳回或取消的采购申请" /></div><div><h3>已结束的采购单</h3><PurchaseOrderTable orders={closedOrders} assignedPurchaseRequestIds={assignedPurchaseRequestIds} purchaserNamesByRequestId={purchaserNamesByRequestId} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage="暂无完成或取消的正式采购单" /></div></div>}
+              : <div className="purchase-history-sections"><div><h3>已结束的申请</h3><PurchaseRequestTable requests={historyRequests} currentMemberId={workspace?.currentMemberId ?? null} developmentOpenAccess={developmentOpenAccess} can={can} busy={busy} runAction={runAction} emptyMessage="暂无驳回或取消的采购申请" /></div><div><h3>已结束的采购单</h3><PurchaseOrderTable orders={closedOrders} assignedPurchaseRequestIds={assignedPurchaseRequestIds} purchaserNamesByRequestId={purchaserNamesByRequestId} requestsById={requestsById} openAssignment={openAssignment} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage="暂无完成或取消的正式采购单" /></div></div>}
       <div className="pagination"><span>取消、退款、到货和库存变化均保留原始记录；系统不物理删除采购历史</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div>
     </article>
   </div>;
@@ -1911,11 +1955,12 @@ function PurchaseDemandTable({ demands, selectable, selectedDemandIds, toggleDem
   }) : <tr><td className="empty-cell" colSpan={selectable ? 8 : 7}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
-function PurchaseRequestTable({ requests, currentMemberId, developmentOpenAccess, can, busy, runAction, openPurchaseOrder, emptyMessage }: {
+function PurchaseRequestTable({ requests, currentMemberId, developmentOpenAccess, can, busy, runAction, openPurchaseOrder, openAssignment, emptyMessage }: {
   requests: PurchaseRequest[]; currentMemberId: string | null; developmentOpenAccess: boolean;
   can: (permission: Permission) => boolean; busy: string;
   runAction: (request: PurchaseRequest, action: PurchaseRequestAction) => void; emptyMessage: string;
   openPurchaseOrder?: (request: PurchaseRequest) => void;
+  openAssignment?: (request: PurchaseRequest) => void;
 }) {
   return <div className="table-wrap module-table"><table className="purchase-request-table"><thead><tr><th>申请单</th><th>采购负责人</th><th>复审人</th><th>明细 / 件数</th><th>状态</th><th>备注</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{requests.length ? requests.map((request) => {
     const purchaserMemberId = request.buyer?.id ?? request.purchaser?.id ?? request.purchaserMemberId;
@@ -1928,13 +1973,14 @@ function PurchaseRequestTable({ requests, currentMemberId, developmentOpenAccess
       Boolean(currentMemberId && reviewerMemberId === currentMemberId),
       developmentOpenAccess,
     );
-    return <tr key={request.id}><td><strong>{request.requestNo}</strong><small className="cell-sub">创建：{request.creator?.displayName ?? '系统成员'}</small></td><td>{request.buyer?.displayName ?? '待指定'}</td><td>{request.reviewer?.displayName ?? '待指定'}</td><td>{request.lineCount} 行 / {request.totalQuantity} 件</td><td><span className={`status-pill purchase-status-${request.status}`}>{purchaseRequestStatusLabel[request.status]}</span>{request.needsAttention && <small className="cell-sub attention-text">源订单已变化，需复核</small>}</td><td>{request.reviewNote ?? request.note ?? '—'}</td><td>{formatTime(request.updatedAt)}</td><td><div className="row-actions">{request.status === 'draft' && assignedPurchaser && can('purchase:submit') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'submit')}>{busy === `${request.id}:submit` ? '提交中…' : '提交复审'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'cancel')}>取消</button></>}{request.status === 'draft' && !assignedPurchaser && <span className="terminal-label">等待 {request.buyer?.displayName ?? '采购负责人'} 提交</span>}{request.status === 'pending_review' && assignedReviewer && can('purchase:review') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'approve')}>{busy === `${request.id}:approve` ? '复审中…' : '批准'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'reject')}>驳回</button></>}{request.status === 'pending_review' && !assignedReviewer && <span className="terminal-label">等待 {request.reviewer?.displayName ?? '复审人'} 处理</span>}{request.status === 'approved' && openPurchaseOrder && assignedPurchaser && can('purchase:order:create') && !request.needsAttention && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openPurchaseOrder(request)}>生成正式采购单</button>}{request.status === 'approved' && openPurchaseOrder && assignedPurchaser && can('purchase:submit') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'withdraw')}>{busy === `${request.id}:withdraw` ? '撤回中…' : '撤回重算'}</button>}{request.status === 'approved' && request.needsAttention && <span className="terminal-label">源订单变化，暂不能转单</span>}{request.status === 'approved' && openPurchaseOrder && !assignedPurchaser && !request.needsAttention && <span className="terminal-label">等待 {request.buyer?.displayName ?? '采购负责人'} 转采购单</span>}{(['rejected','cancelled'].includes(request.status) || (request.status === 'approved' && !openPurchaseOrder)) && <span className="terminal-label">历史已保留</span>}</div></td></tr>;
+    return <tr key={request.id}><td><strong>{request.requestNo}</strong><small className="cell-sub">创建：{request.creator?.displayName ?? '系统成员'}</small></td><td>{request.buyer?.displayName ?? '待指定'}</td><td>{request.reviewer?.displayName ?? '待指定'}</td><td>{request.lineCount} 行 / {request.totalQuantity} 件</td><td><span className={`status-pill purchase-status-${request.status}`}>{purchaseRequestStatusLabel[request.status]}</span>{request.needsAttention && <small className="cell-sub attention-text">源订单已变化，需复核</small>}</td><td>{request.reviewNote ?? request.note ?? '—'}</td><td>{formatTime(request.updatedAt)}</td><td><div className="row-actions">{openAssignment && can('members:manage') && ['draft','pending_review','approved'].includes(request.status) && <button className="action-muted" disabled={Boolean(busy)} onClick={() => openAssignment(request)}>{busy === `reassign:${request.id}` ? '交接中…' : '重新指派'}</button>}{request.status === 'draft' && assignedPurchaser && can('purchase:submit') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'submit')}>{busy === `${request.id}:submit` ? '提交中…' : '提交复审'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'cancel')}>取消</button></>}{request.status === 'draft' && !assignedPurchaser && <span className="terminal-label">等待 {request.buyer?.displayName ?? '采购负责人'} 提交</span>}{request.status === 'pending_review' && assignedReviewer && can('purchase:review') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'approve')}>{busy === `${request.id}:approve` ? '复审中…' : '批准'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'reject')}>驳回</button></>}{request.status === 'pending_review' && !assignedReviewer && <span className="terminal-label">等待 {request.reviewer?.displayName ?? '复审人'} 处理</span>}{request.status === 'approved' && openPurchaseOrder && assignedPurchaser && can('purchase:order:create') && !request.needsAttention && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openPurchaseOrder(request)}>生成正式采购单</button>}{request.status === 'approved' && openPurchaseOrder && assignedPurchaser && can('purchase:submit') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'withdraw')}>{busy === `${request.id}:withdraw` ? '撤回中…' : '撤回重算'}</button>}{request.status === 'approved' && request.needsAttention && <span className="terminal-label">源订单变化，暂不能转单</span>}{request.status === 'approved' && openPurchaseOrder && !assignedPurchaser && !request.needsAttention && <span className="terminal-label">等待 {request.buyer?.displayName ?? '采购负责人'} 转采购单</span>}{(['rejected','cancelled'].includes(request.status) || (request.status === 'approved' && !openPurchaseOrder)) && <span className="terminal-label">历史已保留</span>}</div></td></tr>;
   }) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
-function PurchaseOrderTable({ orders, assignedPurchaseRequestIds, purchaserNamesByRequestId, can, busy, openReceipt, runAction, emptyMessage }: {
+function PurchaseOrderTable({ orders, assignedPurchaseRequestIds, purchaserNamesByRequestId, requestsById, openAssignment, can, busy, openReceipt, runAction, emptyMessage }: {
   orders: PurchaseOrder[]; can: (permission: Permission) => boolean; busy: string;
   assignedPurchaseRequestIds: Set<string>; purchaserNamesByRequestId: Map<string, string>;
+  requestsById: Map<string, PurchaseRequest>; openAssignment: (request: PurchaseRequest) => void;
   openReceipt: (order: PurchaseOrder) => void;
   runAction: (order: PurchaseOrder, action: 'issue' | 'cancel' | 'close') => void; emptyMessage: string;
 }) {
@@ -1949,6 +1995,7 @@ function PurchaseOrderTable({ orders, assignedPurchaseRequestIds, purchaserNames
     }, order.lines.length ? 0 : null);
     const documentUrl = `/api/purchase/orders/${encodeURIComponent(order.id)}/document`;
     const completion = purchaseOrderCompletion(order);
+    const purchaseRequest = requestsById.get(order.purchaseRequestId);
     return <tr key={order.id}>
       <td><strong>{order.orderNo}</strong><small className="cell-sub">{order.lineCount} 行 · v{order.version}</small></td>
       <td><strong>{order.supplier.name}</strong><small className="cell-sub">{order.supplier.code}</small><small className="cell-sub">{order.deliveryWarehouse ? `${order.deliveryWarehouse.code} · ${order.deliveryWarehouse.name}` : '未设置收货仓'} · {order.expectedDeliveryAt ?? '交期未填'}</small></td>
@@ -1959,6 +2006,7 @@ function PurchaseOrderTable({ orders, assignedPurchaseRequestIds, purchaserNames
       <td>{formatTime(order.updatedAt)}</td>
       <td><div className="row-actions">
         {can('purchase:read') && <><a href={documentUrl} target="_blank" rel="noreferrer">打印采购单</a><a href={`${documentUrl}?format=csv`} download>导出 CSV</a></>}
+        {can('members:manage') && purchaseRequest && ['draft','issued','partially_received'].includes(order.status) && <button className="action-muted" disabled={Boolean(busy)} onClick={() => openAssignment(purchaseRequest)}>重新指派</button>}
         {order.status === 'draft' && assignedPurchaser && can('purchase:order:issue') && <>{completion.ready ? <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(order, 'issue')}>{busy === `${order.id}:issue` ? '处理中…' : '确认下单'}</button> : <span className="terminal-label">不可下单：缺 {completion.missing.join('、')}</span>}<button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(order, 'cancel')}>取消采购单</button></>}
         {order.status === 'draft' && !assignedPurchaser && <span className="terminal-label">等待 {purchaserNamesByRequestId.get(order.purchaseRequestId) ?? '采购负责人'} 确认</span>}
         {['issued','partially_received'].includes(order.status) && can('inventory:receive') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openReceipt(order)}>登记到货</button>}
@@ -2111,6 +2159,29 @@ function PurchaseRequestModal({ demands, members, currentMemberId, developmentOp
   const assigneeMissing = !purchasers.length || !reviewers.length;
   const canSubmitDirectly = assignmentActionAllowed(Boolean(currentMemberId && buyerId === currentMemberId), developmentOpenAccess);
   return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal purchase-request-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>生成采购申请</h2><p>已选 {demands.length} 行，共 {totalQuantity} 件</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="purchase-selected-list">{demands.slice(0, 5).map((demand) => <div key={demand.id}><strong>{demand.mappedSkuCode ?? demand.rawSku ?? '未识别 SKU'}</strong><span>{demand.title ?? demand.name ?? demand.sourceOrderLineId}</span><b>{demandAvailableQuantity(demand)} 件</b></div>)}{demands.length > 5 && <small>另有 {demands.length - 5} 行已选需求</small>}</div><div className="form-grid"><label>采购负责人<select name="purchaserMemberId" value={buyerId} onChange={(event) => setBuyerId(event.target.value)} required><option value="" disabled>请选择可提交申请的成员</option>{purchasers.map((member) => <option key={member.id} value={member.id}>{member.displayName} · {member.role === 'admin' ? '管理员' : '操作员'}</option>)}</select></label><label>复审人<select name="reviewerMemberId" value={reviewerId} onChange={(event) => setReviewerId(event.target.value)} required><option value="" disabled>请选择管理员复审</option>{reviewers.map((member) => <option key={member.id} value={member.id}>{member.displayName} · 管理员</option>)}</select></label><label className="full">采购备注<textarea name="note" rows={3} maxLength={500} placeholder="可填写交期、供应商沟通或特殊要求" /></label>{separationBlocked && <div className="form-error full">正式模式要求采购负责人和复审人为不同成员。</div>}{!purchasers.length && <div className="form-error full">没有可提交申请的管理员或操作员，请先由管理员调整团队角色。</div>}{!reviewers.length && <div className="form-error full">没有具备采购复审权限的管理员，请先配置团队角色。</div>}{buyerId && !canSubmitDirectly && <div className="form-error full">当前账号不是所选采购负责人，只能先保存草稿；请由指定负责人登录后提交复审。</div>}{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>{developmentOpenAccess ? '开发试运行' : '岗位分离'}</span>{developmentOpenAccess ? '当前登录账号可继续任何已分配的采购流程，每次操作仍记录实际账号。' : '负责人提交、指定管理员复审，且两人必须不同。'} 重复需求不会生成第二张有效申请。</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button type="submit" value="draft" disabled={busy || assigneeMissing || separationBlocked}>{busy ? '处理中…' : '保存草稿'}</button><button className="primary-button" type="submit" value="submit" disabled={busy || assigneeMissing || separationBlocked || !canSubmitDirectly}>{busy ? '处理中…' : '创建并提交复审'}</button></div></form></div>;
+}
+
+function PurchaseAssignmentModal({ request, members, developmentOpenAccess, busy, error, onClose, onSubmit }: {
+  request: PurchaseRequest; members: PurchaseMember[]; developmentOpenAccess: boolean;
+  busy: boolean; error: string; onClose: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const { purchasers, reviewers } = purchaseAssigneeCandidates(members);
+  const currentPurchaser = request.buyer ?? request.purchaser ?? null;
+  const currentPurchaserMemberId = currentPurchaser?.id ?? request.purchaserMemberId ?? '';
+  const currentReviewerMemberId = request.reviewer?.id ?? request.reviewerMemberId ?? '';
+  const [purchaserMemberId, setPurchaserMemberId] = useState(currentPurchaserMemberId);
+  const [reviewerMemberId, setReviewerMemberId] = useState(currentReviewerMemberId);
+  const [reason, setReason] = useState('');
+  const blocked = purchaseAssignmentBlock({
+    purchaserMemberId,
+    reviewerMemberId,
+    currentPurchaserMemberId,
+    currentReviewerMemberId,
+    reason,
+    developmentOpenAccess,
+  });
+  return <div className="modal-backdrop modal-layer-top" onMouseDown={onClose}><form className="modal purchase-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>重新指派采购流程</h2><p>{request.requestNo} · 当前版本 v{request.version}</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="mapping-context"><strong>现任负责人：{currentPurchaser?.displayName ?? '未知'}</strong><span>现任复审人：{request.reviewer?.displayName ?? '未知'}</span><code>交接只改变后续操作人，不修改申请、采购单或历史记录</code></div><div className="form-grid"><label>新采购负责人<select name="purchaserMemberId" value={purchaserMemberId} onChange={(event) => setPurchaserMemberId(event.target.value)} required><option value="" disabled>请选择负责人</option>{purchasers.map((member) => <option key={member.id} value={member.id}>{member.displayName} · {member.role === 'admin' ? '管理员' : '操作员'}</option>)}</select></label><label>新复审人<select name="reviewerMemberId" value={reviewerMemberId} onChange={(event) => setReviewerMemberId(event.target.value)} required><option value="" disabled>请选择复审人</option>{reviewers.map((member) => <option key={member.id} value={member.id}>{member.displayName} · 管理员</option>)}</select></label><label className="full">交接原因<textarea name="reason" value={reason} onChange={(event) => setReason(event.target.value)} rows={3} minLength={2} maxLength={500} required placeholder="例如：原负责人休假，由当班采购继续跟进" /></label>{blocked && <div className="form-error full">{blocked}</div>}{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>受控交接</span>管理员操作 · 乐观锁防并发覆盖 · 原负责人、新负责人、复审人和原因均写入审计。已有未完成采购单会随申请负责人同步转移操作权。</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || Boolean(blocked)}>{busy ? '正在交接…' : '确认重新指派'}</button></div></form></div>;
 }
 
 function SupplierModal({ busy, error, onClose, onSubmit }: {
