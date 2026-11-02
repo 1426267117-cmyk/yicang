@@ -9,6 +9,21 @@ const ORDER_WRITE_LEASE_MILLISECONDS = 2 * 60 * 1000;
 const ORDER_WRITE_LEASE_WAIT_MILLISECONDS = 5 * 1000;
 const ORDER_WRITE_LEASE_RETRY_MILLISECONDS = 25;
 
+// Exact, auditable exceptions for Shopify charges that must remain on the order
+// but must never create a stock-purchasing requirement. Keep these rules narrow:
+// an unknown blank SKU still requires manual review unless its title is an exact
+// known service charge.
+export const SHOPIFY_NON_STOCK_PURCHASE_RULES = {
+  shippingProtection: {
+    normalizedSku: 'XMHPACELSKU',
+    reasonCode: 'non_stock_shipping_protection',
+  },
+  assemblyFee: {
+    normalizedTitle: 'ASSEMBLY FEE',
+    reasonCode: 'non_stock_assembly_fee',
+  },
+} as const;
+
 export type PlatformStoreRecord = {
   id: string;
   connectorKey: string;
@@ -817,6 +832,16 @@ export class PlatformOrderRepository {
           po.test,
           po.source_cancelled_at,
           po.fulfillment_status,
+          CASE
+            WHEN po.platform = 'shopify'
+              AND UPPER(TRIM(COALESCE(l.normalized_sku, l.raw_sku, ''))) = ?
+              THEN ?
+            WHEN po.platform = 'shopify'
+              AND (l.raw_sku IS NULL OR TRIM(l.raw_sku) = '')
+              AND UPPER(TRIM(COALESCE(NULLIF(TRIM(l.title), ''), l.name, ''))) = ?
+              THEN ?
+            ELSE NULL
+          END AS non_stock_reason,
           po.source_updated_at
         FROM platform_order_lines l
         JOIN platform_orders po
@@ -839,7 +864,7 @@ export class PlatformOrderRepository {
         CASE
           WHEN is_current = 0 OR test = 1 OR source_cancelled_at IS NOT NULL
             OR UPPER(COALESCE(fulfillment_status, '')) = 'FULFILLED'
-            OR candidate_quantity <= 0 THEN 'not_required'
+            OR candidate_quantity <= 0 OR non_stock_reason IS NOT NULL THEN 'not_required'
           WHEN effective_sku_id IS NULL OR effective_mapping_status <> 'mapped' THEN 'needs_mapping'
           ELSE 'open'
         END,
@@ -847,7 +872,7 @@ export class PlatformOrderRepository {
         CASE
           WHEN is_current = 0 OR test = 1 OR source_cancelled_at IS NOT NULL
             OR UPPER(COALESCE(fulfillment_status, '')) = 'FULFILLED'
-            OR candidate_quantity <= 0 THEN 0
+            OR candidate_quantity <= 0 OR non_stock_reason IS NOT NULL THEN 0
           ELSE candidate_quantity
         END,
         CASE
@@ -856,6 +881,7 @@ export class PlatformOrderRepository {
           WHEN source_cancelled_at IS NOT NULL THEN 'cancelled_order'
           WHEN UPPER(COALESCE(fulfillment_status, '')) = 'FULFILLED' THEN 'fulfilled_order'
           WHEN candidate_quantity <= 0 THEN 'no_unfulfilled_quantity'
+          WHEN non_stock_reason IS NOT NULL THEN non_stock_reason
           WHEN effective_sku_id IS NULL AND (raw_sku IS NULL OR TRIM(raw_sku) = '') THEN 'sku_missing'
           WHEN effective_mapping_status = 'ambiguous' THEN 'sku_ambiguous'
           WHEN effective_sku_id IS NULL OR effective_mapping_status <> 'mapped' THEN 'sku_unmapped'
@@ -881,7 +907,17 @@ export class PlatformOrderRepository {
         source_updated_at = excluded.source_updated_at,
         last_refreshed_at = excluded.last_refreshed_at,
         updated_at = excluded.updated_at
-    `).bind(orderId, this.tenantId, refreshedAt, refreshedAt, refreshedAt);
+    `).bind(
+      SHOPIFY_NON_STOCK_PURCHASE_RULES.shippingProtection.normalizedSku,
+      SHOPIFY_NON_STOCK_PURCHASE_RULES.shippingProtection.reasonCode,
+      SHOPIFY_NON_STOCK_PURCHASE_RULES.assemblyFee.normalizedTitle,
+      SHOPIFY_NON_STOCK_PURCHASE_RULES.assemblyFee.reasonCode,
+      orderId,
+      this.tenantId,
+      refreshedAt,
+      refreshedAt,
+      refreshedAt,
+    );
   }
 }
 

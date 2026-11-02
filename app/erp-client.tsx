@@ -380,6 +380,8 @@ const purchaseDemandReasonLabel: Record<string, string> = {
   line_removed: '订单行已移除', test_order: '测试订单', cancelled_order: '订单已取消',
   fulfilled_order: '订单已履约', no_unfulfilled_quantity: '无未履约数量', sku_missing: '订单行缺少 SKU',
   sku_ambiguous: 'SKU 映射存在歧义', sku_unmapped: 'SKU 尚未映射',
+  non_stock_shipping_protection: '运费保障服务，无需采购',
+  non_stock_assembly_fee: '安装服务费，无需采购',
 };
 
 const purchaseRequestStatusLabel: Record<PurchaseRequestStatus, string> = {

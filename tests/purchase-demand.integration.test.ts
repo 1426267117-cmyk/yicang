@@ -220,6 +220,56 @@ describe('Shopify 订单行采购需求池', () => {
       status: 'not_required', required_quantity: 0, reason_code: 'line_removed',
     }));
   });
+
+  it('仅将明确的 Shopify 服务费排除采购，未知空 SKU 仍保持人工阻断', async () => {
+    const template = shopifyOrderFixture({ refunds: [], fulfillments: [] });
+    const sourceLines = (template.raw as { lineItems: { nodes: RawLine[] } }).lineItems.nodes;
+    const serviceLines: RawLine[] = [
+      {
+        ...sourceLines[1],
+        id: 'gid://shopify/LineItem/shipping-protection',
+        sku: 'XMHPACELSKU',
+        title: 'Shipping Protection',
+        name: 'Shipping Protection',
+      },
+      {
+        ...sourceLines[1],
+        id: 'gid://shopify/LineItem/assembly-fee',
+        sku: null,
+        title: '  Assembly fee  ',
+        name: 'Assembly fee',
+      },
+      {
+        ...sourceLines[1],
+        id: 'gid://shopify/LineItem/unknown-empty-sku',
+        sku: null,
+        title: 'Custom service',
+        name: 'Custom service',
+      },
+    ];
+    const graph = shopifyOrderFixture({
+      updatedAt: '2026-11-02T10:00:00Z',
+      displayFulfillmentStatus: 'UNFULFILLED',
+      refunds: [],
+      fulfillments: [],
+      lineItems: rawLineConnection(serviceLines),
+    });
+
+    await repository.upsertOrderGraph({
+      storeId, graph, apiVersion: '2026-07', runId: null,
+      fetchedAt: '2026-11-02T10:00:01.000Z',
+    });
+
+    expect(await demandForLine(db, 'gid://shopify/LineItem/shipping-protection')).toEqual(expect.objectContaining({
+      status: 'not_required', required_quantity: 0, reason_code: 'non_stock_shipping_protection',
+    }));
+    expect(await demandForLine(db, 'gid://shopify/LineItem/assembly-fee')).toEqual(expect.objectContaining({
+      status: 'not_required', required_quantity: 0, reason_code: 'non_stock_assembly_fee',
+    }));
+    expect(await demandForLine(db, 'gid://shopify/LineItem/unknown-empty-sku')).toEqual(expect.objectContaining({
+      status: 'needs_mapping', required_quantity: 1, reason_code: 'sku_missing',
+    }));
+  });
 });
 
 function purchaseGraph(overrides: Record<string, unknown>) {
