@@ -1,7 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 import { MukuDashboardClient } from '../lib/connectors/muku/client';
-import { MukuDashboardConfig } from '../lib/connectors/muku/config';
+import {
+  MukuDashboardConfig,
+  MUKU_DASHBOARD_DEFAULT_BASE_URL,
+  MUKU_LOCAL_EGRESS_PATH,
+} from '../lib/connectors/muku/config';
 import { sanitizedMukuConnectorError } from '../lib/connectors/muku/errors';
+import {
+  createMukuLocalEgressFetch,
+  MUKU_EXPORT_PATH,
+} from '../lib/connectors/muku/local-egress';
 import { MUKU_DATASETS } from '../lib/connectors/muku/types';
 
 const testKey = 'test-muku-read-only-key-with-more-than-32-characters';
@@ -183,6 +191,107 @@ describe('MUKU 只读 API 客户端', () => {
       retryable: true,
     });
     expect(fakeFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('本地开发出口只转发固定路径、白名单参数和必要请求头', async () => {
+    const localUrl = `http://127.0.0.1:3000${MUKU_LOCAL_EGRESS_PATH}`;
+    const localConfig = new MukuDashboardConfig(
+      MUKU_DASHBOARD_DEFAULT_BASE_URL,
+      testKey,
+      localUrl,
+    );
+    const underlyingFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      expect(url.origin).toBe('http://127.0.0.1:3000');
+      expect(url.pathname).toBe(MUKU_LOCAL_EGRESS_PATH);
+      expect(url.searchParams.get('dataset')).toBe('manifest');
+      expect(init?.method).toBe('GET');
+      expect(init?.redirect).toBe('manual');
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      const headers = new Headers(init?.headers);
+      expect([...headers.keys()].sort()).toEqual([
+        'accept',
+        'authorization',
+        'cache-control',
+      ]);
+      expect(headers.get('authorization')).toBe(`Bearer ${testKey}`);
+      expect(headers.get('cache-control')).toBe('no-store');
+      return jsonResponse({
+        ...metadata,
+        dataset: 'manifest',
+        datasets: MUKU_DATASETS.map((id) => ({ id })),
+      });
+    }) as typeof fetch;
+    const client = new MukuDashboardClient(
+      localConfig,
+      createMukuLocalEgressFetch(localConfig, underlyingFetch),
+    );
+
+    const manifest = await client.verifyManifest();
+
+    expect(manifest.datasetIds).toEqual(MUKU_DATASETS);
+    expect(underlyingFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('未配置本地出口时生产传输仍直连 MUKU HTTPS', async () => {
+    const directConfig = new MukuDashboardConfig(MUKU_DASHBOARD_DEFAULT_BASE_URL, testKey);
+    const directFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      expect(url.origin).toBe(new URL(MUKU_DASHBOARD_DEFAULT_BASE_URL).origin);
+      expect(url.pathname).toBe(MUKU_EXPORT_PATH);
+      return dataPage('inventory', 1, 500, 0, 0, false, []);
+    }) as typeof fetch;
+    const transport = createMukuLocalEgressFetch(directConfig, directFetch);
+    const client = new MukuDashboardClient(directConfig, transport);
+
+    await client.getPage('inventory');
+
+    expect(transport).toBe(directFetch);
+    expect(directFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    'https://example.invalid/api/integrations/erp/v1/export?dataset=inventory',
+    `${MUKU_DASHBOARD_DEFAULT_BASE_URL}/wrong-path?dataset=inventory`,
+    `${MUKU_DASHBOARD_DEFAULT_BASE_URL}${MUKU_EXPORT_PATH}`,
+    `${MUKU_DASHBOARD_DEFAULT_BASE_URL}${MUKU_EXPORT_PATH}?dataset=unknown`,
+    `${MUKU_DASHBOARD_DEFAULT_BASE_URL}${MUKU_EXPORT_PATH}?dataset=inventory&dataset=source-status`,
+    `${MUKU_DASHBOARD_DEFAULT_BASE_URL}${MUKU_EXPORT_PATH}?dataset=inventory&target=unsafe`,
+    `${MUKU_DASHBOARD_DEFAULT_BASE_URL}${MUKU_EXPORT_PATH}?dataset=inventory&page=0`,
+  ])('本地出口适配器拒绝非白名单请求 %s', async (url) => {
+    const localConfig = new MukuDashboardConfig(
+      MUKU_DASHBOARD_DEFAULT_BASE_URL,
+      testKey,
+      `http://127.0.0.1:3000${MUKU_LOCAL_EGRESS_PATH}`,
+    );
+    const underlyingFetch = vi.fn() as unknown as typeof fetch;
+    const transport = createMukuLocalEgressFetch(localConfig, underlyingFetch);
+
+    await expect(transport(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${testKey}` },
+    })).rejects.toMatchObject({ code: 'MUKU_LOCAL_EGRESS_REQUEST_REJECTED' });
+    expect(underlyingFetch).not.toHaveBeenCalled();
+  });
+
+  it('本地出口适配器拒绝写请求和缺失授权的请求', async () => {
+    const localConfig = new MukuDashboardConfig(
+      MUKU_DASHBOARD_DEFAULT_BASE_URL,
+      testKey,
+      `http://127.0.0.1:3000${MUKU_LOCAL_EGRESS_PATH}`,
+    );
+    const underlyingFetch = vi.fn() as unknown as typeof fetch;
+    const transport = createMukuLocalEgressFetch(localConfig, underlyingFetch);
+    const url = `${MUKU_DASHBOARD_DEFAULT_BASE_URL}${MUKU_EXPORT_PATH}?dataset=inventory`;
+
+    await expect(transport(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${testKey}` },
+    })).rejects.toMatchObject({ code: 'MUKU_LOCAL_EGRESS_REQUEST_REJECTED' });
+    await expect(transport(url, { method: 'GET' })).rejects.toMatchObject({
+      code: 'MUKU_LOCAL_EGRESS_REQUEST_REJECTED',
+    });
+    expect(underlyingFetch).not.toHaveBeenCalled();
   });
 });
 

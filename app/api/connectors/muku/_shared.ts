@@ -5,6 +5,7 @@ import {
   MukuConnectorError,
   sanitizedMukuConnectorError,
 } from '../../../../lib/connectors/muku/errors';
+import { createMukuLocalEgressFetch } from '../../../../lib/connectors/muku/local-egress';
 import { HttpError, jsonError } from '../../../../lib/db';
 import { MUKU_SYNC_DATASETS, type MukuSyncDataset } from '../../../../lib/muku-sync-service';
 
@@ -12,7 +13,7 @@ export const NO_STORE_HEADERS = { 'Cache-Control': 'no-store' } as const;
 
 export function createMukuClient() {
   const config = resolveMukuConfig(env as unknown as Record<string, unknown>);
-  return new MukuDashboardClient(config);
+  return new MukuDashboardClient(config, createMukuLocalEgressFetch(config));
 }
 
 export function hasMukuConfiguration() {
@@ -21,7 +22,9 @@ export function hasMukuConfiguration() {
     return true;
   } catch (error) {
     if (error instanceof MukuConnectorError
-      && (error.code === 'MUKU_CONFIG_MISSING' || error.code === 'MUKU_BASE_URL_INVALID')) {
+      && (error.code === 'MUKU_CONFIG_MISSING'
+        || error.code === 'MUKU_BASE_URL_INVALID'
+        || error.code === 'MUKU_LOCAL_EGRESS_INVALID')) {
       return false;
     }
     throw error;
@@ -31,7 +34,9 @@ export function hasMukuConfiguration() {
 export function mukuErrorResponse(error: unknown) {
   if (error instanceof MukuConnectorError) {
     const safe = sanitizedMukuConnectorError(error);
-    const status = error.code === 'MUKU_CONFIG_MISSING' || error.code === 'MUKU_BASE_URL_INVALID'
+    const status = error.code === 'MUKU_CONFIG_MISSING'
+      || error.code === 'MUKU_BASE_URL_INVALID'
+      || error.code === 'MUKU_LOCAL_EGRESS_INVALID'
       ? 503
       : error.status === 401 || error.status === 403
         ? 502

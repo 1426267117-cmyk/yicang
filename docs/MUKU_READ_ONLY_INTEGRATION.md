@@ -45,3 +45,16 @@ MUKU 清单中其余数据集已识别，后续按业务阶段接入：履约单
 4. 在“MUKU 只读库存”和“库存风险”页签核对记录数、数据时间、时区和来源状态。
 
 部署环境需要单独配置相同名称的 Secret；本地 `.env.local` 不会自动上传，也不得提交到 Git。
+
+### 本地 Workerd 网络出口
+
+本地 Miniflare/Workerd 的 `fetch` 不使用系统 `HTTPS_PROXY` 时，MUKU 前的 WAF 可能拒绝它的直连请求。开发环境可选使用 Vite 的本机出口：
+
+1. 在本机 `.env.local` 增加
+   `MUKU_LOCAL_EGRESS_URL=http://127.0.0.1:3000/__muku-local-egress/v1/export`。
+2. 在启动 Vite 的同一 Node 进程中设置 `NODE_USE_ENV_PROXY=1`，并确保系统 `HTTPS_PROXY` 已配置，然后运行 `npm run dev`。
+3. 再从 ERP 页面执行“测试连接”。
+
+该出口仅在 Vite `serve` 模式注册，只接受本机 loopback 请求。它把请求固定到 MUKU 官方域名的唯一 `GET /api/integrations/erp/v1/export` 路径，并且限制数据集、查询参数、重定向、JSON 响应和 8 MiB 响应上限。`Authorization` 仅在内存中转发，不会记录；浏览器始终只请求 ERP，不直连 MUKU。
+
+生产部署不要配置 `MUKU_LOCAL_EGRESS_URL`。变量留空时，ERP 后端会直接请求 MUKU 的 HTTPS 出口。

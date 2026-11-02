@@ -2,6 +2,10 @@ import { sha256Hex, stableJson } from '../stable';
 import { MukuDashboardConfig } from './config';
 import { MukuConnectorError } from './errors';
 import {
+  MUKU_EXPORT_PATH,
+  MUKU_LOCAL_EGRESS_CLIENT_CONNECT_TIMEOUT_MILLISECONDS,
+} from './local-egress';
+import {
   MUKU_DATASETS,
   isMukuBusinessDatasetId,
   isMukuDatasetId,
@@ -29,7 +33,6 @@ type ClientOptions = {
 
 type UnknownResponse = Record<string, unknown>;
 
-const EXPORT_PATH = '/api/integrations/erp/v1/export';
 const defaultFetch: FetchLike = (input, init) => globalThis.fetch(input, init);
 
 export class MukuDashboardClient {
@@ -55,7 +58,7 @@ export class MukuDashboardClient {
     this.#random = random;
     this.#connectTimeoutMilliseconds = positiveInteger(
       options.connectTimeoutMilliseconds,
-      10_000,
+      config.localEgressUrl ? MUKU_LOCAL_EGRESS_CLIENT_CONNECT_TIMEOUT_MILLISECONDS : 10_000,
     );
     this.#readTimeoutMilliseconds = positiveInteger(options.readTimeoutMilliseconds, 30_000);
     this.#maxAttempts = boundedInteger(options.maxAttempts, 4, 1, 4);
@@ -284,7 +287,7 @@ export class MukuDashboardClient {
   }
 
   private buildUrl(dataset: string, parameters: MukuPageRequest) {
-    const url = new URL(EXPORT_PATH, `${this.#config.baseUrl}/`);
+    const url = new URL(MUKU_EXPORT_PATH, `${this.#config.baseUrl}/`);
     url.searchParams.set('dataset', dataset);
     for (const [key, value] of Object.entries(parameters)) {
       if (value === undefined) continue;
