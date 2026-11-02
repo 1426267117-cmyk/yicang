@@ -43,7 +43,12 @@ type RunRow = {
 
 export async function testMukuConnection(client: MukuClient) {
   const manifest = await client.verifyManifest();
-  return sanitizeManifest(manifest);
+  return {
+    ...sanitizeManifest(manifest),
+    configured: true as const,
+    connected: true as const,
+    status: 'idle' as const,
+  };
 }
 
 export async function syncMukuDatasets(input: {
@@ -104,7 +109,7 @@ async function syncOneDataset(input: {
   try {
     const exported = await input.client.getAllPages<MukuRecord>(input.dataset, {}, {
       pageSize: 500,
-      maxPages: 10_000,
+      maxPages: 1_000,
     });
     validateExport(input.dataset, exported);
     if (exported.data.length === 0) {

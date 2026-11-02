@@ -1433,7 +1433,8 @@ function normalizeMukuStatus(value: unknown): MukuStatus {
   return {
     ok: true,
     configured,
-    connected: readBoolean(root.connected, data.connected, statusObject.connected, connector.connected) ?? (configured && status !== 'failed'),
+    connected: readBoolean(root.connected, data.connected, statusObject.connected, connector.connected)
+      ?? (configured && (status === 'succeeded' || status === 'idle')),
     readOnly: true,
     apiVersion: readString(root.apiVersion, root.api_version, data.apiVersion, statusObject.apiVersion, connector.apiVersion, ...datasetRows.map((row) => row.apiVersion)),
     datasetCount: Math.max(0, Math.trunc(readNumber(root.datasetCount, root.dataset_count, data.datasetCount, statusObject.datasetCount, connector.datasetCount) ?? rawDatasets.length)),

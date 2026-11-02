@@ -15,6 +15,19 @@ export function createMukuClient() {
   return new MukuDashboardClient(config);
 }
 
+export function hasMukuConfiguration() {
+  try {
+    resolveMukuConfig(env as unknown as Record<string, unknown>);
+    return true;
+  } catch (error) {
+    if (error instanceof MukuConnectorError
+      && (error.code === 'MUKU_CONFIG_MISSING' || error.code === 'MUKU_BASE_URL_INVALID')) {
+      return false;
+    }
+    throw error;
+  }
+}
+
 export function mukuErrorResponse(error: unknown) {
   if (error instanceof MukuConnectorError) {
     const safe = sanitizedMukuConnectorError(error);
