@@ -5,6 +5,7 @@ export type OrderSourceReadinessInput = {
   lastSuccessfulSyncAt: string | null;
   syncLastSuccessAt: string | null;
   syncStatus: string | null;
+  completedWatermark: string | null;
 };
 
 export type OrderSourceReadiness = {
@@ -13,6 +14,8 @@ export type OrderSourceReadiness = {
   identityVerified: boolean;
   lastSuccessAt: string | null;
   ageMinutes: number | null;
+  completedWatermarkAt: string | null;
+  watermarkAgeMinutes: number | null;
   reasons: string[];
 };
 
@@ -51,6 +54,25 @@ export function evaluateOrderSourceReadiness(
     else if (ageMinutes !== null && ageMinutes > options.maxAgeMinutes) reasons.push('order_sync_stale');
   }
   if (official && source.syncStatus === 'failed') reasons.push('order_sync_failed');
+  else if (official && source.syncStatus === 'running') reasons.push('order_sync_in_progress');
+  else if (official && source.syncStatus !== 'idle') reasons.push('order_sync_state_unknown');
+
+  const suppliedWatermark = Boolean(source.completedWatermark);
+  const watermarkTime = validTimestamp(source.completedWatermark);
+  const completedWatermarkAt = watermarkTime === null ? null : new Date(watermarkTime).toISOString();
+  const watermarkAgeMinutes = checkedAt === null || watermarkTime === null
+    ? null
+    : roundMinutes(checkedAt - watermarkTime);
+  if (official && !suppliedWatermark) {
+    reasons.push('order_sync_watermark_unknown');
+  } else if (official && watermarkTime === null) {
+    reasons.push('order_sync_watermark_invalid');
+  } else if (official && checkedAt !== null && watermarkTime !== null) {
+    if (watermarkTime > checkedAt) reasons.push('order_sync_watermark_in_future');
+    else if (watermarkAgeMinutes !== null && watermarkAgeMinutes > options.maxAgeMinutes) {
+      reasons.push('order_sync_watermark_stale');
+    }
+  }
 
   return {
     official,
@@ -58,6 +80,8 @@ export function evaluateOrderSourceReadiness(
     identityVerified,
     lastSuccessAt,
     ageMinutes,
+    completedWatermarkAt,
+    watermarkAgeMinutes,
     reasons,
   };
 }

@@ -74,12 +74,12 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     await applyMigrations(db);
     await seedMembers(db);
     demandId = await seedDemand(db, 9);
-    await seedFreshInventory(db, { availableQty: 6, inboundQty: 99 });
+    await seedFreshInventory(db, { availableQty: 6, inboundQty: 0 });
   });
 
   afterEach(async () => { await mf.dispose(); });
 
-  it('没有显式或唯一映射时 fail-closed；人工映射后按订单缺口建议且在途不扣', async () => {
+  it('没有显式或唯一映射时 fail-closed；人工映射后按订单缺口建议', async () => {
     const blocked = await getPurchasePlanning(db, user, { now });
     expect(blocked.rows).toHaveLength(1);
     expect(blocked.rows[0]).toEqual(expect.objectContaining({
@@ -95,7 +95,7 @@ describe('真实订单 + MUKU 库存采购计划', () => {
       unknownRecommendationRows: 1,
     }));
     expect(blocked.mappingExceptions.muku[0]).toEqual(expect.objectContaining({
-      mukuSku: 'MUKU-CHAIR', availableQty: 6, inboundQty: 99,
+      mukuSku: 'MUKU-CHAIR', availableQty: 6, inboundQty: 0,
     }));
 
     await upsertMukuSkuMapping(db, user, {
@@ -109,12 +109,19 @@ describe('真实订单 + MUKU 库存采购计划', () => {
       mukuSku: 'DIFFERENT-SKU', skuId: 'sku-service',
     }, 'map-muku-chair-0001')).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
     const ready = await getPurchasePlanning(db, user, { now });
+    expect(ready.storeCoverage).toEqual({
+      mode: 'pilot',
+      candidateStoreCount: 4,
+      activeOfficialStoreCount: 1,
+      activeStoreKeys: ['bizfurniz'],
+      missingCandidateStoreKeys: ['zimasya', 'kaguyasu', 'anzhap'],
+    });
     expect(ready.rows[0]).toEqual(expect.objectContaining({
       decision: 'buy',
       mukuMatchStatus: 'manual',
       orderDemandQty: 9,
       mukuAvailableQty: 6,
-      mukuInboundQty: 99,
+      mukuInboundQty: 0,
       sales30d: null,
       safetyStockQty: null,
       recommendedQty: 3,
@@ -319,7 +326,7 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     expect(staleSource.rows[0].blockers).toContain('inventory_source_stale');
   });
 
-  it('HYZ 仅有 5 件 MUKU 在途时，人工 0 解锁可用量但在途继续只展示不抵扣', async () => {
+  it('HYZ 仅有 5 件未对账 MUKU 在途时，即使人工确认可用量也阻断自动采购', async () => {
     await db.prepare(`
       UPDATE skus SET code = 'HYZ-046-01', name = 'HYZ 测试商品'
       WHERE tenant_id = ? AND id = 'sku-service'
@@ -356,21 +363,22 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     }, 'confirm-hyz-zero-0001', { now });
     const confirmed = await getPurchasePlanning(db, user, { now });
     expect(confirmed.rows[0]).toEqual(expect.objectContaining({
-      decision: 'buy',
+      decision: 'blocked',
       mukuAvailableQty: null,
       effectiveAvailableQty: 0,
       availableQtySource: 'manual_confirmation',
       mukuInboundQty: 5,
-      recommendedQty: 9,
+      recommendedQty: null,
     }));
     expect(confirmed.rows[0].blockers).not.toContain('muku_sku_missing_from_snapshot');
     expect(confirmed.rows[0].blockers).not.toContain('muku_available_unknown');
     expect(confirmed.rows[0].blockers).not.toContain('inventory_source_time_unknown');
+    expect(confirmed.rows[0].blockers).toContain('muku_inbound_unreconciled');
     expect(confirmed.rows[0].calculationParts).toEqual(expect.objectContaining({
       effectiveAvailableQty: 0,
       mukuInboundQty: 5,
       mukuInboundDeducted: false,
-      rawOrderGapQty: 9,
+      rawOrderGapQty: null,
     }));
   });
 
@@ -502,12 +510,16 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     }, 'issue-plan-po-0001', { planningNow: now });
     const postedReceipt = await createPurchaseReceipt(db, user, purchaseOrder.purchaseOrder.id, {
       warehouseId: warehouse.warehouse.id,
-      receivedAt: '2026-11-02T10:05:00.000Z',
+      receivedAt: '2026-11-02T09:00:00.000Z',
       lines: [{
         purchaseOrderLineId: purchaseOrder.purchaseOrder.lines[0].id,
         quantity: 3,
       }],
     }, 'receive-plan-po-0001');
+    await db.prepare(`
+      UPDATE purchase_receipts SET created_at = '2026-11-02T10:07:00.000Z'
+      WHERE tenant_id = ? AND id = ?
+    `).bind(tenantId, postedReceipt.receipt.id).run();
     const waitingForMuku = await getPurchasePlanning(db, user, { now });
     expect(waitingForMuku.rows[0]).toEqual(expect.objectContaining({
       decision: 'blocked',
@@ -520,6 +532,16 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     await db.prepare(`
       UPDATE muku_inventory_records
       SET available_qty = 6, source_updated_at = '2026-11-02T10:06:00.000Z'
+      WHERE tenant_id = ? AND snapshot_id = 'snapshot-inventory'
+    `).bind(tenantId).run();
+    const stillBeforePosting = await getPurchasePlanning(db, user, { now });
+    expect(stillBeforePosting.rows[0].blockers).toContain('receipt_not_reflected_in_muku');
+    expect(stillBeforePosting.rows[0].sourceTimes).toEqual(expect.objectContaining({
+      latestInventoryEventAt: '2026-11-02T10:07:00.000Z',
+    }));
+    await db.prepare(`
+      UPDATE muku_inventory_records
+      SET available_qty = 6, source_updated_at = '2026-11-02T10:08:00.000Z'
       WHERE tenant_id = ? AND snapshot_id = 'snapshot-inventory'
     `).bind(tenantId).run();
     const reflected = await getPurchasePlanning(db, user, { now });
@@ -539,6 +561,10 @@ describe('真实订单 + MUKU 库存采购计划', () => {
       }],
     }, 'correct-plan-receipt-0001');
     await db.prepare(`
+      UPDATE purchase_receipt_corrections SET created_at = '2026-11-02T10:09:00.000Z'
+      WHERE tenant_id = ? AND purchase_receipt_id = ?
+    `).bind(tenantId, postedReceipt.receipt.id).run();
+    await db.prepare(`
       UPDATE muku_inventory_records
       SET available_qty = 3, source_updated_at = '2026-11-02T10:00:00.000Z'
       WHERE tenant_id = ? AND snapshot_id = 'snapshot-inventory'
@@ -549,7 +575,17 @@ describe('真实订单 + MUKU 库存采购计划', () => {
       erpReceivedQty: 0,
     }));
     expect(afterFullCorrection.rows[0].sourceTimes.latestReceiptAt).toBeNull();
-    expect(afterFullCorrection.rows[0].blockers).not.toContain('receipt_not_reflected_in_muku');
+    expect(afterFullCorrection.rows[0].sourceTimes.latestInventoryEventAt)
+      .toBe('2026-11-02T10:09:00.000Z');
+    expect(afterFullCorrection.rows[0].blockers).toContain('receipt_not_reflected_in_muku');
+
+    await db.prepare(`
+      UPDATE muku_inventory_records
+      SET available_qty = 3, source_updated_at = '2026-11-02T10:10:00.000Z'
+      WHERE tenant_id = ? AND snapshot_id = 'snapshot-inventory'
+    `).bind(tenantId).run();
+    const correctionReflected = await getPurchasePlanning(db, user, { now });
+    expect(correctionReflected.rows[0].blockers).not.toContain('receipt_not_reflected_in_muku');
 
     await executePurchaseOrderAction(db, buyerUser, purchaseOrder.purchaseOrder.id, {
       action: 'close', note: '供应商无法继续交付，释放剩余需求重新安排',
@@ -814,6 +850,38 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     });
   });
 
+  it('订单同步中或仅完成历史窗口时，不能把订单源判为可采购', async () => {
+    await upsertMukuSkuMapping(db, user, {
+      mukuSku: 'MUKU-CHAIR', skuId: 'sku-service',
+    }, 'map-order-watermark-0001');
+    await db.prepare(`
+      UPDATE connector_sync_state
+      SET status = 'running', updated_at = ?
+      WHERE tenant_id = ? AND connector = 'shopify' AND resource = 'orders'
+    `).bind(now.toISOString(), tenantId).run();
+    const running = await getPurchasePlanning(db, user, { now });
+    expect(running.orderSourceReadiness).toBe(false);
+    expect(running.orderSourceBlockers).toContain('order_sync_in_progress');
+
+    await db.prepare(`
+      UPDATE connector_sync_state
+      SET status = 'idle', completed_watermark = '2026-10-01T00:00:00.000Z',
+          last_success_at = ?, updated_at = ?
+      WHERE tenant_id = ? AND connector = 'shopify' AND resource = 'orders'
+    `).bind(now.toISOString(), now.toISOString(), tenantId).run();
+    await db.prepare(`
+      UPDATE platform_stores SET last_successful_sync_at = ?, updated_at = ?
+      WHERE tenant_id = ?
+    `).bind(now.toISOString(), now.toISOString(), tenantId).run();
+    const historicalWindow = await getPurchasePlanning(db, user, { now });
+    expect(historicalWindow.orderSourceReadiness).toBe(false);
+    expect(historicalWindow.orderSourceBlockers).toContain('order_sync_watermark_stale');
+    expect(historicalWindow.orderSources[0]).toEqual(expect.objectContaining({
+      completedWatermarkAt: '2026-10-01T00:00:00.000Z',
+      ready: false,
+    }));
+  });
+
   it('MOQ/包装取整超过订单缺口时后端拒绝生成低于策略量的申请', async () => {
     await upsertMukuSkuMapping(db, user, {
       mukuSku: 'MUKU-CHAIR', skuId: 'sku-service',
@@ -869,11 +937,18 @@ async function createManualInventoryPlannedRequest(db: D1Database, key: string) 
 
 async function refreshOfficialOrderSourceAt(db: D1Database, timestamp: Date) {
   const value = timestamp.toISOString();
-  await db.prepare(`
-    UPDATE platform_stores
-    SET last_successful_sync_at = ?, updated_at = ?
-    WHERE tenant_id = ?
-  `).bind(value, value, tenantId).run();
+  await db.batch([
+    db.prepare(`
+      UPDATE platform_stores
+      SET last_successful_sync_at = ?, updated_at = ?
+      WHERE tenant_id = ?
+    `).bind(value, value, tenantId),
+    db.prepare(`
+      UPDATE connector_sync_state
+      SET status = 'idle', completed_watermark = ?, last_success_at = ?, updated_at = ?
+      WHERE tenant_id = ? AND connector = 'shopify' AND resource = 'orders'
+    `).bind(value, value, value, tenantId),
+  ]);
 }
 
 async function seedMembers(db: D1Database) {
@@ -908,6 +983,22 @@ async function seedDemand(db: D1Database, quantity: number) {
     '2026-11-02T10:00:00.000Z',
     storeId,
     tenantId,
+  ).run();
+  await db.prepare(`
+    INSERT INTO connector_sync_state (
+      id, tenant_id, platform_store_id, connector, resource, completed_watermark,
+      active_window_start, active_window_end, next_page_cursor, overlap_seconds,
+      status, last_run_id, last_success_at, last_error_code, last_error_at, updated_at
+    ) VALUES (
+      'sync-state-orders', ?, ?, 'shopify', 'orders', ?,
+      NULL, NULL, NULL, 21600, 'idle', NULL, ?, NULL, NULL, ?
+    )
+  `).bind(
+    tenantId,
+    storeId,
+    '2026-11-02T10:00:00.000Z',
+    '2026-11-02T10:00:00.000Z',
+    '2026-11-02T10:00:00.000Z',
   ).run();
   const graph = shopifyOrderFixture({
     updatedAt: '2026-11-02T09:02:00Z',

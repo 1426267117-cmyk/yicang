@@ -14,6 +14,8 @@ describe('shared official order source readiness', () => {
       identityVerified: true,
       lastSuccessAt: '2026-11-02T09:50:00.000Z',
       ageMinutes: 10,
+      completedWatermarkAt: '2026-11-02T09:50:00.000Z',
+      watermarkAgeMinutes: 10,
       reasons: [],
     });
   });
@@ -55,6 +57,32 @@ describe('shared official order source readiness', () => {
       reasons: ['order_sync_time_invalid'],
     });
   });
+
+  it('requires an idle completed sync whose data watermark is current', () => {
+    expect(evaluateOrderSourceReadiness(source({
+      syncStatus: 'running',
+    }), { checkedAt, maxAgeMinutes: 30 })).toMatchObject({
+      ready: false,
+      reasons: ['order_sync_in_progress'],
+    });
+
+    expect(evaluateOrderSourceReadiness(source({
+      lastSuccessfulSyncAt: '2026-11-02T09:59:00.000Z',
+      syncLastSuccessAt: '2026-11-02T09:59:00.000Z',
+      completedWatermark: '2026-10-01T00:00:00.000Z',
+    }), { checkedAt, maxAgeMinutes: 30 })).toMatchObject({
+      ready: false,
+      completedWatermarkAt: '2026-10-01T00:00:00.000Z',
+      reasons: ['order_sync_watermark_stale'],
+    });
+
+    expect(evaluateOrderSourceReadiness(source({
+      completedWatermark: null,
+    }), { checkedAt, maxAgeMinutes: 30 })).toMatchObject({
+      ready: false,
+      reasons: ['order_sync_watermark_unknown'],
+    });
+  });
 });
 
 function source(overrides: Partial<{
@@ -64,6 +92,7 @@ function source(overrides: Partial<{
   lastSuccessfulSyncAt: string | null;
   syncLastSuccessAt: string | null;
   syncStatus: string | null;
+  completedWatermark: string | null;
 }> = {}) {
   return {
     credentialRef: 'd1:shopify:bizfurniz',
@@ -72,6 +101,7 @@ function source(overrides: Partial<{
     lastSuccessfulSyncAt: '2026-11-02T09:50:00.000Z',
     syncLastSuccessAt: null,
     syncStatus: 'idle',
+    completedWatermark: '2026-11-02T09:50:00.000Z',
     ...overrides,
   };
 }

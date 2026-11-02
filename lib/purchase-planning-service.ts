@@ -10,6 +10,7 @@ import { HttpError, requirePermission, type UserContext } from './db';
 import { evaluateMukuFreshness } from './muku-freshness-service';
 import { evaluateOrderSourceReadiness } from './order-source-readiness';
 import { buildProcurementOperationsStatus } from './procurement-operations';
+import { SHOPIFY_STORE_CANDIDATES } from './connectors/shopify/config';
 import {
   createPurchaseRequestFromAllocations,
   getPurchaseRequest,
@@ -40,6 +41,7 @@ type ActiveRequestLineRow = {
   ordered_quantity: number | null;
   received_quantity: number | null;
   latest_receipt_at: string | null;
+  latest_inventory_event_at: string | null;
 };
 type MappingRow = {
   id: string;
@@ -107,6 +109,7 @@ type OrderSourceRow = {
   last_successful_sync_at: string | null;
   sync_status: string | null;
   sync_last_success_at: string | null;
+  completed_watermark: string | null;
   sync_last_error_code: string | null;
   sync_last_error_at: string | null;
 };
@@ -218,6 +221,30 @@ export async function getPurchasePlanning(
                 AND correction.status = 'posted'
             ), 0)
         ) AS latest_receipt_at
+        ,(
+          SELECT MAX(inventory_event.event_at)
+          FROM (
+            SELECT MAX(receipt.received_at, receipt.created_at) AS event_at
+            FROM purchase_receipt_lines receipt_line
+            JOIN purchase_receipts receipt
+              ON receipt.id = receipt_line.purchase_receipt_id
+              AND receipt.tenant_id = receipt_line.tenant_id
+            WHERE receipt_line.tenant_id = line.tenant_id
+              AND receipt_line.purchase_order_line_id = pol.id
+            UNION ALL
+            SELECT correction.created_at AS event_at
+            FROM purchase_receipt_correction_lines correction_line
+            JOIN purchase_receipt_corrections correction
+              ON correction.id = correction_line.correction_id
+              AND correction.tenant_id = correction_line.tenant_id
+            JOIN purchase_receipt_lines receipt_line
+              ON receipt_line.id = correction_line.purchase_receipt_line_id
+              AND receipt_line.tenant_id = correction_line.tenant_id
+            WHERE correction_line.tenant_id = line.tenant_id
+              AND receipt_line.purchase_order_line_id = pol.id
+              AND correction.status = 'posted'
+          ) inventory_event
+        ) AS latest_inventory_event_at
       FROM purchase_request_lines line
       JOIN purchase_requests pr
         ON pr.id = line.request_id AND pr.tenant_id = line.tenant_id
@@ -274,6 +301,7 @@ export async function getPurchasePlanning(
              store.last_successful_sync_at,
              state.status AS sync_status,
              state.last_success_at AS sync_last_success_at,
+             state.completed_watermark,
              state.last_error_code AS sync_last_error_code,
              state.last_error_at AS sync_last_error_at
       FROM platform_stores store
@@ -421,6 +449,7 @@ export async function getPurchasePlanning(
       lastSuccessfulSyncAt: source.last_successful_sync_at,
       syncLastSuccessAt: source.sync_last_success_at,
       syncStatus: source.sync_status,
+      completedWatermark: source.completed_watermark,
     }, {
       checkedAt: freshness.checkedAt,
       maxAgeMinutes: orderSyncMaxAgeMinutes,
@@ -435,6 +464,8 @@ export async function getPurchasePlanning(
       ready: sourceReadiness.ready,
       lastSuccessAt: sourceReadiness.lastSuccessAt,
       ageMinutes: sourceReadiness.ageMinutes,
+      completedWatermarkAt: sourceReadiness.completedWatermarkAt,
+      watermarkAgeMinutes: sourceReadiness.watermarkAgeMinutes,
       syncStatus: source.sync_status ?? 'not_started',
       lastErrorCode: source.sync_last_error_code,
       lastErrorAt: source.sync_last_error_at,
@@ -442,9 +473,13 @@ export async function getPurchasePlanning(
     };
   });
   const officialOrderSources = orderSources.filter((source) => source.official);
-  const orderSourceBlockers: string[] = [];
-  if (officialOrderSources.length === 0) orderSourceBlockers.push('no_official_order_source');
-  if (officialOrderSources.some((source) => !source.ready)) orderSourceBlockers.push('order_sync_stale');
+  const activeShopifyOrderSources = officialOrderSources.filter(
+    (source) => source.platform === 'shopify',
+  );
+  const orderSourceBlockers = [...new Set([
+    ...(officialOrderSources.length === 0 ? ['no_official_order_source'] : []),
+    ...officialOrderSources.flatMap((source) => source.reasons),
+  ])];
   const orderSourceReadiness = orderSourceBlockers.length === 0;
   const readiness = !freshness.readyForProcurement
     ? 'stale' as const
@@ -470,7 +505,18 @@ export async function getPurchasePlanning(
       coverage: '有效可用库存（MUKU 优先，缺失时可用有效人工确认）+ ERP 采购链覆盖量',
       recommendation: 'max(0, target - coverage)，再按 MOQ/包装量展示建议',
       deduplication: '无有效采购单时按 active purchase_request_line；有采购单后仅按 ordered-received，采购单不再重复扣减',
-      mukuInbound: 'MUKU 在途仅展示，不参与扣减，直至能证明不与 ERP 采购链重叠',
+      mukuInbound: 'MUKU 在途不直接扣减；非零且未逐笔证明不与 ERP 采购链重叠时，阻断自动采购',
+    },
+    storeCoverage: {
+      mode: activeShopifyOrderSources.length < SHOPIFY_STORE_CANDIDATES.length
+        ? 'pilot' as const
+        : 'full' as const,
+      candidateStoreCount: SHOPIFY_STORE_CANDIDATES.length,
+      activeOfficialStoreCount: activeShopifyOrderSources.length,
+      activeStoreKeys: activeShopifyOrderSources.map((source) => source.storeKey),
+      missingCandidateStoreKeys: SHOPIFY_STORE_CANDIDATES
+        .map((candidate) => candidate.key)
+        .filter((storeKey) => !activeShopifyOrderSources.some((source) => source.storeKey === storeKey)),
     },
     orderSourceReadiness,
     orderSourceMaxAgeMinutes: orderSyncMaxAgeMinutes,
@@ -631,10 +677,13 @@ async function buildPlanningRow(input: {
       ? 'manual_confirmation' as const
       : 'unknown' as const;
   const latestReceiptAt = latestTimestamp(input.activeLines.map((line) => line.latest_receipt_at));
-  const receiptReflectedInMuku = latestReceiptAt === null
+  const latestInventoryEventAt = latestTimestamp(
+    input.activeLines.map((line) => line.latest_inventory_event_at),
+  );
+  const receiptReflectedInMuku = latestInventoryEventAt === null
     ? null
     : inventoryRecordUpdatedAt !== null
-      && Date.parse(inventoryRecordUpdatedAt) >= Date.parse(latestReceiptAt);
+      && Date.parse(inventoryRecordUpdatedAt) >= Date.parse(latestInventoryEventAt);
   const riskUsable = Boolean(input.riskDataset?.fresh && input.riskDataset.activeSnapshotId);
   const sales30d = riskUsable
     ? aggregateNullable(sourceDetails, (source) => source.sales30d)
@@ -664,8 +713,11 @@ async function buildPlanningRow(input: {
   if (!manualInventoryFallbackUsed && input.assignments.length > 0 && mukuAvailableQty === null) {
     blockers.push('muku_available_unknown');
   }
-  if (latestReceiptAt !== null && receiptReflectedInMuku !== true) {
+  if (latestInventoryEventAt !== null && receiptReflectedInMuku !== true) {
     blockers.push('receipt_not_reflected_in_muku');
+  }
+  if (mukuInboundQty !== null && mukuInboundQty > 0) {
+    blockers.push('muku_inbound_unreconciled');
   }
   if (!manualInventoryFallbackUsed && inventorySourceFreshness === 'unknown') {
     blockers.push('inventory_source_time_unknown');
@@ -731,8 +783,8 @@ async function buildPlanningRow(input: {
       ? 'MUKU 全仓汇总可用量未知；当前未按区域或仓库可调拨性过滤。'
       : `MUKU 全仓汇总可用量 ${mukuAvailableQty} 件；当前未按区域或仓库可调拨性过滤。`,
     `ERP 采购链覆盖 ${erpPurchaseChainCoverageQty} 件；无有效采购单时按申请量，有采购单后仅按未收量，采购单不再重复扣减。`,
-    '发生收货时，只有 MUKU 库存源时间已越过到货时间才继续计算；否则阻断建议，避免刷新窗口重复采购。',
-    'MUKU 在途仅展示，不参与抵扣，避免与 ERP 采购链重复计算。',
+    '发生收货或冲正时，只有 MUKU 库存源时间已越过 ERP 实际入账事件才继续计算；否则阻断建议。',
+    'MUKU 在途不直接抵扣；非零且尚未与 ERP 采购单逐笔对账时阻断自动采购。',
   ];
   if (manualInventoryFallbackUsed) {
     explanations.push(
@@ -774,6 +826,7 @@ async function buildPlanningRow(input: {
       orderedQuantity: line.ordered_quantity,
       receivedQuantity: line.received_quantity,
       latestReceiptAt: line.latest_receipt_at,
+      latestInventoryEventAt: line.latest_inventory_event_at,
     })),
     mappings: sourceDetails,
     ambiguousMukuSkus: [...input.ambiguousMukuSkus].sort(),
@@ -872,6 +925,7 @@ async function buildPlanningRow(input: {
       inventorySourceFreshness,
       inventorySourceMaxAgeMinutes: input.sourceFreshnessMaxAgeMinutes,
       latestReceiptAt,
+      latestInventoryEventAt,
       receiptReflectedInMuku,
       riskGeneratedAt: input.riskDataset?.generatedAt ?? null,
       riskLastSuccessAt: input.riskDataset?.lastSuccessAt ?? null,

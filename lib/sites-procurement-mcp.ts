@@ -49,6 +49,7 @@ type ShopifyFreshnessRow = {
   last_successful_sync_at: string | null;
   sync_status: string | null;
   sync_last_success_at: string | null;
+  completed_watermark: string | null;
 };
 
 type SafeTenantFreshness = {
@@ -426,7 +427,8 @@ async function readShopifyFreshness(
   const rows = await db.prepare(`
     SELECT store.connector_key, store.credential_ref, store.identity_verified_at,
            store.last_successful_sync_at, state.status AS sync_status,
-           state.last_success_at AS sync_last_success_at
+           state.last_success_at AS sync_last_success_at,
+           state.completed_watermark
     FROM platform_stores store
     LEFT JOIN connector_sync_state state
       ON state.platform_store_id = store.id
@@ -461,6 +463,7 @@ export function summarizeShopifyOrderSources(
       lastSuccessfulSyncAt: row.last_successful_sync_at,
       syncLastSuccessAt: row.sync_last_success_at,
       syncStatus: row.sync_status,
+      completedWatermark: row.completed_watermark,
     }, { checkedAt, maxAgeMinutes }),
   }));
   const official = evaluated.filter((source) => source.readiness.official);

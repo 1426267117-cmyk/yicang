@@ -373,6 +373,7 @@ function shopifySource(overrides: Partial<{
   last_successful_sync_at: string | null;
   sync_status: string | null;
   sync_last_success_at: string | null;
+  completed_watermark: string | null;
 }> = {}) {
   return {
     connector_key: 'bizfurniz',
@@ -381,6 +382,7 @@ function shopifySource(overrides: Partial<{
     last_successful_sync_at: '2026-11-02T09:50:00.000Z',
     sync_status: 'idle',
     sync_last_success_at: null,
+    completed_watermark: '2026-11-02T09:50:00.000Z',
     ...overrides,
   };
 }
