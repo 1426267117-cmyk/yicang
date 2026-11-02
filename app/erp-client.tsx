@@ -116,6 +116,94 @@ type PurchaseWorkspacePayload = {
   purchaseReceipts: PurchaseReceipt[]; procurementSummary: ProcurementSummary;
 };
 
+type PurchasePlanningReason = { code: string; dataset?: string; message: string };
+type PurchasePlanningFreshness = {
+  checkedAt: string;
+  status: 'fresh' | 'refreshing' | 'stale' | 'missing';
+  readyForProcurement: boolean;
+  maxAgeMinutes: number;
+  needsRefresh: boolean; refreshDue: boolean; refreshInProgress: boolean;
+  datasets: Array<{
+    dataset: string; requiredForProcurement: boolean; fresh: boolean;
+    generatedAt: string | null; lastSuccessAt: string | null; recordCount: number | null;
+    reasons: PurchasePlanningReason[];
+  }>;
+  blockingReasons: PurchasePlanningReason[];
+};
+type PurchasePlanningRow = {
+  planRowId: string; calculationVersion: string; recommendationVersion: string;
+  skuId: string; skuCode: string; skuName: string;
+  decision: 'buy' | 'no_purchase' | 'blocked';
+  blockers: string[]; warnings: string[]; explanations: string[];
+  mukuMatchStatus: 'manual' | 'exact' | 'unmapped' | 'ambiguous';
+  ambiguousMukuSkus: string[];
+  mukuSkus: Array<{
+    sku: string; mappingSource: 'manual' | 'exact'; availableQty: number | null;
+    inboundQty: number | null; sales30d: number | null; inventoryRecordCount: number;
+    inventorySourceUpdatedAt: string | null; riskSourceUpdatedAt: string | null;
+  }>;
+  orderDemandQty: number; activeRequestQty: number; unallocatedDemandQty: number;
+  mukuAvailableQty: number | null; mukuInboundQty: number | null;
+  inventoryScope: 'all_muku_warehouses';
+  erpPurchaseChainCoverageQty: number; erpOpenPoQty: number; erpReceivedQty: number;
+  sales30d: number | null; safetyDays: number; safetyStockQty: number | null;
+  safetyStockBasis: 'explicit' | 'sales30d' | 'unknown';
+  rawGapQty: number | null; recommendedQty: number | null;
+  policy: {
+    moq: number | null; packSize: number | null; leadTimeDays: number | null;
+    preferredSupplierId: string | null; preferredSupplierName: string | null;
+  };
+  calculationParts: {
+    orderDemandQty: number; safetyStockQty: number | null; mukuAvailableQty: number | null;
+    erpPurchaseChainCoverageQty: number; mukuInboundQty: number | null;
+    mukuInboundDeducted: false; erpOpenPoDeductedSeparately: false;
+    rawOrderGapQty: number | null; rawTotalGapQty: number | null;
+    moq: number | null; packSize: number | null; roundedRecommendedQty: number | null;
+  };
+  sourceTimes: {
+    inventoryGeneratedAt: string | null; inventoryLastSuccessAt: string | null;
+    inventoryRecordUpdatedAt: string | null; riskGeneratedAt: string | null;
+    riskLastSuccessAt: string | null; riskRecordUpdatedAt: string | null;
+    inventoryOldestRecordUpdatedAt: string | null; inventorySourceMaxAgeMinutes: number;
+    latestReceiptAt: string | null; receiptReflectedInMuku: boolean | null;
+  };
+  conversion: {
+    eligibleOrderQty: number; blockedRecommendationQty: number;
+    safetyOnlyQty: number; policyRoundingQty: number;
+    conversionBlocked: boolean; reasons: string[];
+  };
+  demandAllocations: Array<{ demandId: string; quantity: number }>;
+};
+type MukuPlanningException = {
+  mukuSku: string; status: 'unmapped' | 'ambiguous'; candidateSkuIds: string[];
+  availableQty: number | null; inboundQty: number | null;
+};
+type PurchasePlanningPayload = {
+  ok: true; readOnly: true; readiness: 'ready' | 'blocked' | 'stale';
+  orderSourceReadiness: boolean;
+  orderSourceMaxAgeMinutes: number; orderSourceBlockers: string[];
+  orderSources: Array<{
+    storeId: string; platform: string; storeKey: string; storeName: string;
+    official: boolean; ready: boolean; lastSuccessAt: string | null; ageMinutes: number | null;
+    syncStatus: string; lastErrorCode: string | null; reasons: string[];
+  }>;
+  calculationVersion: string;
+  formula: { target: string; coverage: string; recommendation: string; deduplication: string; mukuInbound: string };
+  freshness: PurchasePlanningFreshness;
+  summary: {
+    rows: number; buy: number; noPurchase: number; blocked: number;
+    recommendedQty: number | null; knownRecommendedQty: number; unknownRecommendationRows: number;
+    convertibleOrderQty: number;
+    needsShopifyMapping: number; needsMukuMapping: number;
+  };
+  rows: PurchasePlanningRow[];
+  mappingExceptions: {
+    shopify: Array<{ demandId: string; platform: string; rawSku: string | null; requiredQuantity: number; sourceOrderId: string }>;
+    muku: MukuPlanningException[];
+    erp: Array<{ planRowId: string; skuId: string; skuCode: string; status: 'unmapped' | 'ambiguous'; ambiguousMukuSkus: string[] }>;
+  };
+};
+
 type ShopifyStatus = {
   ok: true; apiVersion: string; readOnly: true;
   stores: Array<{
@@ -158,6 +246,7 @@ type MukuStatus = {
   syncedAt: string | null;
   datasets: MukuDatasetState[];
   sourceStatusCount: number;
+  autoRefresh?: { mode: string; refreshTriggered: boolean; externalScheduleConfigured: boolean };
 };
 type MukuRun = {
   id: string;
@@ -279,6 +368,8 @@ const actionLabel: Record<string, string> = {
   CREATE_SUPPLIER: '新增供应商', CREATE_WAREHOUSE: '新增仓库', CREATE_PURCHASE_ORDER: '生成正式采购单',
   ISSUE_PURCHASE_ORDER: '确认采购下单', CANCEL_PURCHASE_ORDER: '取消采购单',
   POST_PURCHASE_RECEIPT: '采购到货入库',
+  UPSERT_MUKU_SKU_MAPPING: '维护 MUKU SKU 映射', UPSERT_SKU_PROCUREMENT_POLICY: '维护采购策略',
+  CREATE_PURCHASE_REQUEST_FROM_PLAN: '采购建议转申请',
 };
 
 const purchaseDemandStatusLabel: Record<PurchaseDemandStatus, string> = {
@@ -299,7 +390,7 @@ const purchaseOrderStatusLabel: Record<PurchaseOrderStatus, string> = {
   draft: '草稿', issued: '已下单', partially_received: '部分到货', received: '全部到货', cancelled: '已取消',
 };
 
-type PurchaseTab = 'pending' | 'mapping' | 'requests' | 'approved' | 'orders' | 'received' | 'history';
+type PurchaseTab = 'planning' | 'pending' | 'mapping' | 'requests' | 'approved' | 'orders' | 'received' | 'history';
 
 const plannedModules: Record<Exclude<ModuleKey, 'dashboard' | 'platform' | 'orders' | 'inventory'>, {
   title: string; desc: string; source: string;
@@ -328,6 +419,8 @@ export default function ErpClient() {
   const [active, setActive] = useState<ModuleKey>('dashboard');
   const [payload, setPayload] = useState<ErpPayload | null>(null);
   const [purchasePayload, setPurchasePayload] = useState<PurchaseWorkspacePayload | null>(null);
+  const [purchasePlanning, setPurchasePlanning] = useState<PurchasePlanningPayload | null>(null);
+  const [planningError, setPlanningError] = useState('');
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatus | null>(null);
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(true);
@@ -349,10 +442,14 @@ export default function ErpClient() {
   const [mukuBusy, setMukuBusy] = useState('');
   const [mukuError, setMukuError] = useState('');
   const [mukuRefreshKey, setMukuRefreshKey] = useState(0);
-  const [purchaseTab, setPurchaseTab] = useState<PurchaseTab>('pending');
+  const [purchaseTab, setPurchaseTab] = useState<PurchaseTab>('planning');
   const [selectedDemandIds, setSelectedDemandIds] = useState<Set<string>>(new Set());
+  const [selectedPlanRowIds, setSelectedPlanRowIds] = useState<Set<string>>(new Set());
   const [mappingDemand, setMappingDemand] = useState<PurchaseDemand | null>(null);
+  const [planningMapping, setPlanningMapping] = useState<MukuPlanningException | null>(null);
+  const [planningPolicy, setPlanningPolicy] = useState<PurchasePlanningRow | null>(null);
   const [showPurchaseRequest, setShowPurchaseRequest] = useState(false);
+  const [showPlanningRequest, setShowPlanningRequest] = useState(false);
   const [showSupplier, setShowSupplier] = useState(false);
   const [showWarehouse, setShowWarehouse] = useState(false);
   const [purchaseOrderRequest, setPurchaseOrderRequest] = useState<PurchaseRequest | null>(null);
@@ -379,6 +476,18 @@ export default function ErpClient() {
       setSelectedDemandIds((current) => new Set([...current].filter((id) => normalizedPurchase.demands.some(
         (demand) => demand.id === id && demand.status === 'open' && demandAvailableQuantity(demand) > 0,
       ))));
+      const planningResponse = await fetch('/api/purchase/planning', { cache: 'no-store' });
+      const planningBody = await planningResponse.json().catch(() => null) as PurchasePlanningPayload | { message?: string } | null;
+      if (planningResponse.status === 401) { setAuthRequired(true); return; }
+      if (planningResponse.ok && planningBody && 'ok' in planningBody && planningBody.ok === true) {
+        setPurchasePlanning(planningBody);
+        setPlanningError('');
+        setSelectedPlanRowIds((current) => new Set([...current].filter((id) => planningBody.rows.some(
+          (row) => row.planRowId === id && planningRowConvertible(row, planningBody.readiness, planningBody.orderSourceReadiness),
+        ))));
+      } else {
+        setPlanningError(readApiMessage(planningBody, '采购建议暂时无法计算，现有申请和采购单仍可正常使用'));
+      }
       const connectorResponse = await fetch('/api/connectors/shopify/status', { cache: 'no-store' });
       if (connectorResponse.ok) setShopifyStatus(await connectorResponse.json() as ShopifyStatus);
       if (body.user.permissions.includes('connectors:read')) {
@@ -402,6 +511,55 @@ export default function ErpClient() {
     const timer = window.setTimeout(() => { void loadData(); }, 0);
     return () => window.clearTimeout(timer);
   }, [loadData]);
+
+  const shouldPollPurchasePlanning = active === 'purchase' && Boolean(
+    purchasePlanning && !purchasePlanning.freshness.readyForProcurement
+    && (purchasePlanning.freshness.refreshInProgress
+      || purchasePlanning.freshness.refreshDue
+      || mukuStatus?.autoRefresh?.refreshTriggered),
+  );
+
+  useEffect(() => {
+    if (!shouldPollPurchasePlanning) return undefined;
+    let cancelled = false;
+    let attempts = 0;
+    let timer = 0;
+    const poll = async () => {
+      attempts += 1;
+      try {
+        const [planningResponse, statusResponse] = await Promise.all([
+          fetch('/api/purchase/planning', { cache: 'no-store' }),
+          fetch('/api/connectors/muku/status', { cache: 'no-store' }),
+        ]);
+        const planningBody = await planningResponse.json().catch(() => null) as PurchasePlanningPayload | null;
+        const statusBody = await statusResponse.json().catch(() => null);
+        if (cancelled) return;
+        if (statusResponse.ok) setMukuStatus(normalizeMukuStatus(statusBody));
+        if (planningResponse.ok && planningBody?.ok === true) {
+          setPurchasePlanning(planningBody);
+          setSelectedPlanRowIds((current) => new Set([...current].filter((id) => planningBody.rows.some(
+            (row) => row.planRowId === id && planningRowConvertible(row, planningBody.readiness, planningBody.orderSourceReadiness),
+          ))));
+          if (planningBody.freshness.readyForProcurement) {
+            setPlanningError('');
+            return;
+          }
+        }
+      } catch {
+        // 保留上一份有效建议；轮询窗口内继续尝试。
+      }
+      if (attempts < 8) {
+        timer = window.setTimeout(() => { void poll(); }, 5000);
+      } else if (!cancelled) {
+        setPlanningError('MUKU 后台刷新尚未在 40 秒内完成，已保留上一版建议；数据恢复新鲜前不能转采购申请。');
+      }
+    };
+    timer = window.setTimeout(() => { void poll(); }, 4000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [shouldPollPurchasePlanning]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -520,6 +678,18 @@ export default function ErpClient() {
       demand.reasonCode ? (purchaseDemandReasonLabel[demand.reasonCode] ?? demand.reasonCode) : '',
     ].some((value) => value.toLowerCase().includes(term)));
   }, [purchasePayload, query]);
+  const filteredPurchasePlanningRows = useMemo(() => {
+    const rows = purchasePlanning?.rows ?? [];
+    const term = query.trim().toLowerCase();
+    if (!term) return rows;
+    return rows.filter((row) => [
+      row.skuCode,
+      row.skuName,
+      ...row.mukuSkus.map((source) => source.sku),
+      ...row.blockers.map(planningReasonLabel),
+      ...row.warnings.map(planningReasonLabel),
+    ].some((value) => value.toLowerCase().includes(term)));
+  }, [purchasePlanning, query]);
   const filteredPurchaseRequests = useMemo(() => {
     const term = query.trim().toLowerCase();
     if (!term) return purchasePayload?.requests ?? [];
@@ -704,6 +874,113 @@ export default function ErpClient() {
       if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
+  }
+
+  function togglePlanningRow(id: string) {
+    setSelectedPlanRowIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  async function submitPlanningMapping(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!planningMapping) return;
+    const data = new FormData(event.currentTarget);
+    setPurchaseBusy(`planning-mapping:${planningMapping.mukuSku}`); setError('');
+    try {
+      const response = await fetch('/api/purchase/planning/mappings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          mukuSku: planningMapping.mukuSku,
+          skuId: String(data.get('skuId') ?? ''),
+        }),
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiMessage(body, 'MUKU SKU 映射失败'));
+      setPlanningMapping(null);
+      await loadData();
+      flash('MUKU SKU 已映射，采购建议已重新计算');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'MUKU SKU 映射失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
+  async function submitPlanningPolicy(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!planningPolicy) return;
+    const data = new FormData(event.currentTarget);
+    setPurchaseBusy(`planning-policy:${planningPolicy.skuId}`); setError('');
+    try {
+      const response = await fetch('/api/purchase/planning/policies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          skuId: planningPolicy.skuId,
+          safetyDays: Number(data.get('safetyDays')),
+          safetyStockQty: optionalFormInteger(data, 'safetyStockQty'),
+          moq: optionalFormInteger(data, 'moq'),
+          packSize: optionalFormInteger(data, 'packSize'),
+          leadTimeDays: optionalFormInteger(data, 'leadTimeDays'),
+          preferredSupplierId: String(data.get('preferredSupplierId') ?? '').trim() || null,
+        }),
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiMessage(body, '采购策略保存失败'));
+      setPlanningPolicy(null);
+      await loadData();
+      flash('采购策略已保存，建议数量已重新计算');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '采购策略保存失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
+  async function submitPlanningRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!purchasePlanning) return;
+    const data = new FormData(event.currentTarget);
+    const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
+    const intent = submitter?.value === 'submit' ? 'submit' : 'draft';
+    const selections = purchasePlanning.rows
+      .filter((row) => selectedPlanRowIds.has(row.planRowId))
+      .map((row) => ({ planRowId: row.planRowId, recommendationVersion: row.recommendationVersion }));
+    setPurchaseBusy('create-planning-request'); setError('');
+    try {
+      const response = await fetch('/api/purchase/planning/requests', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          selections,
+          purchaserMemberId: String(data.get('purchaserMemberId') ?? ''),
+          reviewerMemberId: String(data.get('reviewerMemberId') ?? ''),
+          note: String(data.get('note') ?? '').trim() || undefined,
+        }),
+      });
+      const body = await response.json().catch(() => null) as { message?: string; request?: { id?: string } } | null;
+      if (!response.ok) {
+        if (response.status === 409) await loadData();
+        throw new Error(readApiMessage(body, response.status === 409
+          ? '建议依据已经变化，页面已刷新，请重新确认'
+          : '采购建议转申请失败'));
+      }
+      if (intent === 'submit') {
+        if (!body?.request?.id) throw new Error('采购申请已创建，但返回结果缺少申请标识，请刷新后提交');
+        const submitResponse = await fetch(`/api/purchase/requests/${body.request.id}/actions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+          body: JSON.stringify({ action: 'submit' }),
+        });
+        const submitBody = await submitResponse.json().catch(() => null);
+        if (!submitResponse.ok) throw new Error(readApiMessage(submitBody, '采购申请已保存为草稿，但提交复审失败'));
+      }
+      setShowPlanningRequest(false); setSelectedPlanRowIds(new Set());
+      await loadData(); setPurchaseTab('requests');
+      flash(intent === 'submit' ? '订单采购缺口已生成申请并提交复审' : '订单采购缺口已保存为申请草稿');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '采购建议转申请失败');
+    } finally { setPurchaseBusy(''); }
   }
 
   async function submitSkuMapping(event: FormEvent<HTMLFormElement>) {
@@ -974,7 +1251,7 @@ export default function ErpClient() {
             {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}
             {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
             {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} source={inventorySource} setSource={switchInventorySource} mukuStatus={mukuStatus} mukuRuns={mukuRuns} mukuInventory={mukuInventory} mukuRisk={mukuRisk} mukuInventoryRows={filteredMukuInventory} mukuRiskRows={filteredMukuRisk} mukuPage={mukuPage} setMukuPage={setMukuPage} mukuFilters={mukuFilters} applyMukuFilters={applyMukuFilters} mukuBusy={mukuBusy} mukuError={mukuError} canRead={can('connectors:read')} canSync={can('connectors:sync')} testConnection={testMukuConnection} syncReadOnly={syncMukuReadOnly} />}
-            {active === 'purchase' && <PurchaseWorkspaceView demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={setReceivingOrder} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
+            {active === 'purchase' && <PurchaseWorkspaceView planning={purchasePlanning} planningRows={filteredPurchasePlanningRows} planningError={planningError} demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedPlanRowIds={selectedPlanRowIds} togglePlanningRow={togglePlanningRow} openPlanningRequest={() => setShowPlanningRequest(true)} openPlanningMapping={setPlanningMapping} openPlanningPolicy={setPlanningPolicy} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={setReceivingOrder} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
             {!['dashboard','platform','orders','inventory','purchase'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
           </>
         ) : <LoadingState message={error || '暂时无法加载业务数据'} />}
@@ -982,6 +1259,9 @@ export default function ErpClient() {
 
       {showOrder && payload && <OrderModal inventory={payload.inventory} submitting={submitting} error={error} onClose={() => { if (!submitting) { setShowOrder(false); setError(''); } }} onSubmit={submitOrder} />}
       {mappingDemand && purchasePayload && <SkuMappingModal demand={mappingDemand} skuOptions={purchasePayload.skuOptions} busy={purchaseBusy.startsWith('mapping:')} error={error} onClose={() => { if (!purchaseBusy) { setMappingDemand(null); setError(''); } }} onSubmit={submitSkuMapping} />}
+      {planningMapping && purchasePayload && <MukuPlanningMappingModal exception={planningMapping} skuOptions={purchasePayload.skuOptions} busy={purchaseBusy.startsWith('planning-mapping:')} error={error} onClose={() => { if (!purchaseBusy) { setPlanningMapping(null); setError(''); } }} onSubmit={submitPlanningMapping} />}
+      {planningPolicy && purchasePayload && <PlanningPolicyModal row={planningPolicy} suppliers={purchasePayload.suppliers} busy={purchaseBusy.startsWith('planning-policy:')} error={error} onClose={() => { if (!purchaseBusy) { setPlanningPolicy(null); setError(''); } }} onSubmit={submitPlanningPolicy} />}
+      {showPlanningRequest && purchasePlanning && purchasePayload && <PlanningRequestModal rows={purchasePlanning.rows.filter((row) => selectedPlanRowIds.has(row.planRowId))} members={purchasePayload.members} busy={purchaseBusy === 'create-planning-request'} error={error} onClose={() => { if (!purchaseBusy) { setShowPlanningRequest(false); setError(''); } }} onSubmit={submitPlanningRequest} />}
       {showPurchaseRequest && purchasePayload && <PurchaseRequestModal demands={purchasePayload.demands.filter((demand) => selectedDemandIds.has(demand.id))} members={purchasePayload.members} busy={purchaseBusy === 'create-request'} error={error} onClose={() => { if (!purchaseBusy) { setShowPurchaseRequest(false); setError(''); } }} onSubmit={submitPurchaseRequest} />}
       {showSupplier && <SupplierModal busy={purchaseBusy === 'create-supplier'} error={error} onClose={() => { if (!purchaseBusy) { setShowSupplier(false); setError(''); } }} onSubmit={submitSupplier} />}
       {showWarehouse && <WarehouseModal busy={purchaseBusy === 'create-warehouse'} error={error} onClose={() => { if (!purchaseBusy) { setShowWarehouse(false); setError(''); } }} onSubmit={submitWarehouse} />}
@@ -1132,9 +1412,13 @@ function MukuPaginationView({ pagination, currentPage, setPage, busy, fallbackTe
   return <div className="pagination muku-pagination"><span>{fallbackText}</span><div><button aria-label="上一页" disabled={busy || page <= 1} onClick={() => setPage(Math.max(1, page - 1))}>‹</button><button className="current" disabled>{page} / {totalPages}</button><button aria-label="下一页" disabled={busy || !(pagination?.hasNext ?? false)} onClick={() => setPage(page + 1)}>›</button></div></div>;
 }
 
-function PurchaseWorkspaceView({ demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedDemandIds, toggleDemand, openMapping, openRequest, openSupplier, openWarehouse, openPurchaseOrder, openReceipt, can, busy, runAction, runOrderAction, hasQuery }: {
+function PurchaseWorkspaceView({ planning, planningRows, planningError, demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedPlanRowIds, togglePlanningRow, openPlanningRequest, openPlanningMapping, openPlanningPolicy, selectedDemandIds, toggleDemand, openMapping, openRequest, openSupplier, openWarehouse, openPurchaseOrder, openReceipt, can, busy, runAction, runOrderAction, hasQuery }: {
+  planning: PurchasePlanningPayload | null; planningRows: PurchasePlanningRow[]; planningError: string;
   demands: PurchaseDemand[]; requests: PurchaseRequest[]; purchaseOrders: PurchaseOrder[]; purchaseReceipts: PurchaseReceipt[];
   workspace: PurchaseWorkspacePayload | null; tab: PurchaseTab; setTab: (tab: PurchaseTab) => void;
+  selectedPlanRowIds: Set<string>; togglePlanningRow: (id: string) => void;
+  openPlanningRequest: () => void; openPlanningMapping: (exception: MukuPlanningException) => void;
+  openPlanningPolicy: (row: PurchasePlanningRow) => void;
   selectedDemandIds: Set<string>; toggleDemand: (id: string) => void;
   openMapping: (demand: PurchaseDemand) => void; openRequest: () => void; openSupplier: () => void; openWarehouse: () => void;
   openPurchaseOrder: (request: PurchaseRequest) => void; openReceipt: (order: PurchaseOrder) => void;
@@ -1156,9 +1440,9 @@ function PurchaseWorkspaceView({ demands, requests, purchaseOrders, purchaseRece
   ).length;
   const availableQuantity = summary.availableQuantity ?? demands.filter((demand) => demand.status === 'open').reduce((sum, demand) => sum + demandAvailableQuantity(demand), 0);
   const stats = [
-    ['待采购数量', String(availableQuantity), '真实订单尚待处理'],
+    ['建议采购', planning ? formatOptionalQuantity(planning.summary.recommendedQty) : '未知', '订单需求 + 安全库存 - 有效覆盖'],
+    ['可转申请', planning ? String(planning.summary.convertibleOrderQty) : '未知', '仅转换已验证官方订单需求'],
     ['待复审申请', String(requestSummary.pendingReview), '审批后才能正式下单'],
-    ['待转采购单', String(approvedRequests.length), '已批准、尚未向供应商下单'],
     ['待到货数量', String(procurementSummary.pendingReceiptQuantity), '已下单未完成入库'],
   ];
   const visibleDemands = tab === 'pending'
@@ -1168,6 +1452,7 @@ function PurchaseWorkspaceView({ demands, requests, purchaseOrders, purchaseRece
   const selectedDemands = (workspace?.demands ?? []).filter((demand) => selectedDemandIds.has(demand.id));
   const selectedQuantity = selectedDemands.reduce((sum, demand) => sum + demandAvailableQuantity(demand), 0);
   const tabs: Array<[PurchaseTab, string, number]> = [
+    ['planning', '今日采购建议', planning?.summary.buy ?? 0],
     ['pending', '待处理需求', pendingDemandCount],
     ['mapping', 'SKU 映射', summary.needsMapping],
     ['requests', '申请与复审', requestSummary.draft + requestSummary.pendingReview],
@@ -1176,15 +1461,19 @@ function PurchaseWorkspaceView({ demands, requests, purchaseOrders, purchaseRece
     ['received', '到货记录', purchaseReceipts.length],
     ['history', '历史', historyRequests.length + closedOrders.length],
   ];
-  const toolbarText = tab === 'pending' ? `可采购 ${availableQuantity} 件`
+  const toolbarText = tab === 'planning'
+    ? planning ? `建议 ${formatOptionalQuantity(planning.summary.recommendedQty)} 件 · 可转申请 ${planning.summary.convertibleOrderQty} 件` : '等待采购建议'
+    : tab === 'pending' ? `可采购 ${availableQuantity} 件`
     : tab === 'mapping' ? '映射后自动进入待处理'
       : tab === 'orders' ? `待到货 ${procurementSummary.pendingReceiptQuantity} 件`
         : tab === 'received' ? `累计入库 ${procurementSummary.receivedQuantity} 件`
           : `供应商 ${procurementSummary.suppliers} 家`;
-  return <div className="content module-content"><div className="module-head"><div><p>真实订单 / 采购执行</p><h1>采购工作台</h1><span>真实订单形成采购需求，经过申请、复审、供应商下单和到货登记后更新 ERP 库存；不会向 Shopify 写入。</span></div><div className="purchase-head-actions"><div className="ledger-chip">需求防重复 · 入库有流水 · 历史不删除</div>{can('warehouse:manage') && <button className="secondary-button warehouse-button" onClick={openWarehouse} disabled={Boolean(busy)}><span>＋</span>仓库</button>}{can('purchase:supplier:create') && <button className="primary-button" onClick={openSupplier} disabled={Boolean(busy)}><span>＋</span>供应商</button>}</div></div><StatCards stats={stats} />
+  return <div className="content module-content"><div className="module-head"><div><p>订单需求 / 采购执行</p><h1>采购工作台</h1><span>已验证的官方订单形成采购需求，经过申请、复审、供应商下单和到货登记后更新 ERP 库存；不会向 Shopify 写入。</span></div><div className="purchase-head-actions"><div className="ledger-chip">需求防重复 · 入库有流水 · 历史不删除</div>{can('warehouse:manage') && <button className="secondary-button warehouse-button" onClick={openWarehouse} disabled={Boolean(busy)}><span>＋</span>仓库</button>}{can('purchase:supplier:create') && <button className="primary-button" onClick={openSupplier} disabled={Boolean(busy)}><span>＋</span>供应商</button>}</div></div><StatCards stats={stats} />
+    {planning && !planning.orderSourceReadiness && <div className="planning-order-source-warning purchase-source-warning"><strong>官方订单源未就绪</strong><span>{formatOrderSourceWarning(planning)}</span></div>}
     <article className="card data-card purchase-workspace-card"><div className="data-toolbar purchase-toolbar"><div>{tabs.map(([key, label, count]) => <button key={key} className={tab === key ? 'tab-active' : ''} onClick={() => setTab(key)}>{label}<b>{count}</b></button>)}</div><span>{toolbarText}</span></div>
-      {tab === 'pending' || tab === 'mapping' ? <>
-        {tab === 'pending' && <div className="purchase-selection"><div><strong>已选 {selectedDemandIds.size} 行 / {selectedQuantity} 件</strong><span>每条需求只能进入一张有效采购申请</span></div><button className="primary-button" disabled={!selectedDemandIds.size || !can('purchase:create') || Boolean(busy)} onClick={openRequest}><span>＋</span>生成采购申请</button></div>}
+      {tab === 'planning' ? <PurchasePlanningView planning={planning} rows={planningRows} error={planningError} skuOptions={workspace?.skuOptions ?? []} selectedPlanRowIds={selectedPlanRowIds} toggleRow={togglePlanningRow} openRequest={openPlanningRequest} openMapping={openPlanningMapping} openPolicy={openPlanningPolicy} canCreate={can('purchase:create')} canMap={can('purchase:mapping')} busy={busy} hasQuery={hasQuery} />
+        : tab === 'pending' || tab === 'mapping' ? <>
+        {tab === 'pending' && <div className="purchase-selection"><div><strong>已选 {selectedDemandIds.size} 行 / {selectedQuantity} 件</strong><span>每条需求只能进入一张有效采购申请</span></div><button className="primary-button" disabled={!selectedDemandIds.size || !can('purchase:create') || Boolean(busy) || planning?.orderSourceReadiness !== true} onClick={openRequest}><span>＋</span>生成采购申请</button></div>}
         <PurchaseDemandTable demands={visibleDemands} selectable={tab === 'pending'} selectedDemandIds={selectedDemandIds} toggleDemand={toggleDemand} openMapping={openMapping} canMap={can('purchase:mapping')} busy={busy} emptyMessage={hasQuery ? '没有符合当前搜索条件的需求' : tab === 'pending' ? '暂无可采购需求；待映射 SKU 完成后会出现在这里' : '暂无待映射的真实订单行'} />
       </> : tab === 'requests' ? <PurchaseRequestTable requests={visibleRequests} can={can} busy={busy} runAction={runAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购申请' : '暂无草稿或待复审申请，可从待处理需求生成'} />
         : tab === 'approved' ? <PurchaseRequestTable requests={approvedRequests} can={can} busy={busy} runAction={runAction} openPurchaseOrder={openPurchaseOrder} emptyMessage={hasQuery ? '没有符合当前搜索条件的已批准申请' : '暂无待转采购单；采购申请批准后会出现在这里'} />
@@ -1194,6 +1483,53 @@ function PurchaseWorkspaceView({ demands, requests, purchaseOrders, purchaseRece
       <div className="pagination"><span>取消、退款、到货和库存变化均保留原始记录；系统不物理删除采购历史</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div>
     </article>
   </div>;
+}
+
+function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanRowIds, toggleRow, openRequest, openMapping, openPolicy, canCreate, canMap, busy, hasQuery }: {
+  planning: PurchasePlanningPayload | null; rows: PurchasePlanningRow[]; error: string;
+  skuOptions: PurchaseSkuOption[]; selectedPlanRowIds: Set<string>; toggleRow: (id: string) => void;
+  openRequest: () => void; openMapping: (exception: MukuPlanningException) => void;
+  openPolicy: (row: PurchasePlanningRow) => void; canCreate: boolean; canMap: boolean;
+  busy: string; hasQuery: boolean;
+}) {
+  const [showAllMappings, setShowAllMappings] = useState(false);
+  if (!planning) {
+    return <div className="planning-unavailable"><strong>采购建议暂时不可用</strong><span>{error || '正在等待库存快照和采购策略数据。现有申请、采购单与到货流程不受影响。'}</span></div>;
+  }
+  const freshness = planning.freshness;
+  const freshnessState = freshness.readyForProcurement
+    ? { label: '库存数据可用于采购', className: 'ready' }
+    : freshness.status === 'refreshing'
+      ? { label: '库存正在刷新', className: 'pending' }
+      : { label: '库存数据不可用于采购', className: 'error' };
+  const inventoryFreshness = freshness.datasets.find((item) => item.dataset === 'inventory');
+  const selectedRows = planning.rows.filter((row) => selectedPlanRowIds.has(row.planRowId));
+  const selectedQuantity = selectedRows.reduce((sum, row) => sum + row.conversion.eligibleOrderQty, 0);
+  const mappingExceptions = planning.mappingExceptions.muku;
+  return <div className="planning-workspace">
+    <section className={`planning-freshness ${freshnessState.className}`} aria-label="采购数据新鲜度">
+      <div><span className="planning-signal" /><div><strong>{freshnessState.label}</strong><small>最近检查 {formatOptionalTime(freshness.checkedAt)} · 允许时效 {freshness.maxAgeMinutes} 分钟</small></div></div>
+      <div className="planning-source-times"><span>MUKU 库存生成 <b>{formatOptionalTime(inventoryFreshness?.generatedAt ?? null)}</b></span><span>ERP 同步 <b>{formatOptionalTime(inventoryFreshness?.lastSuccessAt ?? null)}</b></span></div>
+      {!freshness.readyForProcurement && <p>{freshness.blockingReasons.map((reason) => reason.message).join('；') || '库存快照状态未知，暂不允许转采购申请。'}</p>}
+    </section>
+    <section className="planning-formula" aria-label="采购建议公式"><div><strong>系统怎么算</strong><span>{planning.formula.target} − {planning.formula.coverage}</span></div><small>{planning.formula.recommendation}。MUKU 在途只展示，不参与抵扣。</small></section>
+    {error && <div className="planning-inline-warning">{error}</div>}
+    <div className="purchase-selection planning-selection"><div><strong>已选 {selectedRows.length} 个 SKU / 可转 {selectedQuantity} 件</strong><span>只会把已验证的官方订单缺口转成申请；安全库存和取整超量不会伪造订单需求</span></div><button className="primary-button" disabled={!selectedRows.length || !selectedQuantity || !canCreate || Boolean(busy) || planning.readiness === 'stale' || !planning.orderSourceReadiness} onClick={openRequest}><span>＋</span>按建议生成申请</button></div>
+    <PurchasePlanningTable planning={planning} rows={rows} selectedPlanRowIds={selectedPlanRowIds} toggleRow={toggleRow} openPolicy={openPolicy} canMap={canMap} busy={busy} hasQuery={hasQuery} />
+    {mappingExceptions.length > 0 && <section className="planning-exceptions"><div className="planning-section-head"><div><strong>MUKU SKU 待映射</strong><span>{mappingExceptions.length} 项库存尚未归属到 ERP SKU，不会按 0 库存参与建议</span></div>{mappingExceptions.length > 24 && <button onClick={() => setShowAllMappings((current) => !current)}>{showAllMappings ? '收起' : `展开全部 ${mappingExceptions.length} 项`}</button>}</div><div className="planning-exception-grid">{(showAllMappings ? mappingExceptions : mappingExceptions.slice(0, 24)).map((item) => <article key={item.mukuSku}><div><strong>{item.mukuSku}</strong><small>可用 {formatOptionalQuantity(item.availableQty)} · 在途 {formatOptionalQuantity(item.inboundQty)}</small></div><span className={`status-pill ${item.status === 'ambiguous' ? 'danger' : ''}`}>{item.status === 'ambiguous' ? '存在歧义' : '未映射'}</span>{canMap && <button disabled={Boolean(busy) || !skuOptions.length} onClick={() => openMapping(item)}>去映射</button>}</article>)}</div></section>}
+  </div>;
+}
+
+function PurchasePlanningTable({ planning, rows, selectedPlanRowIds, toggleRow, openPolicy, canMap, busy, hasQuery }: {
+  planning: PurchasePlanningPayload; rows: PurchasePlanningRow[]; selectedPlanRowIds: Set<string>;
+  toggleRow: (id: string) => void; openPolicy: (row: PurchasePlanningRow) => void;
+  canMap: boolean; busy: string; hasQuery: boolean;
+}) {
+  return <div className="table-wrap module-table"><table className="purchase-planning-table"><thead><tr><th className="selection-cell">选择</th><th>ERP SKU / MUKU SKU</th><th>订单需求 / 安全库存</th><th>MUKU 可用 / 在途</th><th>ERP 覆盖 / 已收展示</th><th>建议采购</th><th>状态与依据</th><th>操作</th></tr></thead><tbody>{rows.length ? rows.map((row) => {
+    const convertible = planningRowConvertible(row, planning.readiness, planning.orderSourceReadiness);
+    const matchedSkus = row.mukuSkus.map((source) => source.sku).join('、');
+    return <tr key={row.planRowId} className={row.decision === 'blocked' ? 'planning-row-blocked' : ''}><td className="selection-cell"><input className="purchase-check" type="checkbox" aria-label={`选择 ${row.skuCode}`} checked={selectedPlanRowIds.has(row.planRowId)} disabled={!convertible || Boolean(busy)} onChange={() => toggleRow(row.planRowId)} /></td><td><strong>{row.skuCode}</strong><small className="cell-sub">{row.skuName}</small><small className="cell-sub planning-match">{matchedSkus || (row.mukuMatchStatus === 'ambiguous' ? 'MUKU SKU 存在歧义' : '尚未映射 MUKU SKU')}</small></td><td><strong>{row.orderDemandQty} / {formatOptionalQuantity(row.safetyStockQty)}</strong><small className="cell-sub">近 30 天销量：{formatOptionalQuantity(row.sales30d)}</small></td><td><strong>{formatOptionalQuantity(row.mukuAvailableQty)} / {formatOptionalQuantity(row.mukuInboundQty)}</strong><small className="cell-sub">在途仅展示，不抵扣</small></td><td><strong>{row.erpPurchaseChainCoverageQty}</strong><small className="cell-sub">PO 未收 {row.erpOpenPoQty} · 已收 {row.erpReceivedQty}（仅展示）</small></td><td><strong className="planning-recommendation">{formatOptionalQuantity(row.recommendedQty)}</strong><small className="cell-sub">可转官方订单 {row.conversion.eligibleOrderQty} 件</small>{row.conversion.blockedRecommendationQty > 0 && <small className="cell-sub attention-text">另有 {row.conversion.blockedRecommendationQty} 件不可自动转</small>}</td><td><span className={`status-pill planning-status-${row.decision}`}>{planningDecisionLabel(row.decision)}</span><details className="planning-explanation"><summary>查看计算依据</summary><div><p><b>公式：</b>{formatPlanningEquation(row)}</p>{row.explanations.map((text, index) => <p key={`${row.planRowId}-explanation-${index}`}>{text}</p>)}{[...row.blockers, ...row.warnings].map((reason) => <p className="attention-text" key={`${row.planRowId}-${reason}`}>{planningReasonLabel(reason)}</p>)}<p className="planning-source-note">库存源更新时间：{formatOptionalTime(row.sourceTimes.inventoryRecordUpdatedAt)}</p></div></details></td><td><div className="row-actions planning-row-actions">{canMap && <button disabled={Boolean(busy)} onClick={() => openPolicy(row)}>采购策略</button>}{convertible ? <span className="terminal-label">勾选后批量转申请</span> : <span className="terminal-label">{!planning.orderSourceReadiness ? '官方订单源未就绪' : row.conversion.eligibleOrderQty <= 0 && row.blockers.length === 0 ? '暂无可转订单缺口' : planningPrimaryBlocker(row)}</span>}</div></td></tr>;
+  }) : <tr><td className="empty-cell" colSpan={8}>{hasQuery ? '没有符合当前搜索条件的采购建议' : '暂无可计算的 ERP SKU；接入真实订单或设置采购策略后会出现在这里'}</td></tr>}</tbody></table></div>;
 }
 
 function PurchaseDemandTable({ demands, selectable, selectedDemandIds, toggleDemand, openMapping, canMap, busy, emptyMessage }: {
@@ -1247,6 +1583,33 @@ function StatCards({ stats }: { stats: string[][] }) {
 
 function OrderModal({ inventory, submitting, error, onClose, onSubmit }: { inventory: Inventory[]; submitting: boolean; error: string; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
   return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal order-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>新建销售订单</h2><p>订单先进入待审核；审核后才会预占库存</p></div><button type="button" onClick={onClose} disabled={submitting}>×</button></div><div className="form-grid"><label>销售渠道<select name="channel" required><option>Amazon US</option><option>Shopify</option><option>eBay DE</option><option>TikTok Shop</option></select></label><label>目的国家<select name="destination" required><option>美国</option><option>英国</option><option>德国</option><option>法国</option><option>加拿大</option></select></label><label className="full">客户名称<input name="customer" placeholder="请输入客户名称" required minLength={2} /></label><label className="full">SKU 与履约仓<select name="inventory" required>{inventory.map((item) => <option key={item.id} value={item.id}>{item.skuCode} · {item.skuName} · {item.warehouseName}（可售 {item.availableQty}）</option>)}</select></label><label>订购数量<input name="quantity" type="number" min="1" max="999" defaultValue="1" required /></label><label>币种<select name="currency" required><option value="USD">USD 美元</option><option value="EUR">EUR 欧元</option><option value="GBP">GBP 英镑</option><option value="CNY">CNY 人民币</option></select></label><label className="full">订单原币金额<input name="amount" type="number" min="0.01" step="0.01" placeholder="0.00" required /></label>{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>安全规则</span>服务端生成订单号 · 重复提交不会重复建单 · 所有动作自动审计</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={submitting}>取消</button><button className="primary-button" type="submit" disabled={submitting}>{submitting ? '正在安全写入…' : '创建待审核订单'}</button></div></form></div>;
+}
+
+function MukuPlanningMappingModal({ exception, skuOptions, busy, error, onClose, onSubmit }: {
+  exception: MukuPlanningException; skuOptions: PurchaseSkuOption[]; busy: boolean; error: string;
+  onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const suggestedSku = exception.candidateSkuIds.find((id) => skuOptions.some((sku) => sku.id === id));
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal purchase-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>归属 MUKU 库存 SKU</h2><p>确认后该库存才会参与对应 ERP SKU 的采购建议</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="mapping-context"><strong>{exception.mukuSku}</strong><span>可用 {formatOptionalQuantity(exception.availableQty)} · 在途 {formatOptionalQuantity(exception.inboundQty)}</span><code>{exception.status === 'ambiguous' ? '存在多个可能的 ERP SKU，请人工确认' : '当前尚未匹配 ERP SKU'}</code></div><div className="form-grid"><label className="full">选择 ERP SKU<select name="skuId" required defaultValue={suggestedSku ?? skuOptions[0]?.id ?? ''}><option value="" disabled>请选择 ERP SKU</option>{skuOptions.map((sku) => <option key={sku.id} value={sku.id}>{sku.code} · {sku.name}</option>)}</select></label>{!skuOptions.length && <div className="form-error full">当前没有可用 ERP SKU，请先建立真实 SKU 主数据。</div>}{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>映射规则</span>保留 MUKU 原始 SKU · 人工映射可追溯 · 不会修改 MUKU 或共享盘</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || !skuOptions.length}>{busy ? '正在保存…' : '确认映射并重算'}</button></div></form></div>;
+}
+
+function PlanningPolicyModal({ row, suppliers, busy, error, onClose, onSubmit }: {
+  row: PurchasePlanningRow; suppliers: PurchaseSupplier[]; busy: boolean; error: string;
+  onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const activeSuppliers = suppliers.filter((supplier) => supplier.active);
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal purchase-modal planning-policy-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>采购策略</h2><p>{row.skuCode} · {row.skuName}</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>安全库存天数<input name="safetyDays" type="number" min="0" max="365" step="1" defaultValue={row.safetyDays} required /></label><label>固定安全库存<input name="safetyStockQty" type="number" min="0" step="1" defaultValue={row.safetyStockBasis === 'explicit' ? row.safetyStockQty ?? '' : ''} placeholder="留空按近 30 天销量" /></label><label>最小采购量 MOQ<input name="moq" type="number" min="1" step="1" defaultValue={row.policy.moq ?? ''} placeholder="留空不限制" /></label><label>包装倍数<input name="packSize" type="number" min="1" step="1" defaultValue={row.policy.packSize ?? ''} placeholder="留空不取整" /></label><label>采购提前期（天）<input name="leadTimeDays" type="number" min="0" step="1" defaultValue={row.policy.leadTimeDays ?? ''} placeholder="可选" /></label><label>首选供应商<select name="preferredSupplierId" defaultValue={row.policy.preferredSupplierId ?? ''}><option value="">暂不指定</option>{activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.code} · {supplier.name}</option>)}</select></label>{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>计算规则</span>留空固定安全库存时按近 30 天销量估算；销量未知会明确显示“未知”，不会补成 0</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy}>{busy ? '正在保存…' : '保存并重新计算'}</button></div></form></div>;
+}
+
+function PlanningRequestModal({ rows, members, busy, error, onClose, onSubmit }: {
+  rows: PurchasePlanningRow[]; members: PurchaseMember[]; busy: boolean; error: string;
+  onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const totalQuantity = rows.reduce((sum, row) => sum + row.conversion.eligibleOrderQty, 0);
+  const blockedQuantity = rows.reduce((sum, row) => sum + row.conversion.blockedRecommendationQty, 0);
+  const defaultBuyer = members[0]?.id ?? '';
+  const defaultReviewer = members[1]?.id ?? defaultBuyer;
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal purchase-request-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>按采购建议生成申请</h2><p>已选 {rows.length} 个 SKU，可安全关联官方订单 {totalQuantity} 件</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="purchase-selected-list">{rows.slice(0, 8).map((row) => <div key={row.planRowId}><strong>{row.skuCode}</strong><span>{row.skuName}</span><b>{row.conversion.eligibleOrderQty} 件</b></div>)}{rows.length > 8 && <small>另有 {rows.length - 8} 个 SKU 已选</small>}</div>{blockedQuantity > 0 && <div className="planning-modal-warning">另有 {blockedQuantity} 件来自安全库存或策略取整，没有对应官方订单需求，本次不会自动转申请。</div>}<div className="form-grid"><label>采购负责人<select name="purchaserMemberId" defaultValue={defaultBuyer} required>{members.map((member) => <option key={member.id} value={member.id}>{member.displayName}</option>)}</select></label><label>复审人<select name="reviewerMemberId" defaultValue={defaultReviewer} required>{members.map((member) => <option key={member.id} value={member.id}>{member.displayName}</option>)}</select></label><label className="full">采购备注<textarea name="note" rows={3} maxLength={500} placeholder="可填写交期、供应商沟通或特殊要求" /></label>{!members.length && <div className="form-error full">当前没有可分配成员，请先让业务人员登录一次 ERP。</div>}{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>防重复</span>提交时服务端会用最新库存和订单重新计算；数据变化会要求刷新，不接受前端自填数量</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button type="submit" value="draft" disabled={busy || !members.length || !totalQuantity}>{busy ? '处理中…' : '保存草稿'}</button><button className="primary-button" type="submit" value="submit" disabled={busy || !members.length || !totalQuantity}>{busy ? '处理中…' : '创建并提交复审'}</button></div></form></div>;
 }
 
 function SkuMappingModal({ demand, skuOptions, busy, error, onClose, onSubmit }: {
@@ -1387,6 +1750,7 @@ function latestTimestamp(values: unknown[]) {
 function normalizeMukuStatus(value: unknown): MukuStatus {
   const root = asObject(value);
   const data = asObject(root.data);
+  const autoRefresh = asObject(root.autoRefresh);
   const statusObject = asObject(root.status);
   const connector = asObject(root.connection ?? root.connector ?? data.connection ?? data.connector);
   const run = asObject(root.sync ?? root.lastRun ?? root.run ?? data.sync ?? data.lastRun);
@@ -1445,6 +1809,11 @@ function normalizeMukuStatus(value: unknown): MukuStatus {
     syncedAt: latestTimestamp([root.syncedAt, root.synced_at, data.syncedAt, statusObject.syncedAt, connector.syncedAt, run.syncedAt, ...datasetRows.flatMap((row) => [row.updatedAt, row.lastSuccessAt])]),
     datasets,
     sourceStatusCount: readArray(root.sourceStatuses, data.sourceStatuses).length,
+    autoRefresh: Object.keys(autoRefresh).length ? {
+      mode: readString(autoRefresh.mode) ?? 'stale-while-revalidate',
+      refreshTriggered: readBoolean(autoRefresh.refreshTriggered) ?? false,
+      externalScheduleConfigured: readBoolean(autoRefresh.externalScheduleConfigured) ?? false,
+    } : undefined,
   };
 }
 
@@ -1693,6 +2062,73 @@ function summarizeProcurement(orders: PurchaseOrder[], receipts: PurchaseReceipt
 
 function demandAvailableQuantity(demand: PurchaseDemand) {
   return Math.max(0, demand.availableQuantity ?? demand.requiredQuantity - (demand.allocatedQuantity ?? 0));
+}
+
+function planningRowConvertible(row: PurchasePlanningRow, readiness: PurchasePlanningPayload['readiness'], orderSourceReadiness = true) {
+  return orderSourceReadiness && readiness !== 'stale' && row.blockers.length === 0 && row.conversion.eligibleOrderQty > 0;
+}
+
+function planningDecisionLabel(decision: PurchasePlanningRow['decision']) {
+  if (decision === 'buy') return '建议采购';
+  if (decision === 'no_purchase') return '无需采购';
+  return '需先处理';
+}
+
+function planningReasonLabel(reason: string) {
+  const labels: Record<string, string> = {
+    inventory_stale: '库存快照已过期或正在刷新',
+    muku_sku_unmapped: '尚未映射 MUKU SKU',
+    muku_sku_ambiguous: 'MUKU SKU 映射存在歧义',
+    muku_sku_missing_from_snapshot: '已映射 SKU 不在当前 MUKU 快照中',
+    muku_available_unknown: 'MUKU 可用库存未知',
+    safety_unknown: '安全库存未知，暂不追加安全库存',
+    muku_inbound_unknown: 'MUKU 在途库存未知',
+    source_inventory_stale: 'MUKU 出口已更新，但仓库源数据过旧',
+    source_inventory_unknown: 'MUKU 出口已更新，但仓库源数据时间未知',
+    inventory_source_stale: 'MUKU 出口已更新，但仓库源数据过旧',
+    inventory_source_time_unknown: 'MUKU 出口已更新，但仓库源数据时间未知',
+    inventory_source_time_invalid: 'MUKU 仓库源数据时间无效',
+    receipt_not_reflected_in_muku: '本次到货尚未在 MUKU 库存中确认',
+    order_source_unavailable: '官方订单源当前不可用',
+    order_sync_stale: '官方订单同步已过期',
+    no_official_order_source: '尚未接通可验证的官方订单源',
+    global_inventory_scope: '当前按 MUKU 全仓汇总，未按区域可调拨性过滤',
+    warehouse_scope_global_unverified: '当前按 MUKU 全仓汇总，未按区域可调拨性过滤',
+    active_demand_partial_gap: '该订单需求已有部分采购，剩余缺口需人工复核',
+    local_qa_excluded: '本地验收订单不作为官方采购需求',
+    order_sync_time_unknown: '官方订单同步时间未知',
+    order_sync_failed: '官方订单最近同步失败',
+    safety_stock_without_purchase_demand: '安全库存部分没有真实订单需求，不能自动转申请',
+    policy_rounding_exceeds_order_gap: 'MOQ 或包装取整超出真实订单缺口',
+    order_demand_already_in_active_request: '部分订单需求已进入有效采购申请',
+  };
+  return labels[reason] ?? reason;
+}
+
+function formatOrderSourceWarning(planning: PurchasePlanningPayload) {
+  const unavailable = planning.orderSources.filter((source) => !source.ready);
+  if (!unavailable.length) return planning.orderSourceBlockers.map(planningReasonLabel).join('；') || '官方订单源暂不可用。';
+  return unavailable.map((source) => {
+    const reason = source.reasons.map(planningReasonLabel).join('、') || '状态未就绪';
+    return `${source.storeName}：${reason}${source.lastSuccessAt ? `（最近同步 ${formatOptionalTime(source.lastSuccessAt)}）` : ''}`;
+  }).join('；');
+}
+
+function planningPrimaryBlocker(row: PurchasePlanningRow) {
+  return row.blockers.length ? planningReasonLabel(row.blockers[0]!) : '当前不可转换';
+}
+
+function formatPlanningEquation(row: PurchasePlanningRow) {
+  const safety = row.calculationParts.safetyStockQty === null ? '未知（按 0 暂算）' : String(row.calculationParts.safetyStockQty);
+  const available = row.calculationParts.mukuAvailableQty === null ? '未知' : String(row.calculationParts.mukuAvailableQty);
+  const raw = row.calculationParts.rawTotalGapQty === null ? '未知' : String(row.calculationParts.rawTotalGapQty);
+  const rounded = row.calculationParts.roundedRecommendedQty === null ? '未知' : String(row.calculationParts.roundedRecommendedQty);
+  return `max(0, ${row.calculationParts.orderDemandQty} + ${safety} - ${available} - ${row.calculationParts.erpPurchaseChainCoverageQty}) = ${raw}，策略取整后 ${rounded}`;
+}
+
+function optionalFormInteger(data: FormData, name: string) {
+  const raw = String(data.get(name) ?? '').trim();
+  return raw ? Number(raw) : null;
 }
 
 function formatMoney(amountMinor: number, currency: string) {
