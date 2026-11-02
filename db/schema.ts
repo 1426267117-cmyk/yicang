@@ -721,3 +721,140 @@ export const connectorSyncState = sqliteTable('connector_sync_state', {
   uniqueIndex('uq_connector_sync_state_resource').on(table.platformStoreId, table.connector, table.resource),
   index('idx_connector_sync_state_tenant').on(table.tenantId, table.status),
 ]);
+
+export const mukuSnapshots = sqliteTable('muku_snapshots', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  dataset: text('dataset').notNull(),
+  status: text('status', { enum: ['staging', 'active', 'superseded', 'failed'] }).notNull(),
+  apiVersion: text('api_version').notNull(),
+  generatedAt: text('generated_at').notNull(),
+  source: text('source'),
+  grain: text('grain'),
+  businessTimezone: text('business_timezone'),
+  refreshCadence: text('refresh_cadence'),
+  zeroSemantics: text('zero_semantics'),
+  filtersJson: text('filters_json').notNull(),
+  contentHash: text('content_hash').notNull(),
+  pageCount: integer('page_count').notNull(),
+  recordCount: integer('record_count').notNull(),
+  expectedTotal: integer('expected_total'),
+  sourceUpdatedAt: text('source_updated_at'),
+  ingestedAt: text('ingested_at').notNull(),
+  activatedAt: text('activated_at'),
+  createdAt: text('created_at').notNull(),
+}, (table) => [
+  index('idx_muku_snapshots_content').on(table.tenantId, table.dataset, table.contentHash),
+  index('idx_muku_snapshots_dataset').on(table.tenantId, table.dataset, table.status, table.createdAt),
+]);
+
+export const mukuDatasetState = sqliteTable('muku_dataset_state', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  dataset: text('dataset').notNull(),
+  activeSnapshotId: text('active_snapshot_id').references(() => mukuSnapshots.id),
+  status: text('status', { enum: ['never_synced', 'ready', 'running', 'delayed', 'failed'] }).notNull(),
+  apiVersion: text('api_version'),
+  generatedAt: text('generated_at'),
+  source: text('source'),
+  grain: text('grain'),
+  businessTimezone: text('business_timezone'),
+  refreshCadence: text('refresh_cadence'),
+  zeroSemantics: text('zero_semantics'),
+  recordCount: integer('record_count'),
+  pageCount: integer('page_count'),
+  lastRunId: text('last_run_id'),
+  lastSuccessAt: text('last_success_at'),
+  lastErrorCode: text('last_error_code'),
+  lastErrorAt: text('last_error_at'),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_muku_dataset_state').on(table.tenantId, table.dataset),
+  index('idx_muku_dataset_state_status').on(table.tenantId, table.status, table.updatedAt),
+]);
+
+export const mukuSyncRuns = sqliteTable('muku_sync_runs', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  dataset: text('dataset').notNull(),
+  snapshotId: text('snapshot_id').references(() => mukuSnapshots.id),
+  status: text('status', { enum: ['running', 'succeeded', 'unchanged', 'failed'] }).notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  leaseId: text('lease_id').notNull(),
+  leaseExpiresAt: text('lease_expires_at').notNull(),
+  pageCount: integer('page_count').notNull().default(0),
+  recordCount: integer('record_count').notNull().default(0),
+  contentHash: text('content_hash'),
+  errorCode: text('error_code'),
+  errorMessage: text('error_message'),
+  startedAt: text('started_at').notNull(),
+  finishedAt: text('finished_at'),
+}, (table) => [
+  uniqueIndex('uq_muku_sync_runs_idempotency').on(table.tenantId, table.dataset, table.idempotencyKey),
+  uniqueIndex('uq_muku_sync_runs_running').on(table.tenantId, table.dataset)
+    .where(sql`${table.status} = 'running'`),
+  index('idx_muku_sync_runs_dataset').on(table.tenantId, table.dataset, table.startedAt),
+]);
+
+export const mukuInventoryRecords = sqliteTable('muku_inventory_records', {
+  id: text('id').primaryKey(), tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  snapshotId: text('snapshot_id').notNull().references(() => mukuSnapshots.id),
+  stableKey: text('stable_key').notNull(), recordKey: text('record_key'), sourceId: text('source_id'),
+  sourceSnapshotId: text('source_snapshot_id'), inventoryKind: text('inventory_kind'),
+  warehouseCode: text('warehouse_code'), warehouseName: text('warehouse_name'), region: text('region'),
+  sku: text('sku'), availableQty: integer('available_qty'), lockedQty: integer('locked_qty'),
+  onHandQty: integer('on_hand_qty'), inboundQty: integer('inbound_qty'), ageDays: integer('age_days'),
+  sourceUpdatedAt: text('source_updated_at'), ingestedAt: text('ingested_at'),
+  rawJson: text('raw_json').notNull(), rawHash: text('raw_hash').notNull(), createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_muku_inventory_snapshot_key').on(table.snapshotId, table.stableKey),
+  index('idx_muku_inventory_lookup').on(table.tenantId, table.snapshotId, table.sku, table.warehouseCode),
+]);
+
+export const mukuInventoryDetailRecords = sqliteTable('muku_inventory_detail_records', {
+  id: text('id').primaryKey(), tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  snapshotId: text('snapshot_id').notNull().references(() => mukuSnapshots.id),
+  stableKey: text('stable_key').notNull(), recordKey: text('record_key'), sourceId: text('source_id'),
+  sourceSnapshotId: text('source_snapshot_id'), sourceKind: text('source_kind'),
+  warehouseCode: text('warehouse_code'), warehouseName: text('warehouse_name'), region: text('region'),
+  sku: text('sku'), cabinetNo: text('cabinet_no'), receivedAt: text('received_at'), note: text('note'),
+  stockStatus: text('stock_status'), packageBarcode: text('package_barcode'),
+  productDimensions: text('product_dimensions'), productColorStyle: text('product_color_style'),
+  packagingType: text('packaging_type'), reservedOrderNo: text('reserved_order_no'),
+  inboundBatch: text('inbound_batch'), sequenceNo: text('sequence_no'), parentSpu: text('parent_spu'),
+  parentRecord: text('parent_record'), category: text('category'), estimatedArrivalAt: text('estimated_arrival_at'),
+  ageDays: integer('age_days'), quantity: integer('quantity'), stockUnitQty: integer('stock_unit_qty'),
+  sourceUpdatedAt: text('source_updated_at'), ingestedAt: text('ingested_at'),
+  rawJson: text('raw_json').notNull(), rawHash: text('raw_hash').notNull(), createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_muku_inventory_detail_snapshot_key').on(table.snapshotId, table.stableKey),
+  index('idx_muku_inventory_detail_lookup').on(table.tenantId, table.snapshotId, table.sku, table.warehouseCode),
+]);
+
+export const mukuInventoryRiskRecords = sqliteTable('muku_inventory_risk_records', {
+  id: text('id').primaryKey(), tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  snapshotId: text('snapshot_id').notNull().references(() => mukuSnapshots.id),
+  stableKey: text('stable_key').notNull(), sku: text('sku'), sales30d: integer('sales_30d'),
+  availableQty: integer('available_qty'), lockedQty: integer('locked_qty'), onHandQty: integer('on_hand_qty'),
+  inboundQty: integer('inbound_qty'), warehouseCount: integer('warehouse_count'), maxAgeDays: integer('max_age_days'),
+  slowMoving: integer('slow_moving', { mode: 'boolean' }), overAge: integer('over_age', { mode: 'boolean' }),
+  activeLowStock: integer('active_low_stock', { mode: 'boolean' }), matchedBy: text('matched_by'),
+  sourceUpdatedAt: text('source_updated_at'),
+  rawJson: text('raw_json').notNull(), rawHash: text('raw_hash').notNull(), createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_muku_inventory_risk_snapshot_key').on(table.snapshotId, table.stableKey),
+  index('idx_muku_inventory_risk_lookup').on(table.tenantId, table.snapshotId, table.sku),
+]);
+
+export const mukuSourceStatusRecords = sqliteTable('muku_source_status_records', {
+  id: text('id').primaryKey(), tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  snapshotId: text('snapshot_id').notNull().references(() => mukuSnapshots.id),
+  stableKey: text('stable_key').notNull(), sourceKind: text('source_kind'), sourceId: text('source_id'),
+  status: text('status'), businessDate: text('business_date'), message: text('message'),
+  recordCount: integer('record_count'), sourceUpdatedAt: text('source_updated_at'), ingestedAt: text('ingested_at'),
+  rawJson: text('raw_json').notNull(), rawHash: text('raw_hash').notNull(), createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_muku_source_status_snapshot_key').on(table.snapshotId, table.stableKey),
+  index('idx_muku_source_status_lookup').on(table.tenantId, table.snapshotId, table.sourceKind, table.sourceId, table.businessDate),
+]);
