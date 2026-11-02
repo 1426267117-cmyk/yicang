@@ -43,6 +43,20 @@ const user: UserContext = {
   id: 'auth-planner', email: 'planner@example.invalid', displayName: '采购计划员', role: 'admin',
   permissions: ROLE_PERMISSIONS.admin, tenantId, tenantName: '采购计划测试工作区',
 };
+const buyerUser: UserContext = {
+  ...user,
+  id: 'auth-buyer',
+  email: 'buyer@example.invalid',
+  displayName: '采购员',
+  role: 'operator',
+  permissions: ROLE_PERMISSIONS.operator,
+};
+const reviewerUser: UserContext = {
+  ...user,
+  id: 'auth-reviewer',
+  email: 'reviewer@example.invalid',
+  displayName: '复审员',
+};
 
 describe('真实订单 + MUKU 库存采购计划', () => {
   let mf: Miniflare;
@@ -418,6 +432,13 @@ describe('真实订单 + MUKU 库存采购计划', () => {
       recommendedQty: 0,
     }));
 
+    await executePurchaseRequestAction(db, buyerUser, created.request.id, {
+      action: 'submit',
+    }, 'submit-planned-request-0001', { now });
+    await executePurchaseRequestAction(db, reviewerUser, created.request.id, {
+      action: 'approve',
+    }, 'approve-planned-request-0001', { now });
+
     await db.prepare(`
       UPDATE muku_inventory_records SET available_qty = 3
       WHERE tenant_id = ? AND snapshot_id = 'snapshot-inventory'
@@ -434,12 +455,6 @@ describe('真实订单 + MUKU 库存采购计划', () => {
       conversionBlocked: true,
       reasons: expect.arrayContaining(['order_demand_already_in_active_request']),
     }));
-    await executePurchaseRequestAction(db, user, created.request.id, {
-      action: 'submit',
-    }, 'submit-planned-request-0001');
-    await executePurchaseRequestAction(db, user, created.request.id, {
-      action: 'approve',
-    }, 'approve-planned-request-0001');
     const supplier = await createSupplier(db, user, {
       code: 'SUP-PLAN', name: '计划供应商',
     }, 'create-plan-supplier-0001');
@@ -491,6 +506,95 @@ describe('真实订单 + MUKU 库存采购计划', () => {
       recommendedQty: 3,
     }));
     expect(reflected.rows[0].blockers).not.toContain('receipt_not_reflected_in_muku');
+  });
+
+  it('人工库存确认过期后拒绝提交既有采购建议草稿', async () => {
+    const created = await createManualInventoryPlannedRequest(db, 'expired-submit');
+    const expiredAt = new Date(now.getTime() + 24 * 60 * 60 * 1000 + 60_000);
+    await refreshOfficialOrderSourceAt(db, expiredAt);
+
+    await expect(executePurchaseRequestAction(
+      db,
+      buyerUser,
+      created.request.id,
+      { action: 'submit' },
+      'submit-expired-confirmation-0001',
+      { now: expiredAt, maxAgeMinutes: 2_000 },
+    )).rejects.toMatchObject({ code: 'PURCHASE_RECOMMENDATION_STALE' });
+    const stored = await db.prepare('SELECT status FROM purchase_requests WHERE id = ?')
+      .bind(created.request.id).first<{ status: string }>();
+    expect(stored?.status).toBe('draft');
+  });
+
+  it('及时提交后，人工库存确认过期仍会阻止复审批准', async () => {
+    const created = await createManualInventoryPlannedRequest(db, 'expired-approve');
+    await executePurchaseRequestAction(
+      db,
+      buyerUser,
+      created.request.id,
+      { action: 'submit' },
+      'submit-before-confirmation-expiry',
+      { now },
+    );
+    const expiredAt = new Date(now.getTime() + 24 * 60 * 60 * 1000 + 60_000);
+    await refreshOfficialOrderSourceAt(db, expiredAt);
+
+    await expect(executePurchaseRequestAction(
+      db,
+      reviewerUser,
+      created.request.id,
+      { action: 'approve' },
+      'approve-after-confirmation-expiry',
+      { now: expiredAt, maxAgeMinutes: 2_000 },
+    )).rejects.toMatchObject({ code: 'PURCHASE_RECOMMENDATION_STALE' });
+    const stored = await db.prepare('SELECT status FROM purchase_requests WHERE id = ?')
+      .bind(created.request.id).first<{ status: string }>();
+    expect(stored?.status).toBe('pending_review');
+  });
+
+  it('旧版计划草稿缺少验证快照时拒绝提交且保留原历史', async () => {
+    await upsertMukuSkuMapping(db, user, {
+      mukuSku: 'MUKU-CHAIR', skuId: 'sku-service',
+    }, 'map-for-legacy-plan-0001');
+    const plan = await getPurchasePlanning(db, user, { now });
+    const row = plan.rows[0];
+    const created = await createPurchaseRequestFromPlanning(db, user, {
+      selections: [{
+        planRowId: row.planRowId,
+        recommendationVersion: row.recommendationVersion,
+      }],
+      purchaserMemberId: 'member-buyer',
+      reviewerMemberId: 'member-reviewer',
+    }, 'create-legacy-plan-draft-0001', { now });
+    const creationAudit = await db.prepare(`
+      SELECT id, after_json FROM audit_logs
+      WHERE tenant_id = ? AND entity_id = ? AND action = 'CREATE_PURCHASE_REQUEST_FROM_PLAN'
+      LIMIT 1
+    `).bind(tenantId, created.request.id).first<{ id: string; after_json: string }>();
+    const legacyAudit = JSON.parse(creationAudit!.after_json) as Record<string, unknown>;
+    delete legacyAudit.planningEvidence;
+    await db.prepare('UPDATE audit_logs SET after_json = ? WHERE id = ?')
+      .bind(JSON.stringify(legacyAudit), creationAudit!.id).run();
+
+    await expect(executePurchaseRequestAction(
+      db,
+      buyerUser,
+      created.request.id,
+      { action: 'submit' },
+      'submit-legacy-plan-draft-0001',
+      { now },
+    )).rejects.toMatchObject({ code: 'PURCHASE_PLAN_EVIDENCE_MISSING' });
+    const stored = await db.prepare(`
+      SELECT pr.status, line.active
+      FROM purchase_requests pr
+      JOIN purchase_request_lines line ON line.request_id = pr.id
+      WHERE pr.id = ?
+    `).bind(created.request.id).first<{ status: string; active: number }>();
+    expect(stored).toEqual({ status: 'draft', active: 1 });
+    const auditCount = await db.prepare(`
+      SELECT COUNT(*) AS count FROM audit_logs WHERE tenant_id = ? AND entity_id = ?
+    `).bind(tenantId, created.request.id).first<{ count: number }>();
+    expect(Number(auditCount?.count)).toBe(1);
   });
 
   it('库存 null 或快照过期时阻断，真实 0 则生成建议', async () => {
@@ -680,6 +784,38 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     });
   });
 });
+
+async function createManualInventoryPlannedRequest(db: D1Database, key: string) {
+  await upsertSkuInventoryConfirmation(db, user, {
+    skuId: 'sku-service',
+    confirmedAvailableQty: 6,
+    note: '测试 24 小时人工库存确认失效保护',
+  }, `confirm-manual-${key}`, { now });
+  const plan = await getPurchasePlanning(db, user, { now });
+  const row = plan.rows[0];
+  expect(row).toEqual(expect.objectContaining({
+    availableQtySource: 'manual_confirmation',
+    effectiveAvailableQty: 6,
+  }));
+  expect(row.inventoryConfirmation).toEqual(expect.objectContaining({ active: true, used: true }));
+  return createPurchaseRequestFromPlanning(db, user, {
+    selections: [{
+      planRowId: row.planRowId,
+      recommendationVersion: row.recommendationVersion,
+    }],
+    purchaserMemberId: 'member-buyer',
+    reviewerMemberId: 'member-reviewer',
+  }, `create-manual-plan-${key}`, { now });
+}
+
+async function refreshOfficialOrderSourceAt(db: D1Database, timestamp: Date) {
+  const value = timestamp.toISOString();
+  await db.prepare(`
+    UPDATE platform_stores
+    SET last_successful_sync_at = ?, updated_at = ?
+    WHERE tenant_id = ?
+  `).bind(value, value, tenantId).run();
+}
 
 async function seedMembers(db: D1Database) {
   const timestamp = '2026-11-02T09:00:00.000Z';

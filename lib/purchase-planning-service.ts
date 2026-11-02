@@ -5,6 +5,7 @@ import type {
   UpsertSkuInventoryConfirmationInput,
   UpsertSkuProcurementPolicyInput,
 } from './contracts';
+import { developmentOpenAccessEnabled } from './access-policy';
 import { HttpError, requirePermission, type UserContext } from './db';
 import { evaluateMukuFreshness } from './muku-freshness-service';
 import {
@@ -117,6 +118,16 @@ type MukuAssignment = {
 
 export type PurchasePlanningRow = Awaited<ReturnType<typeof buildPlanningRow>>;
 
+export type PurchasePlanningEvidence = {
+  schemaVersion: 1;
+  rows: Array<{
+    planRowId: string;
+    skuId: string;
+    recommendationVersion: string;
+    allocations: Array<{ demandId: string; quantity: number }>;
+  }>;
+};
+
 export async function getPurchasePlanning(
   db: D1Database,
   user: UserContext,
@@ -125,6 +136,7 @@ export async function getPurchasePlanning(
     maxAgeMinutes?: number;
     sourceMaxAgeMinutes?: number;
     runtimeEnv?: Record<string, unknown>;
+    excludePurchaseRequestId?: string;
   } = {},
 ) {
   requirePermission(user, 'purchase:read');
@@ -202,8 +214,13 @@ export async function getPurchasePlanning(
         ON pol.purchase_order_id = po.id AND pol.purchase_request_line_id = line.id
         AND pol.tenant_id = line.tenant_id
       WHERE line.tenant_id = ? AND line.active = 1
+        AND (? IS NULL OR line.request_id <> ?)
       ORDER BY line.id
-    `).bind(user.tenantId).all<ActiveRequestLineRow>(),
+    `).bind(
+      user.tenantId,
+      options.excludePurchaseRequestId ?? null,
+      options.excludePurchaseRequestId ?? null,
+    ).all<ActiveRequestLineRow>(),
     db.prepare(`
       SELECT id, muku_sku, normalized_muku_sku, sku_id, mapping_source, updated_at
       FROM muku_sku_mappings
@@ -1218,6 +1235,7 @@ export async function createPurchaseRequestFromPlanning(
   const rowById = new Map(plan.rows.map((row) => [row.planRowId, row]));
   const allocations: Array<{ demandId: string; requestedQuantity: number }> = [];
   const versions: string[] = [];
+  const evidenceRows: PurchasePlanningEvidence['rows'] = [];
   for (const selection of normalizedSelections) {
     const row = rowById.get(selection.planRowId);
     if (!row) throw new HttpError(404, '采购建议不存在或不在当前数据范围内', 'PURCHASE_PLAN_ROW_NOT_FOUND');
@@ -1242,7 +1260,14 @@ export async function createPurchaseRequestFromPlanning(
       requestedQuantity: allocation.quantity,
     })));
     versions.push(row.recommendationVersion);
+    evidenceRows.push({
+      planRowId: row.planRowId,
+      skuId: row.skuId,
+      recommendationVersion: row.recommendationVersion,
+      allocations: row.demandAllocations.map((allocation) => ({ ...allocation })),
+    });
   }
+  const runtimeEnv = options.runtimeEnv ?? env as unknown as Record<string, unknown>;
   return createPurchaseRequestFromAllocations(db, user, {
     purchaserMemberId: input.purchaserMemberId,
     reviewerMemberId: input.reviewerMemberId,
@@ -1250,7 +1275,63 @@ export async function createPurchaseRequestFromPlanning(
     allocations,
     recommendationVersions: versions,
     planningInputHash,
-  }, idempotencyKey);
+    planningEvidence: { schemaVersion: 1, rows: evidenceRows },
+  }, idempotencyKey, {
+    developmentOpenAccess: developmentOpenAccessEnabled(runtimeEnv),
+  });
+}
+
+export async function assertPurchaseRequestPlanningEvidenceCurrent(
+  db: D1Database,
+  user: UserContext,
+  purchaseRequestId: string,
+  evidence: PurchasePlanningEvidence,
+  options: {
+    now?: Date;
+    maxAgeMinutes?: number;
+    sourceMaxAgeMinutes?: number;
+    runtimeEnv?: Record<string, unknown>;
+  } = {},
+) {
+  const current = await getPurchasePlanning(db, user, {
+    ...options,
+    excludePurchaseRequestId: purchaseRequestId,
+  });
+  if (!current.orderSourceReadiness) {
+    throw new HttpError(
+      409,
+      '官方订单同步未知、失败或已过期，请刷新订单和采购建议后重试',
+      'PURCHASE_RECOMMENDATION_STALE',
+    );
+  }
+  const rowById = new Map(current.rows.map((row) => [row.planRowId, row]));
+  for (const expected of evidence.rows) {
+    const row = rowById.get(expected.planRowId);
+    const allocations = row?.demandAllocations
+      .map((allocation) => ({ ...allocation }))
+      .sort(comparePlanningAllocations);
+    const expectedAllocations = expected.allocations
+      .map((allocation) => ({ ...allocation }))
+      .sort(comparePlanningAllocations);
+    if (!row
+      || row.skuId !== expected.skuId
+      || row.recommendationVersion !== expected.recommendationVersion
+      || row.blockers.length > 0
+      || JSON.stringify(allocations) !== JSON.stringify(expectedAllocations)) {
+      throw new HttpError(
+        409,
+        '采购建议所依据的订单、库存、确认有效期或策略已变化，请刷新建议并重新生成申请',
+        'PURCHASE_RECOMMENDATION_STALE',
+      );
+    }
+  }
+}
+
+function comparePlanningAllocations(
+  left: { demandId: string; quantity: number },
+  right: { demandId: string; quantity: number },
+) {
+  return left.demandId.localeCompare(right.demandId) || left.quantity - right.quantity;
 }
 
 function allocateDeterministically(demands: DemandRow[], quantity: number) {

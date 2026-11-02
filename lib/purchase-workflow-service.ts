@@ -9,6 +9,7 @@ import {
 } from './db';
 import { getPurchaseDemands } from './purchase-demand-service';
 import { getProcurementWorkspaceData } from './purchase-order-service';
+import type { PurchasePlanningEvidence } from './purchase-planning-service';
 
 export type PurchaseRequestStatus =
   | 'draft'
@@ -80,6 +81,17 @@ type CurrentRequestRow = {
   id: string;
   status: PurchaseRequestStatus;
   version: number;
+  purchaser_member_id: string;
+  reviewer_member_id: string;
+  planning_audit_json: string | null;
+};
+
+export type PurchaseWorkflowOptions = {
+  developmentOpenAccess?: boolean;
+  now?: Date;
+  maxAgeMinutes?: number;
+  sourceMaxAgeMinutes?: number;
+  runtimeEnv?: Record<string, unknown>;
 };
 
 const ACTION_TRANSITIONS: Record<PurchaseRequestAction, {
@@ -106,7 +118,11 @@ const ACTION_TRANSITIONS: Record<PurchaseRequestAction, {
   },
 };
 
-export async function getPurchaseWorkspace(db: D1Database, user: UserContext) {
+export async function getPurchaseWorkspace(
+  db: D1Database,
+  user: UserContext,
+  options: Pick<PurchaseWorkflowOptions, 'developmentOpenAccess'> = {},
+) {
   requirePermission(user, 'purchase:read');
   const demandPayload = await getPurchaseDemands(db, user);
   const [allocations, requestRows, lineRows, members, skuOptions, availability] = await Promise.all([
@@ -128,12 +144,14 @@ export async function getPurchaseWorkspace(db: D1Database, user: UserContext) {
       LIMIT 2000
     `).bind(user.tenantId).all<PurchaseRequestLineRow>(),
     db.prepare(`
-      SELECT id, display_name, role
+      SELECT id, auth_user_id, display_name, role
       FROM members
       WHERE tenant_id = ?
       ORDER BY display_name, id
       LIMIT 500
-    `).bind(user.tenantId).all<{ id: string; display_name: string; role: string }>(),
+    `).bind(user.tenantId).all<{
+      id: string; auth_user_id: string; display_name: string; role: string;
+    }>(),
     db.prepare(`
       SELECT id, code, name
       FROM skus
@@ -209,6 +227,8 @@ export async function getPurchaseWorkspace(db: D1Database, user: UserContext) {
       displayName: member.display_name,
       role: member.role,
     })),
+    currentMemberId: members.results.find((member) => member.auth_user_id === user.id)?.id ?? null,
+    developmentOpenAccess: options.developmentOpenAccess === true,
     skuOptions: skuOptions.results.map((sku) => ({ id: sku.id, code: sku.code, name: sku.name })),
     ...procurement,
     readOnly: false as const,
@@ -220,6 +240,7 @@ export async function createPurchaseRequest(
   user: UserContext,
   input: CreatePurchaseRequestInput,
   idempotencyKey: string,
+  options: Pick<PurchaseWorkflowOptions, 'developmentOpenAccess'> = {},
 ) {
   const normalizedInput = {
     ...input,
@@ -237,7 +258,7 @@ export async function createPurchaseRequest(
     requestHashInput: normalizedInput,
     auditAction: 'CREATE_PURCHASE_REQUEST',
     auditContext: null,
-  }, idempotencyKey);
+  }, idempotencyKey, options);
 }
 
 export type PurchaseRequestAllocationInput = {
@@ -247,6 +268,7 @@ export type PurchaseRequestAllocationInput = {
   allocations: Array<{ demandId: string; requestedQuantity: number }>;
   recommendationVersions: string[];
   planningInputHash: string;
+  planningEvidence: PurchasePlanningEvidence;
 };
 
 export async function createPurchaseRequestFromAllocations(
@@ -254,6 +276,7 @@ export async function createPurchaseRequestFromAllocations(
   user: UserContext,
   input: PurchaseRequestAllocationInput,
   idempotencyKey: string,
+  options: Pick<PurchaseWorkflowOptions, 'developmentOpenAccess'> = {},
 ) {
   const normalizedInput = {
     purchaserMemberId: input.purchaserMemberId,
@@ -262,6 +285,7 @@ export async function createPurchaseRequestFromAllocations(
     allocations: [...input.allocations].sort((left, right) => left.demandId.localeCompare(right.demandId)),
     recommendationVersions: [...input.recommendationVersions].sort(),
     planningInputHash: input.planningInputHash,
+    planningEvidence: input.planningEvidence,
   };
   return createPurchaseRequestWithAllocations(db, user, {
     ...normalizedInput,
@@ -274,8 +298,9 @@ export async function createPurchaseRequestFromAllocations(
     auditContext: {
       recommendationVersions: normalizedInput.recommendationVersions,
       planningInputHash: normalizedInput.planningInputHash,
+      planningEvidence: normalizedInput.planningEvidence,
     },
-  }, idempotencyKey);
+  }, idempotencyKey, options);
 }
 
 async function createPurchaseRequestWithAllocations(
@@ -291,6 +316,7 @@ async function createPurchaseRequestWithAllocations(
     auditContext: Record<string, unknown> | null;
   },
   idempotencyKey: string,
+  options: Pick<PurchaseWorkflowOptions, 'developmentOpenAccess'> = {},
 ) {
   requirePermission(user, 'purchase:create');
   validateIdempotencyKey(idempotencyKey);
@@ -321,6 +347,11 @@ async function createPurchaseRequestWithAllocations(
     user.tenantId,
     input.purchaserMemberId,
     input.reviewerMemberId,
+  );
+  assertReviewerSeparation(
+    input.purchaserMemberId,
+    input.reviewerMemberId,
+    options.developmentOpenAccess === true,
   );
   const demands = await loadCreateDemands(db, user.tenantId, demandIds);
   validateCreateDemands(demandIds, demands);
@@ -415,10 +446,23 @@ export async function executePurchaseRequestAction(
   purchaseRequestId: string,
   input: PurchaseRequestActionInput,
   idempotencyKey: string,
+  options: PurchaseWorkflowOptions = {},
 ) {
   validateIdempotencyKey(idempotencyKey);
   const transition = ACTION_TRANSITIONS[input.action];
   requirePermission(user, transition.permission);
+
+  const current = await getCurrentPurchaseRequest(db, user.tenantId, purchaseRequestId);
+  const actorMemberId = await resolveActorMemberId(db, user);
+  assertAssignedActor(current, actorMemberId, input.action);
+  if ((input.action === 'submit' || input.action === 'approve')
+    && options.developmentOpenAccess !== true) {
+    assertReviewerSeparation(
+      current.purchaser_member_id,
+      current.reviewer_member_id,
+      false,
+    );
+  }
 
   const receipt = await db.prepare(`
     SELECT entity_id, action
@@ -436,15 +480,15 @@ export async function executePurchaseRequestAction(
     };
   }
 
-  const current = await getCurrentPurchaseRequest(db, user.tenantId, purchaseRequestId);
   if (current.status !== transition.from) {
     throw new HttpError(409, '当前采购申请状态不允许执行该操作', 'INVALID_PURCHASE_REQUEST_TRANSITION');
   }
   if (input.action === 'submit' || input.action === 'approve') {
     await assertRequestDemandsStillValid(db, user.tenantId, purchaseRequestId);
+    await assertRequestPlanningStillValid(db, user, current, options);
   }
 
-  const now = new Date().toISOString();
+  const now = (options.now ?? new Date()).toISOString();
   const actionRequestId = crypto.randomUUID();
   const beforeJson = JSON.stringify({ status: current.status, version: current.version });
   const afterJson = JSON.stringify({
@@ -729,6 +773,40 @@ async function validateAssignedMembers(
   }
 }
 
+function assertReviewerSeparation(
+  purchaserMemberId: string,
+  reviewerMemberId: string,
+  developmentOpenAccess: boolean,
+) {
+  if (!developmentOpenAccess && purchaserMemberId === reviewerMemberId) {
+    throw new HttpError(
+      409,
+      '正式模式要求采购负责人和复审人为不同成员，请重新分配后再继续',
+      'PURCHASE_REVIEWER_MUST_DIFFER',
+    );
+  }
+}
+
+function assertAssignedActor(
+  request: Pick<CurrentRequestRow, 'purchaser_member_id' | 'reviewer_member_id'>,
+  actorMemberId: string,
+  action: PurchaseRequestAction,
+) {
+  const purchaserAction = action === 'submit' || action === 'cancel';
+  const assignedMemberId = purchaserAction
+    ? request.purchaser_member_id
+    : request.reviewer_member_id;
+  if (actorMemberId !== assignedMemberId) {
+    throw new HttpError(
+      403,
+      purchaserAction
+        ? '只有该申请指定的采购负责人可以提交或取消'
+        : '只有该申请指定的复审人可以批准或驳回',
+      purchaserAction ? 'PURCHASE_PURCHASER_REQUIRED' : 'PURCHASE_REVIEWER_REQUIRED',
+    );
+  }
+}
+
 async function loadCreateDemands(db: D1Database, tenantId: string, demandIds: string[]) {
   const placeholders = demandIds.map(() => '?').join(', ');
   const rows = await db.prepare(`
@@ -765,13 +843,84 @@ function validateCreateDemands(demandIds: string[], demands: CreateDemandRow[]) 
 
 async function getCurrentPurchaseRequest(db: D1Database, tenantId: string, id: string) {
   const row = await db.prepare(`
-    SELECT id, status, version
-    FROM purchase_requests
-    WHERE tenant_id = ? AND id = ?
+    SELECT
+      pr.id,
+      pr.status,
+      pr.version,
+      pr.purchaser_member_id,
+      pr.reviewer_member_id,
+      (
+        SELECT log.after_json
+        FROM audit_logs log
+        WHERE log.tenant_id = pr.tenant_id
+          AND log.entity_type = 'purchase_request'
+          AND log.entity_id = pr.id
+          AND log.action = 'CREATE_PURCHASE_REQUEST_FROM_PLAN'
+        ORDER BY log.created_at, log.id
+        LIMIT 1
+      ) AS planning_audit_json
+    FROM purchase_requests pr
+    WHERE pr.tenant_id = ? AND pr.id = ?
     LIMIT 1
   `).bind(tenantId, id).first<CurrentRequestRow>();
   if (!row) throw new HttpError(404, '采购申请不存在或不在当前数据范围内', 'PURCHASE_REQUEST_NOT_FOUND');
   return row;
+}
+
+async function assertRequestPlanningStillValid(
+  db: D1Database,
+  user: UserContext,
+  request: CurrentRequestRow,
+  options: PurchaseWorkflowOptions,
+) {
+  if (request.planning_audit_json === null) return;
+  const audit = parseJsonObject(request.planning_audit_json);
+  const evidence = audit?.planningEvidence;
+  if (!isPurchasePlanningEvidence(evidence)) {
+    throw new HttpError(
+      409,
+      '该旧版采购建议草稿缺少可复验依据，请刷新采购建议并重新生成申请',
+      'PURCHASE_PLAN_EVIDENCE_MISSING',
+    );
+  }
+  const { assertPurchaseRequestPlanningEvidenceCurrent } = await import('./purchase-planning-service');
+  await assertPurchaseRequestPlanningEvidenceCurrent(db, user, request.id, evidence, {
+    now: options.now,
+    maxAgeMinutes: options.maxAgeMinutes,
+    sourceMaxAgeMinutes: options.sourceMaxAgeMinutes,
+    runtimeEnv: options.runtimeEnv,
+  });
+}
+
+function parseJsonObject(value: string | null): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPurchasePlanningEvidence(value: unknown): value is PurchasePlanningEvidence {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const candidate = value as Partial<PurchasePlanningEvidence>;
+  return candidate.schemaVersion === 1
+    && Array.isArray(candidate.rows)
+    && candidate.rows.length > 0
+    && candidate.rows.every((row) => row !== null && typeof row === 'object'
+      && typeof row.planRowId === 'string'
+      && typeof row.skuId === 'string'
+      && typeof row.recommendationVersion === 'string'
+      && Array.isArray(row.allocations)
+      && row.allocations.length > 0
+      && row.allocations.every((allocation) => allocation !== null
+        && typeof allocation === 'object'
+        && typeof allocation.demandId === 'string'
+        && Number.isSafeInteger(allocation.quantity)
+        && allocation.quantity > 0));
 }
 
 async function assertRequestDemandsStillValid(db: D1Database, tenantId: string, requestId: string) {

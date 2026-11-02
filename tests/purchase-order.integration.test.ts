@@ -28,6 +28,20 @@ const user: UserContext = {
   id: 'auth-creator', email: 'creator@example.invalid', displayName: '创建人', role: 'admin',
   permissions: ROLE_PERMISSIONS.admin, tenantId, tenantName: '采购单测试工作区',
 };
+const buyerUser: UserContext = {
+  ...user,
+  id: 'auth-buyer',
+  email: 'buyer@example.invalid',
+  displayName: '采购员',
+  role: 'operator',
+  permissions: ROLE_PERMISSIONS.operator,
+};
+const reviewerUser: UserContext = {
+  ...user,
+  id: 'auth-reviewer',
+  email: 'reviewer@example.invalid',
+  displayName: '复审员',
+};
 const config: ShopifyCredentialConfig = {
   key: 'bizfurniz', displayName: 'BizFurniz', domain: 'bizfurniz.myshopify.com',
   expectedDomain: 'bizfurniz.myshopify.com', acceptedDomains: ['bizfurniz.myshopify.com'],
@@ -343,8 +357,8 @@ async function approveRequest(db: D1Database, demandId: string) {
   const created = await createPurchaseRequest(db, user, {
     demandIds: [demandId], purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer',
   }, `request-create-${crypto.randomUUID()}`);
-  await executePurchaseRequestAction(db, user, created.request.id, { action: 'submit' }, `request-submit-${crypto.randomUUID()}`);
-  const approved = await executePurchaseRequestAction(db, user, created.request.id, { action: 'approve' }, `request-approve-${crypto.randomUUID()}`);
+  await executePurchaseRequestAction(db, buyerUser, created.request.id, { action: 'submit' }, `request-submit-${crypto.randomUUID()}`);
+  const approved = await executePurchaseRequestAction(db, reviewerUser, created.request.id, { action: 'approve' }, `request-approve-${crypto.randomUUID()}`);
   return approved.request.id;
 }
 

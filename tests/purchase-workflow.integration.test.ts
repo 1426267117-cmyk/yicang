@@ -32,6 +32,20 @@ const user: UserContext = {
   id: 'auth-creator', email: 'creator@example.invalid', displayName: '创建人', role: 'admin',
   permissions: ROLE_PERMISSIONS.admin, tenantId, tenantName: '采购测试工作区',
 };
+const buyerUser: UserContext = {
+  ...user,
+  id: 'auth-buyer',
+  email: 'buyer@example.invalid',
+  displayName: '采购员',
+  role: 'operator',
+  permissions: ROLE_PERMISSIONS.operator,
+};
+const reviewerUser: UserContext = {
+  ...user,
+  id: 'auth-reviewer',
+  email: 'reviewer@example.invalid',
+  displayName: '复审员',
+};
 
 describe('采购申请闭环', () => {
   let mf: Miniflare;
@@ -88,18 +102,18 @@ describe('采购申请闭环', () => {
     const created = await createPurchaseRequest(db, user, {
       demandIds: [demandId], purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer',
     }, 'create-request-1001');
-    const submitted = await executePurchaseRequestAction(db, user, created.request.id, {
+    const submitted = await executePurchaseRequestAction(db, buyerUser, created.request.id, {
       action: 'submit', note: '提交复审',
     }, 'submit-request-1001');
     expect(submitted.request.status).toBe('pending_review');
-    const approved = await executePurchaseRequestAction(db, user, created.request.id, {
+    const approved = await executePurchaseRequestAction(db, reviewerUser, created.request.id, {
       action: 'approve', note: '批准采购',
     }, 'approve-request-1001');
     expect(approved.request).toEqual(expect.objectContaining({
       status: 'approved', reviewNote: '批准采购', needsAttention: false,
     }));
 
-    const replay = await executePurchaseRequestAction(db, user, created.request.id, {
+    const replay = await executePurchaseRequestAction(db, reviewerUser, created.request.id, {
       action: 'approve', note: '批准采购',
     }, 'approve-request-1001');
     expect(replay.replayed).toBe(true);
@@ -121,8 +135,8 @@ describe('采购申请闭环', () => {
     const first = await createPurchaseRequest(db, user, {
       demandIds: [demandId], purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer',
     }, 'create-request-2001');
-    await executePurchaseRequestAction(db, user, first.request.id, { action: 'submit' }, 'submit-request-2001');
-    const rejected = await executePurchaseRequestAction(db, user, first.request.id, {
+    await executePurchaseRequestAction(db, buyerUser, first.request.id, { action: 'submit' }, 'submit-request-2001');
+    const rejected = await executePurchaseRequestAction(db, reviewerUser, first.request.id, {
       action: 'reject', note: '供应安排需要调整',
     }, 'reject-request-2001');
     expect(rejected.request).toEqual(expect.objectContaining({
@@ -148,12 +162,75 @@ describe('采购申请闭环', () => {
       SET status = 'not_required', required_quantity = 0, reason_code = 'cancelled_order', updated_at = ?
       WHERE id = ? AND tenant_id = ?
     `).bind('2026-11-02T13:00:00.000Z', demandId, tenantId).run();
-    await expect(executePurchaseRequestAction(db, user, created.request.id, {
+    await expect(executePurchaseRequestAction(db, buyerUser, created.request.id, {
       action: 'submit',
     }, 'submit-request-3001')).rejects.toMatchObject({ code: 'PURCHASE_DEMAND_CHANGED' });
     const stored = await db.prepare('SELECT status FROM purchase_requests WHERE id = ?')
       .bind(created.request.id).first<{ status: string }>();
     expect(stored?.status).toBe('draft');
+  });
+
+  it('只有分配的负责人可提交，只有分配的复审人可审批', async () => {
+    const created = await createPurchaseRequest(db, user, {
+      demandIds: [demandId], purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer',
+    }, 'create-request-assignee-0001');
+    await expect(executePurchaseRequestAction(db, user, created.request.id, {
+      action: 'submit',
+    }, 'submit-request-assignee-denied')).rejects.toMatchObject({
+      code: 'PURCHASE_PURCHASER_REQUIRED',
+    });
+    await executePurchaseRequestAction(db, buyerUser, created.request.id, {
+      action: 'submit',
+    }, 'submit-request-assignee-0001');
+    await expect(executePurchaseRequestAction(db, user, created.request.id, {
+      action: 'approve',
+    }, 'approve-request-assignee-denied')).rejects.toMatchObject({
+      code: 'PURCHASE_REVIEWER_REQUIRED',
+    });
+    const approved = await executePurchaseRequestAction(db, reviewerUser, created.request.id, {
+      action: 'approve',
+    }, 'approve-request-assignee-0001');
+    expect(approved.request.status).toBe('approved');
+  });
+
+  it('正式模式强制岗位分离，开发开放模式明确允许同人试运行', async () => {
+    const sameAssigneeInput = {
+      demandIds: [demandId],
+      purchaserMemberId: 'member-reviewer',
+      reviewerMemberId: 'member-reviewer',
+    };
+    await expect(createPurchaseRequest(
+      db,
+      user,
+      sameAssigneeInput,
+      'create-request-same-formal',
+    )).rejects.toMatchObject({ code: 'PURCHASE_REVIEWER_MUST_DIFFER' });
+
+    const created = await createPurchaseRequest(
+      db,
+      user,
+      sameAssigneeInput,
+      'create-request-same-development',
+      { developmentOpenAccess: true },
+    );
+    const submitted = await executePurchaseRequestAction(
+      db,
+      reviewerUser,
+      created.request.id,
+      { action: 'submit' },
+      'submit-request-same-development',
+      { developmentOpenAccess: true },
+    );
+    expect(submitted.request.status).toBe('pending_review');
+    const approved = await executePurchaseRequestAction(
+      db,
+      reviewerUser,
+      created.request.id,
+      { action: 'approve' },
+      'approve-request-same-development',
+      { developmentOpenAccess: true },
+    );
+    expect(approved.request.status).toBe('approved');
   });
 });
 
