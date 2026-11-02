@@ -1497,11 +1497,16 @@ function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanR
     return <div className="planning-unavailable"><strong>采购建议暂时不可用</strong><span>{error || '正在等待库存快照和采购策略数据。现有申请、采购单与到货流程不受影响。'}</span></div>;
   }
   const freshness = planning.freshness;
-  const freshnessState = freshness.readyForProcurement
+  const sourceTimeBlocked = planning.rows.some((row) => row.blockers.some((reason) => [
+    'inventory_source_stale', 'inventory_source_time_unknown', 'inventory_source_time_invalid',
+  ].includes(reason)));
+  const freshnessState = freshness.readyForProcurement && !sourceTimeBlocked
     ? { label: '库存数据可用于采购', className: 'ready' }
     : freshness.status === 'refreshing'
       ? { label: '库存正在刷新', className: 'pending' }
-      : { label: '库存数据不可用于采购', className: 'error' };
+      : freshness.readyForProcurement
+        ? { label: 'MUKU 出口已更新，仓库源数据需处理', className: 'error' }
+        : { label: '库存数据不可用于采购', className: 'error' };
   const inventoryFreshness = freshness.datasets.find((item) => item.dataset === 'inventory');
   const selectedRows = planning.rows.filter((row) => selectedPlanRowIds.has(row.planRowId));
   const selectedQuantity = selectedRows.reduce((sum, row) => sum + row.conversion.eligibleOrderQty, 0);
@@ -1511,6 +1516,7 @@ function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanR
       <div><span className="planning-signal" /><div><strong>{freshnessState.label}</strong><small>最近检查 {formatOptionalTime(freshness.checkedAt)} · 允许时效 {freshness.maxAgeMinutes} 分钟</small></div></div>
       <div className="planning-source-times"><span>MUKU 库存生成 <b>{formatOptionalTime(inventoryFreshness?.generatedAt ?? null)}</b></span><span>ERP 同步 <b>{formatOptionalTime(inventoryFreshness?.lastSuccessAt ?? null)}</b></span></div>
       {!freshness.readyForProcurement && <p>{freshness.blockingReasons.map((reason) => reason.message).join('；') || '库存快照状态未知，暂不允许转采购申请。'}</p>}
+      {freshness.readyForProcurement && sourceTimeBlocked && <p>ERP 刚读取到 MUKU 导出，但至少一项仓库业务源时间未知、无效或超过采购时效，相关建议已被阻断。</p>}
     </section>
     <section className="planning-formula" aria-label="采购建议公式"><div><strong>系统怎么算</strong><span>{planning.formula.target} − {planning.formula.coverage}</span></div><small>{planning.formula.recommendation}。MUKU 在途只展示，不参与抵扣。</small></section>
     {error && <div className="planning-inline-warning">{error}</div>}
@@ -2065,7 +2071,11 @@ function demandAvailableQuantity(demand: PurchaseDemand) {
 }
 
 function planningRowConvertible(row: PurchasePlanningRow, readiness: PurchasePlanningPayload['readiness'], orderSourceReadiness = true) {
-  return orderSourceReadiness && readiness !== 'stale' && row.blockers.length === 0 && row.conversion.eligibleOrderQty > 0;
+  return orderSourceReadiness
+    && readiness !== 'stale'
+    && row.blockers.length === 0
+    && row.conversion.eligibleOrderQty > 0
+    && !row.conversion.reasons.includes('policy_rounding_exceeds_order_gap');
 }
 
 function planningDecisionLabel(decision: PurchasePlanningRow['decision']) {
@@ -2115,7 +2125,10 @@ function formatOrderSourceWarning(planning: PurchasePlanningPayload) {
 }
 
 function planningPrimaryBlocker(row: PurchasePlanningRow) {
-  return row.blockers.length ? planningReasonLabel(row.blockers[0]!) : '当前不可转换';
+  const reason = row.blockers[0]
+    ?? row.conversion.reasons.find((item) => item === 'policy_rounding_exceeds_order_gap')
+    ?? row.conversion.reasons[0];
+  return reason ? planningReasonLabel(reason) : '当前不可转换';
 }
 
 function formatPlanningEquation(row: PurchasePlanningRow) {
