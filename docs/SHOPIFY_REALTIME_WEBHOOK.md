@@ -65,3 +65,29 @@ mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $subscription: Webhook
 11. 保留周期性增量同步作为漏单补偿，Webhook 不能取代对账重扫。
 
 订阅注册在 OAuth 凭证保存后由后台任务幂等执行。注册失败不会影响已成功的授权回跳，日志只记录安全错误码，绝不记录 Token；失败状态展示与主动重试入口属于后续增强项。
+
+## 周期增量对账
+
+后台调度器应每 15 分钟调用一次 `POST /api/connectors/shopify/reconcile`。这个入口复用人工同步已经验证过的增量水位、6 小时重叠窗口、分页断点、同步租约和订单幂等写入，不会另造一套订单落库逻辑。
+
+它是内部任务入口，不使用普通用户登录。即使 `ERP_DEV_OPEN_ACCESS=true`，请求也必须携带：
+
+```text
+Authorization: Bearer <ERP_INTERNAL_JOB_TOKEN>
+Content-Type: application/json
+```
+
+空请求体或 `{}` 会处理 ERP D1 中已经保存授权的全部 Shopify 店铺；不会尝试未授权的候选店铺。需要限制本次店铺或页数时可传：
+
+```json
+{
+  "storeKeys": ["bizfurniz"],
+  "maxPages": 100
+}
+```
+
+首次同步没有完成水位时，任务会为该店返回 `SHOPIFY_INITIAL_RANGE_REQUIRED`，应先通过人工同步明确历史起始时间完成回补。已有水位后，每次定时任务按更新时间增量读取并自动重扫重叠窗口；重复运行由现有主键和内容哈希保证不重复制造订单。访问令牌临近或已经过期时，入口会复用加密刷新凭证和刷新租约自动轮换，响应、日志和文档均不得包含访问令牌或刷新令牌。
+
+任务逐店隔离：一家店失败不会抹掉其他店的成功结果。全成功返回 HTTP 200；存在失败或明确请求了尚未授权的店铺时返回 HTTP 207。响应只包含 `storeKey`、分页数、订单新增/更新/未变化计数、完成时间以及安全错误码和可重试标记，不包含租户 ID、店铺域名、客户资料或凭证。
+
+`ERP_SHOPIFY_RECONCILE_SCHEDULE_CONFIGURED=true` 只用于声明外部调度器已经实际配置并验证。端点代码存在并不代表平台已经自动调用；未配置时保持 `false`。调度器使用的 `ERP_INTERNAL_JOB_TOKEN` 必须作为服务端 Secret 管理，不能写入前端、仓库、命令历史或聊天。
