@@ -5,7 +5,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 type ModuleKey = 'dashboard' | 'platform' | 'orders' | 'inventory' | 'purchase' | 'warehouse' | 'logistics' | 'finance' | 'reports';
 type OrderStatus = 'pending_review' | 'reserved' | 'shipped' | 'cancelled';
 type OrderAction = 'approve' | 'ship' | 'cancel';
-type Permission = 'orders:read' | 'orders:create' | 'orders:approve' | 'orders:ship' | 'orders:cancel' | 'audit:read' | 'connectors:read' | 'connectors:sync' | 'purchase:read' | 'purchase:mapping' | 'purchase:create' | 'purchase:submit' | 'purchase:review' | 'purchase:supplier:create' | 'purchase:order:create' | 'purchase:order:issue' | 'inventory:receive';
+type Permission = 'orders:read' | 'orders:create' | 'orders:approve' | 'orders:ship' | 'orders:cancel' | 'audit:read' | 'connectors:read' | 'connectors:sync' | 'purchase:read' | 'purchase:mapping' | 'purchase:create' | 'purchase:submit' | 'purchase:review' | 'purchase:supplier:create' | 'purchase:order:create' | 'purchase:order:issue' | 'inventory:receive' | 'warehouse:manage';
 
 type ErpOrder = {
   id: string; orderNo: string; channel: string; destination: string; customerName: string;
@@ -182,7 +182,7 @@ const actionLabel: Record<string, string> = {
   MAP_PURCHASE_SKU: '映射采购 SKU', CREATE_PURCHASE_REQUEST: '创建采购申请',
   SUBMIT_PURCHASE_REQUEST: '提交采购复审', APPROVE_PURCHASE_REQUEST: '批准采购申请',
   REJECT_PURCHASE_REQUEST: '驳回采购申请', CANCEL_PURCHASE_REQUEST: '取消采购申请',
-  CREATE_SUPPLIER: '新增供应商', CREATE_PURCHASE_ORDER: '生成正式采购单',
+  CREATE_SUPPLIER: '新增供应商', CREATE_WAREHOUSE: '新增仓库', CREATE_PURCHASE_ORDER: '生成正式采购单',
   ISSUE_PURCHASE_ORDER: '确认采购下单', CANCEL_PURCHASE_ORDER: '取消采购单',
   POST_PURCHASE_RECEIPT: '采购到货入库',
 };
@@ -250,6 +250,7 @@ export default function ErpClient() {
   const [mappingDemand, setMappingDemand] = useState<PurchaseDemand | null>(null);
   const [showPurchaseRequest, setShowPurchaseRequest] = useState(false);
   const [showSupplier, setShowSupplier] = useState(false);
+  const [showWarehouse, setShowWarehouse] = useState(false);
   const [purchaseOrderRequest, setPurchaseOrderRequest] = useState<PurchaseRequest | null>(null);
   const [receivingOrder, setReceivingOrder] = useState<PurchaseOrder | null>(null);
   const [purchaseBusy, setPurchaseBusy] = useState('');
@@ -607,6 +608,29 @@ export default function ErpClient() {
     } finally { setPurchaseBusy(''); }
   }
 
+  async function submitWarehouse(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    setPurchaseBusy('create-warehouse'); setError('');
+    try {
+      const response = await fetch('/api/purchase/warehouses', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          code: String(data.get('code') ?? '').trim(),
+          name: String(data.get('name') ?? '').trim(),
+        }),
+      });
+      const body = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(body.message ?? '仓库创建失败');
+      form.reset(); setShowWarehouse(false); await loadData();
+      flash('仓库已保存，可以继续登记采购到货');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '仓库创建失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
   async function submitPurchaseOrder(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!purchaseOrderRequest) return;
@@ -731,7 +755,7 @@ export default function ErpClient() {
             {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}
             {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
             {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} />}
-            {active === 'purchase' && <PurchaseWorkspaceView demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} openSupplier={() => setShowSupplier(true)} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={setReceivingOrder} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
+            {active === 'purchase' && <PurchaseWorkspaceView demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={setReceivingOrder} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
             {!['dashboard','platform','orders','inventory','purchase'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
           </>
         ) : <LoadingState message={error || '暂时无法加载业务数据'} />}
@@ -741,8 +765,9 @@ export default function ErpClient() {
       {mappingDemand && purchasePayload && <SkuMappingModal demand={mappingDemand} skuOptions={purchasePayload.skuOptions} busy={purchaseBusy.startsWith('mapping:')} error={error} onClose={() => { if (!purchaseBusy) { setMappingDemand(null); setError(''); } }} onSubmit={submitSkuMapping} />}
       {showPurchaseRequest && purchasePayload && <PurchaseRequestModal demands={purchasePayload.demands.filter((demand) => selectedDemandIds.has(demand.id))} members={purchasePayload.members} busy={purchaseBusy === 'create-request'} error={error} onClose={() => { if (!purchaseBusy) { setShowPurchaseRequest(false); setError(''); } }} onSubmit={submitPurchaseRequest} />}
       {showSupplier && <SupplierModal busy={purchaseBusy === 'create-supplier'} error={error} onClose={() => { if (!purchaseBusy) { setShowSupplier(false); setError(''); } }} onSubmit={submitSupplier} />}
+      {showWarehouse && <WarehouseModal busy={purchaseBusy === 'create-warehouse'} error={error} onClose={() => { if (!purchaseBusy) { setShowWarehouse(false); setError(''); } }} onSubmit={submitWarehouse} />}
       {purchaseOrderRequest && purchasePayload && <PurchaseOrderModal request={purchaseOrderRequest} suppliers={purchasePayload.suppliers} busy={purchaseBusy.startsWith('create-order:')} error={error} openSupplier={() => setShowSupplier(true)} onClose={() => { if (!purchaseBusy) { setPurchaseOrderRequest(null); setError(''); } }} onSubmit={submitPurchaseOrder} />}
-      {receivingOrder && purchasePayload && <PurchaseReceiptModal order={receivingOrder} warehouses={purchasePayload.warehouses} busy={purchaseBusy.startsWith('receive:')} error={error} onClose={() => { if (!purchaseBusy) { setReceivingOrder(null); setError(''); } }} onSubmit={submitPurchaseReceipt} />}
+      {receivingOrder && purchasePayload && <PurchaseReceiptModal order={receivingOrder} warehouses={purchasePayload.warehouses} busy={purchaseBusy.startsWith('receive:')} error={error} canCreateWarehouse={can('warehouse:manage')} openWarehouse={() => setShowWarehouse(true)} onClose={() => { if (!purchaseBusy) { setReceivingOrder(null); setError(''); } }} onSubmit={submitPurchaseReceipt} />}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
     </main>
   );
@@ -807,11 +832,11 @@ function InventoryView({ inventory, summary, hasInventoryData, hasQuery }: { inv
   </div>;
 }
 
-function PurchaseWorkspaceView({ demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedDemandIds, toggleDemand, openMapping, openRequest, openSupplier, openPurchaseOrder, openReceipt, can, busy, runAction, runOrderAction, hasQuery }: {
+function PurchaseWorkspaceView({ demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedDemandIds, toggleDemand, openMapping, openRequest, openSupplier, openWarehouse, openPurchaseOrder, openReceipt, can, busy, runAction, runOrderAction, hasQuery }: {
   demands: PurchaseDemand[]; requests: PurchaseRequest[]; purchaseOrders: PurchaseOrder[]; purchaseReceipts: PurchaseReceipt[];
   workspace: PurchaseWorkspacePayload | null; tab: PurchaseTab; setTab: (tab: PurchaseTab) => void;
   selectedDemandIds: Set<string>; toggleDemand: (id: string) => void;
-  openMapping: (demand: PurchaseDemand) => void; openRequest: () => void; openSupplier: () => void;
+  openMapping: (demand: PurchaseDemand) => void; openRequest: () => void; openSupplier: () => void; openWarehouse: () => void;
   openPurchaseOrder: (request: PurchaseRequest) => void; openReceipt: (order: PurchaseOrder) => void;
   can: (permission: Permission) => boolean; busy: string;
   runAction: (request: PurchaseRequest, action: 'submit' | 'approve' | 'reject' | 'cancel') => void;
@@ -856,7 +881,7 @@ function PurchaseWorkspaceView({ demands, requests, purchaseOrders, purchaseRece
       : tab === 'orders' ? `待到货 ${procurementSummary.pendingReceiptQuantity} 件`
         : tab === 'received' ? `累计入库 ${procurementSummary.receivedQuantity} 件`
           : `供应商 ${procurementSummary.suppliers} 家`;
-  return <div className="content module-content"><div className="module-head"><div><p>真实订单 / 采购执行</p><h1>采购工作台</h1><span>真实订单形成采购需求，经过申请、复审、供应商下单和到货登记后更新 ERP 库存；不会向 Shopify 写入。</span></div><div className="purchase-head-actions"><div className="ledger-chip">需求防重复 · 入库有流水 · 历史不删除</div>{can('purchase:supplier:create') && <button className="primary-button" onClick={openSupplier} disabled={Boolean(busy)}><span>＋</span>供应商</button>}</div></div><StatCards stats={stats} />
+  return <div className="content module-content"><div className="module-head"><div><p>真实订单 / 采购执行</p><h1>采购工作台</h1><span>真实订单形成采购需求，经过申请、复审、供应商下单和到货登记后更新 ERP 库存；不会向 Shopify 写入。</span></div><div className="purchase-head-actions"><div className="ledger-chip">需求防重复 · 入库有流水 · 历史不删除</div>{can('warehouse:manage') && <button className="secondary-button warehouse-button" onClick={openWarehouse} disabled={Boolean(busy)}><span>＋</span>仓库</button>}{can('purchase:supplier:create') && <button className="primary-button" onClick={openSupplier} disabled={Boolean(busy)}><span>＋</span>供应商</button>}</div></div><StatCards stats={stats} />
     <article className="card data-card purchase-workspace-card"><div className="data-toolbar purchase-toolbar"><div>{tabs.map(([key, label, count]) => <button key={key} className={tab === key ? 'tab-active' : ''} onClick={() => setTab(key)}>{label}<b>{count}</b></button>)}</div><span>{toolbarText}</span></div>
       {tab === 'pending' || tab === 'mapping' ? <>
         {tab === 'pending' && <div className="purchase-selection"><div><strong>已选 {selectedDemandIds.size} 行 / {selectedQuantity} 件</strong><span>每条需求只能进入一张有效采购申请</span></div><button className="primary-button" disabled={!selectedDemandIds.size || !can('purchase:create') || Boolean(busy)} onClick={openRequest}><span>＋</span>生成采购申请</button></div>}
@@ -949,6 +974,13 @@ function SupplierModal({ busy, error, onClose, onSubmit }: {
   return <div className="modal-backdrop modal-layer-top" onMouseDown={onClose}><form className="modal purchase-modal supplier-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>新增供应商</h2><p>供应商会用于正式采购单，历史采购单保留名称快照</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>供应商编码<input name="code" required minLength={1} maxLength={40} placeholder="例如 SUP-001" autoComplete="off" /></label><label>供应商名称<input name="name" required minLength={1} maxLength={120} placeholder="请输入公司或工厂名称" autoComplete="off" /></label><label className="full">备注<textarea name="note" rows={3} maxLength={500} placeholder="可填写主营品类或内部说明；不要填写账号密码" /></label>{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>主数据规则</span>编码在当前 ERP 内唯一 · 不物理删除 · 所有新增操作自动审计</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy}>{busy ? '正在保存…' : '保存供应商'}</button></div></form></div>;
 }
 
+function WarehouseModal({ busy, error, onClose, onSubmit }: {
+  busy: boolean; error: string; onClose: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return <div className="modal-backdrop modal-layer-top" onMouseDown={onClose}><form className="modal purchase-modal warehouse-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>新增 ERP 仓库</h2><p>到货登记必须选择真实入库仓，库存会按 SKU × 仓库分别累计</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>仓库编码<input name="code" required minLength={1} maxLength={40} placeholder="例如 SZ-01" autoComplete="off" /></label><label>仓库名称<input name="name" required minLength={1} maxLength={120} placeholder="例如 深圳成品仓" autoComplete="off" /></label>{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>库存规则</span>仓库编码在当前 ERP 内唯一 · 新增不会改变现有库存 · 入库后才产生库存流水</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy}>{busy ? '正在保存…' : '保存仓库'}</button></div></form></div>;
+}
+
 function PurchaseOrderModal({ request, suppliers, busy, error, openSupplier, onClose, onSubmit }: {
   request: PurchaseRequest; suppliers: PurchaseSupplier[]; busy: boolean; error: string;
   openSupplier: () => void; onClose: () => void;
@@ -958,14 +990,15 @@ function PurchaseOrderModal({ request, suppliers, busy, error, openSupplier, onC
   return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal procurement-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>生成正式采购单</h2><p>{request.requestNo} · {request.lineCount} 行 / {request.totalQuantity} 件</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label className="full">供应商<div className="select-with-action"><select name="supplierId" required defaultValue={activeSuppliers[0]?.id ?? ''}><option value="" disabled>请选择供应商</option>{activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.code} · {supplier.name}</option>)}</select><button type="button" onClick={openSupplier} disabled={busy}>＋ 新增</button></div></label><label>采购币种<select name="currency" defaultValue="CNY"><option value="CNY">CNY 人民币</option><option value="USD">USD 美元</option><option value="EUR">EUR 欧元</option><option value="GBP">GBP 英镑</option></select></label><label>当前状态<input value="草稿（确认下单前不入库）" readOnly /></label><label className="full">采购备注<textarea name="note" rows={2} maxLength={500} placeholder="可填写议价、交期或包装要求" /></label></div><div className="purchase-order-lines"><div className="purchase-order-lines-head"><strong>采购明细</strong><span>单价可暂不填写，金额按所选币种保存</span></div>{request.lines.map((line) => <div className="purchase-order-line" key={line.id}><div><strong>{line.skuCode ?? line.rawSku ?? '未识别 SKU'}</strong><span>{line.skuName ?? '采购申请明细'}</span></div><b>{line.requestedQuantity} 件</b><label>含税单价<input name={`unitCost:${line.id}`} type="number" min="0" step="0.01" placeholder="可选" inputMode="decimal" /></label></div>)}</div>{!activeSuppliers.length && <div className="form-error">请先新增一个可用供应商，再生成正式采购单。</div>}{error && <div className="form-error">{error}</div>}<div className="modal-safety"><span>生成规则</span>一张已批准申请只能生成一张有效采购单 · 取消后历史仍保留 · 不会向 Shopify 写入</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || !activeSuppliers.length}>{busy ? '正在生成…' : '生成采购单草稿'}</button></div></form></div>;
 }
 
-function PurchaseReceiptModal({ order, warehouses, busy, error, onClose, onSubmit }: {
+function PurchaseReceiptModal({ order, warehouses, busy, error, canCreateWarehouse, openWarehouse, onClose, onSubmit }: {
   order: PurchaseOrder; warehouses: PurchaseWarehouse[]; busy: boolean; error: string;
+  canCreateWarehouse: boolean; openWarehouse: () => void;
   onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
   const receivableLines = order.lines.filter((line) => line.remainingQuantity > 0);
   const now = new Date();
   const localDateTime = new Date(now.getTime() - now.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
-  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal procurement-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>登记采购到货</h2><p>{order.orderNo} · {order.supplier.name}</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>本次入库仓<select name="warehouseId" required defaultValue={warehouses[0]?.id ?? ''}><option value="" disabled>请选择仓库</option>{warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.code} · {warehouse.name}</option>)}</select></label><label>实际到货时间<input name="receivedAt" type="datetime-local" defaultValue={localDateTime} required /></label><label className="full">到货备注<textarea name="note" rows={2} maxLength={500} placeholder="可填写送货单号、批次或异常说明" /></label></div><div className="purchase-order-lines"><div className="purchase-order-lines-head"><strong>本次实际到货</strong><span>可以分批登记，累计数量不能超过采购数量</span></div>{receivableLines.map((line) => <div className="purchase-order-line receipt-line" key={line.id}><div><strong>{line.skuCode}</strong><span>{line.skuName}</span></div><b>已到 {line.receivedQuantity} / 未到 {line.remainingQuantity}</b><label>本次到货<input name={`quantity:${line.id}`} type="number" min="0" max={line.remainingQuantity} step="1" defaultValue={line.remainingQuantity} inputMode="numeric" /></label></div>)}</div>{!warehouses.length && <div className="form-error">当前没有可用仓库，无法登记入库。</div>}{error && <div className="form-error">{error}</div>}<div className="modal-safety"><span>库存规则</span>提交后自动增加 ERP 现存库存并写入不可变入库流水 · 重复提交不会重复加库存</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || !warehouses.length || !receivableLines.length}>{busy ? '正在入库…' : '确认本次到货并入库'}</button></div></form></div>;
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal procurement-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>登记采购到货</h2><p>{order.orderNo} · {order.supplier.name}</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>本次入库仓<div className="select-with-action"><select name="warehouseId" required defaultValue={warehouses[0]?.id ?? ''}><option value="" disabled>请选择仓库</option>{warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.code} · {warehouse.name}</option>)}</select>{canCreateWarehouse && <button type="button" onClick={openWarehouse} disabled={busy}>＋ 新增</button>}</div></label><label>实际到货时间<input name="receivedAt" type="datetime-local" defaultValue={localDateTime} required /></label><label className="full">到货备注<textarea name="note" rows={2} maxLength={500} placeholder="可填写送货单号、批次或异常说明" /></label></div><div className="purchase-order-lines"><div className="purchase-order-lines-head"><strong>本次实际到货</strong><span>可以分批登记，累计数量不能超过采购数量</span></div>{receivableLines.map((line) => <div className="purchase-order-line receipt-line" key={line.id}><div><strong>{line.skuCode}</strong><span>{line.skuName}</span></div><b>已到 {line.receivedQuantity} / 未到 {line.remainingQuantity}</b><label>本次到货<input name={`quantity:${line.id}`} type="number" min="0" max={line.remainingQuantity} step="1" defaultValue={line.remainingQuantity} inputMode="numeric" /></label></div>)}</div>{!warehouses.length && <div className="form-error missing-master-data"><span>当前没有可用仓库，无法登记入库。</span>{canCreateWarehouse && <button type="button" onClick={openWarehouse}>立即新增仓库</button>}</div>}{error && <div className="form-error">{error}</div>}<div className="modal-safety"><span>库存规则</span>提交后自动增加 ERP 现存库存并写入不可变入库流水 · 重复提交不会重复加库存</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || !warehouses.length || !receivableLines.length}>{busy ? '正在入库…' : '确认本次到货并入库'}</button></div></form></div>;
 }
 
 function Status({ status }: { status: OrderStatus }) {
