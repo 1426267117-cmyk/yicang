@@ -1,9 +1,8 @@
 import { HttpError, requirePermission, type UserContext } from './db';
-import type { Role } from './domain';
+import { ROLE_PERMISSIONS, type Role } from './domain';
 
 type MemberRow = {
   id: string;
-  auth_user_id: string;
   email: string;
   display_name: string;
   role: Role;
@@ -12,7 +11,6 @@ type MemberRow = {
 
 export type ManagedMember = {
   id: string;
-  authUserId: string;
   email: string;
   displayName: string;
   role: Role;
@@ -27,7 +25,7 @@ export async function listManagedMembers(
 ) {
   requirePermission(user, 'members:manage');
   const rows = await db.prepare(`
-    SELECT id, auth_user_id, email, display_name, role, created_at
+    SELECT id, email, display_name, role, created_at
     FROM members
     WHERE tenant_id = ?
     ORDER BY
@@ -54,7 +52,7 @@ export async function updateManagedMemberRole(
   }
 
   const target = await db.prepare(`
-    SELECT id, auth_user_id, email, display_name, role, created_at
+    SELECT id, email, display_name, role, created_at
     FROM members
     WHERE tenant_id = ? AND id = ?
     LIMIT 1
@@ -81,6 +79,7 @@ export async function updateManagedMemberRole(
       throw new HttpError(409, '工作区必须至少保留一名管理员', 'LAST_ADMIN_ROLE_PROTECTED');
     }
   }
+  await assertRoleChangeDoesNotStrandProcurement(db, user.tenantId, target.id, input.role);
 
   const now = new Date().toISOString();
   const auditId = crypto.randomUUID();
@@ -133,7 +132,7 @@ export async function updateManagedMemberRole(
 
   if (Number(results[0]?.meta.changes ?? 0) !== 1) {
     const current = await db.prepare(`
-      SELECT id, auth_user_id, email, display_name, role, created_at
+      SELECT id, email, display_name, role, created_at
       FROM members
       WHERE tenant_id = ? AND id = ?
       LIMIT 1
@@ -148,7 +147,7 @@ export async function updateManagedMemberRole(
   }
 
   const updated = await db.prepare(`
-    SELECT id, auth_user_id, email, display_name, role, created_at
+    SELECT id, email, display_name, role, created_at
     FROM members
     WHERE tenant_id = ? AND id = ?
     LIMIT 1
@@ -162,7 +161,6 @@ export async function updateManagedMemberRole(
 function toManagedMember(row: MemberRow, bootstrapOwnerEmail: string | null): ManagedMember {
   return {
     id: row.id,
-    authUserId: row.auth_user_id,
     email: row.email,
     displayName: row.display_name,
     role: row.role,
@@ -179,4 +177,58 @@ function isBootstrapOwner(email: string, bootstrapOwnerEmail: string | null) {
 function normalizeEmail(email: string | null) {
   const value = email?.trim().toLowerCase() ?? '';
   return value || null;
+}
+
+async function assertRoleChangeDoesNotStrandProcurement(
+  db: D1Database,
+  tenantId: string,
+  memberId: string,
+  nextRole: Role,
+) {
+  const permissions = ROLE_PERMISSIONS[nextRole];
+  if (!permissions.includes('purchase:submit')) {
+    const purchaserAssignments = await db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM purchase_requests request
+      WHERE request.tenant_id = ?
+        AND request.purchaser_member_id = ?
+        AND (
+          request.status = 'draft'
+          OR request.status = 'pending_review'
+          OR (
+            request.status = 'approved'
+            AND NOT EXISTS (
+              SELECT 1 FROM purchase_orders purchase_order
+              WHERE purchase_order.tenant_id = request.tenant_id
+                AND purchase_order.purchase_request_id = request.id
+                AND purchase_order.status <> 'cancelled'
+            )
+          )
+        )
+    `).bind(tenantId, memberId).first<{ count: number }>();
+    const count = Number(purchaserAssignments?.count ?? 0);
+    if (count > 0) {
+      throw new HttpError(
+        409,
+        `该成员仍负责 ${count} 张待提交、待复审或待转单采购申请，请先完成或撤回这些申请`,
+        'MEMBER_ROLE_ACTIVE_PURCHASER_ASSIGNMENTS',
+      );
+    }
+  }
+  if (!permissions.includes('purchase:review')) {
+    const reviewerAssignments = await db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM purchase_requests
+      WHERE tenant_id = ? AND reviewer_member_id = ?
+        AND status IN ('draft', 'pending_review')
+    `).bind(tenantId, memberId).first<{ count: number }>();
+    const count = Number(reviewerAssignments?.count ?? 0);
+    if (count > 0) {
+      throw new HttpError(
+        409,
+        `该成员仍需复审 ${count} 张采购申请，请先完成或取消这些申请`,
+        'MEMBER_ROLE_ACTIVE_REVIEWER_ASSIGNMENTS',
+      );
+    }
+  }
 }

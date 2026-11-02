@@ -459,7 +459,7 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-PLAN', name: '计划供应商',
     }, 'create-plan-supplier-0001');
-    const purchaseOrder = await createPurchaseOrder(db, user, {
+    const purchaseOrder = await createPurchaseOrder(db, buyerUser, {
       purchaseRequestId: created.request.id,
       supplierId: supplier.supplier.id,
     }, 'create-plan-po-0001');
@@ -474,7 +474,7 @@ describe('真实订单 + MUKU 库存采购计划', () => {
     const warehouse = await createWarehouse(db, user, {
       code: 'PLAN-WH', name: '计划收货仓',
     }, 'create-plan-warehouse-0001');
-    await executePurchaseOrderAction(db, user, purchaseOrder.purchaseOrder.id, {
+    await executePurchaseOrderAction(db, buyerUser, purchaseOrder.purchaseOrder.id, {
       action: 'issue',
     }, 'issue-plan-po-0001');
     const postedReceipt = await createPurchaseReceipt(db, user, purchaseOrder.purchaseOrder.id, {

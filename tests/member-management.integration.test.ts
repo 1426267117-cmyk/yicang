@@ -175,6 +175,75 @@ describe('采购团队角色管理', () => {
     expect(await storedRole(db, tenantId, 'member-owner')).toBe('admin');
     expect(await auditCount(db)).toBe(1);
   });
+
+  it('不能把仍负责草稿、待复审或待转单申请的采购负责人降为只读', async () => {
+    await insertRequest(db, 'request-draft', 'draft', 'member-buyer', 'member-owner');
+    await expect(updateManagedMemberRole(db, admin, {
+      memberId: 'member-buyer',
+      role: 'viewer',
+      bootstrapOwnerEmail: ownerEmail,
+    })).rejects.toMatchObject({
+      status: 409,
+      code: 'MEMBER_ROLE_ACTIVE_PURCHASER_ASSIGNMENTS',
+    });
+    expect(await storedRole(db, tenantId, 'member-buyer')).toBe('operator');
+
+    await db.prepare(`UPDATE purchase_requests SET status = 'pending_review' WHERE id = 'request-draft'`).run();
+    await expect(updateManagedMemberRole(db, admin, {
+      memberId: 'member-buyer',
+      role: 'viewer',
+      bootstrapOwnerEmail: ownerEmail,
+    })).rejects.toMatchObject({
+      status: 409,
+      code: 'MEMBER_ROLE_ACTIVE_PURCHASER_ASSIGNMENTS',
+    });
+
+    await db.prepare(`UPDATE purchase_requests SET status = 'cancelled' WHERE id = 'request-draft'`).run();
+    const changed = await updateManagedMemberRole(db, admin, {
+      memberId: 'member-buyer',
+      role: 'viewer',
+      bootstrapOwnerEmail: ownerEmail,
+    });
+    expect(changed.member.role).toBe('viewer');
+  });
+
+  it('不能移除仍被草稿或待复审申请指定的复审权限', async () => {
+    await db.prepare(`
+      INSERT INTO members (id, tenant_id, auth_user_id, email, display_name, role, created_at)
+      VALUES ('member-reviewer', ?, 'auth-reviewer', 'reviewer@example.com', '复审员', 'admin', ?)
+    `).bind(tenantId, '2026-11-02T00:00:00.000Z').run();
+    await insertRequest(db, 'request-review', 'pending_review', 'member-buyer', 'member-reviewer');
+
+    await expect(updateManagedMemberRole(db, admin, {
+      memberId: 'member-reviewer',
+      role: 'operator',
+      bootstrapOwnerEmail: ownerEmail,
+    })).rejects.toMatchObject({
+      status: 409,
+      code: 'MEMBER_ROLE_ACTIVE_REVIEWER_ASSIGNMENTS',
+    });
+    expect(await storedRole(db, tenantId, 'member-reviewer')).toBe('admin');
+  });
+
+  it('已批准申请存在有效采购单后不再阻止负责人转只读', async () => {
+    await insertRequest(db, 'request-approved', 'approved', 'member-buyer', 'member-owner');
+    await expect(updateManagedMemberRole(db, admin, {
+      memberId: 'member-buyer',
+      role: 'viewer',
+      bootstrapOwnerEmail: ownerEmail,
+    })).rejects.toMatchObject({ code: 'MEMBER_ROLE_ACTIVE_PURCHASER_ASSIGNMENTS' });
+
+    await db.prepare(`
+      INSERT INTO purchase_orders (id, tenant_id, purchase_request_id, status)
+      VALUES ('order-issued', ?, 'request-approved', 'issued')
+    `).bind(tenantId).run();
+    const changed = await updateManagedMemberRole(db, admin, {
+      memberId: 'member-buyer',
+      role: 'viewer',
+      bootstrapOwnerEmail: ownerEmail,
+    });
+    expect(changed.member.role).toBe('viewer');
+  });
 });
 
 async function createSchema(db: D1Database) {
@@ -214,9 +283,39 @@ async function createSchema(db: D1Database) {
     )
   `).run();
   await db.prepare(`
+    CREATE TABLE purchase_requests (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      purchaser_member_id TEXT NOT NULL,
+      reviewer_member_id TEXT NOT NULL
+    )
+  `).run();
+  await db.prepare(`
+    CREATE TABLE purchase_orders (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      purchase_request_id TEXT NOT NULL,
+      status TEXT NOT NULL
+    )
+  `).run();
+  await db.prepare(`
     CREATE UNIQUE INDEX uq_audit_tenant_idempotency
     ON audit_logs (tenant_id, idempotency_key)
   `).run();
+}
+
+async function insertRequest(
+  db: D1Database,
+  id: string,
+  status: string,
+  purchaserMemberId: string,
+  reviewerMemberId: string,
+) {
+  await db.prepare(`
+    INSERT INTO purchase_requests (id, tenant_id, status, purchaser_member_id, reviewer_member_id)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(id, tenantId, status, purchaserMemberId, reviewerMemberId).run();
 }
 
 function memberStatement(

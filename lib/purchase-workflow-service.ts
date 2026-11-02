@@ -9,6 +9,7 @@ import {
 } from './db';
 import { getPurchaseDemands } from './purchase-demand-service';
 import { getProcurementWorkspaceData } from './purchase-order-service';
+import { ROLE_PERMISSIONS, type Role } from './domain';
 import type { PurchasePlanningEvidence } from './purchase-planning-service';
 
 export type PurchaseRequestStatus =
@@ -787,11 +788,28 @@ async function validateAssignedMembers(
   const ids = [...new Set([purchaserMemberId, reviewerMemberId])];
   const placeholders = ids.map(() => '?').join(', ');
   const rows = await db.prepare(`
-    SELECT id FROM members
+    SELECT id, role FROM members
     WHERE tenant_id = ? AND id IN (${placeholders})
-  `).bind(tenantId, ...ids).all<{ id: string }>();
+  `).bind(tenantId, ...ids).all<{ id: string; role: Role }>();
   if (rows.results.length !== ids.length) {
     throw new HttpError(400, '采购负责人或复审人不在当前工作区', 'PURCHASE_ASSIGNEE_INVALID');
+  }
+  const memberById = new Map(rows.results.map((member) => [member.id, member]));
+  const purchaser = memberById.get(purchaserMemberId);
+  const reviewer = memberById.get(reviewerMemberId);
+  if (!purchaser || !ROLE_PERMISSIONS[purchaser.role]?.includes('purchase:submit')) {
+    throw new HttpError(
+      400,
+      '采购负责人必须是管理员或操作员，且具备提交采购申请权限',
+      'PURCHASE_PURCHASER_PERMISSION_REQUIRED',
+    );
+  }
+  if (!reviewer || !ROLE_PERMISSIONS[reviewer.role]?.includes('purchase:review')) {
+    throw new HttpError(
+      400,
+      '复审人必须是管理员，且具备采购复审权限',
+      'PURCHASE_REVIEWER_PERMISSION_REQUIRED',
+    );
   }
 }
 
