@@ -578,6 +578,83 @@ describe('正式采购单与到货入库闭环', () => {
     expect(issued.purchaseOrder.status).toBe('issued');
   });
 
+  it('开发开放模式允许换账号接续转单、下单和关闭，正式模式仍拒绝', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-ACCOUNT-HANDOFF', name: '换账号交接测试供应商',
+    }, 'supplier-account-handoff-0001');
+    const input = {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
+    };
+
+    await expect(createPurchaseOrder(
+      db,
+      user,
+      input,
+      'purchase-order-account-handoff-formal-create',
+    )).rejects.toMatchObject({ code: 'PURCHASE_ORDER_PURCHASER_REQUIRED' });
+
+    const created = await createPurchaseOrder(
+      db,
+      user,
+      input,
+      'purchase-order-account-handoff-open-create',
+      { developmentOpenAccess: true },
+    );
+    await expect(executePurchaseOrderActionService(
+      db,
+      user,
+      created.purchaseOrder.id,
+      { action: 'issue' },
+      'purchase-order-account-handoff-formal-issue',
+      { validatePlanningEvidence: async () => undefined },
+    )).rejects.toMatchObject({ code: 'PURCHASE_ORDER_PURCHASER_REQUIRED' });
+
+    const issued = await executePurchaseOrderActionService(
+      db,
+      user,
+      created.purchaseOrder.id,
+      { action: 'issue', note: '换账号继续确认下单' },
+      'purchase-order-account-handoff-open-issue',
+      {
+        developmentOpenAccess: true,
+        validatePlanningEvidence: async () => undefined,
+      },
+    );
+    expect(issued.purchaseOrder.status).toBe('issued');
+
+    await expect(executePurchaseOrderActionService(
+      db,
+      user,
+      created.purchaseOrder.id,
+      { action: 'close', note: '供应商无法继续交货' },
+      'purchase-order-account-handoff-formal-close',
+      { validatePlanningEvidence: async () => undefined },
+    )).rejects.toMatchObject({ code: 'PURCHASE_ORDER_PURCHASER_REQUIRED' });
+
+    const closed = await executePurchaseOrderActionService(
+      db,
+      user,
+      created.purchaseOrder.id,
+      { action: 'close', note: '供应商无法继续交货' },
+      'purchase-order-account-handoff-open-close',
+      {
+        developmentOpenAccess: true,
+        validatePlanningEvidence: async () => undefined,
+      },
+    );
+    expect(closed.purchaseOrder.status).toBe('closed_short');
+
+    const audit = await db.prepare(`
+      SELECT action, actor_email FROM audit_logs
+      WHERE tenant_id = ? AND entity_id = ?
+        AND action IN ('CREATE_PURCHASE_ORDER', 'ISSUE_PURCHASE_ORDER', 'CLOSE_PURCHASE_ORDER_REMAINDER')
+    `).bind(tenantId, created.purchaseOrder.id).all<{ action: string; actor_email: string }>();
+    expect(audit.results).toHaveLength(3);
+    expect(audit.results.every((row) => row.actor_email === user.email)).toBe(true);
+  });
+
   it('采购单文档允许只读角色按当前租户读取，并拒绝跨租户标识', async () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-DOC', name: '采购单文档供应商',

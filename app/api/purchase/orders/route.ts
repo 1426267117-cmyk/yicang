@@ -1,3 +1,5 @@
+import { env } from 'cloudflare:workers';
+import { developmentOpenAccessEnabled } from '../../../../lib/access-policy';
 import { createPurchaseOrderSchema } from '../../../../lib/contracts';
 import { HttpError, jsonError, requestContext } from '../../../../lib/db';
 import { createPurchaseOrder } from '../../../../lib/purchase-order-service';
@@ -20,6 +22,11 @@ export async function POST(request: Request) {
       user,
       parsed.data,
       request.headers.get('Idempotency-Key') ?? '',
+      {
+        developmentOpenAccess: developmentOpenAccessEnabled(
+          env as unknown as Record<string, unknown>,
+        ),
+      },
     );
     return Response.json({ ok: true, ...result }, {
       status: result.replayed ? 200 : 201,

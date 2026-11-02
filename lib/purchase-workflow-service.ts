@@ -505,7 +505,9 @@ export async function executePurchaseRequestAction(
 
   const current = await getCurrentPurchaseRequest(db, user.tenantId, purchaseRequestId);
   const actorMemberId = await resolveActorMemberId(db, user);
-  assertAssignedActor(current, actorMemberId, input.action);
+  if (options.developmentOpenAccess !== true) {
+    assertAssignedActor(current, actorMemberId, input.action);
+  }
   if ((input.action === 'submit' || input.action === 'approve')
     && options.developmentOpenAccess !== true) {
     assertReviewerSeparation(

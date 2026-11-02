@@ -194,6 +194,41 @@ describe('采购申请闭环', () => {
     expect(approved.request.status).toBe('approved');
   });
 
+  it('开发开放模式允许换账号继续处理，正式模式仍严格校验指派人', async () => {
+    const created = await createPurchaseRequest(db, user, {
+      demandIds: [demandId], purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer',
+    }, 'create-request-account-handoff-0001');
+
+    await expect(executePurchaseRequestAction(db, user, created.request.id, {
+      action: 'submit',
+    }, 'submit-request-account-handoff-formal')).rejects.toMatchObject({
+      code: 'PURCHASE_PURCHASER_REQUIRED',
+    });
+    const submitted = await executePurchaseRequestAction(db, user, created.request.id, {
+      action: 'submit', note: '开发期换账号接续提交',
+    }, 'submit-request-account-handoff-open', { developmentOpenAccess: true });
+    expect(submitted.request.status).toBe('pending_review');
+
+    await expect(executePurchaseRequestAction(db, user, created.request.id, {
+      action: 'approve',
+    }, 'approve-request-account-handoff-formal')).rejects.toMatchObject({
+      code: 'PURCHASE_REVIEWER_REQUIRED',
+    });
+    const approved = await executePurchaseRequestAction(db, user, created.request.id, {
+      action: 'approve', note: '开发期换账号接续复审',
+    }, 'approve-request-account-handoff-open', { developmentOpenAccess: true });
+    expect(approved.request.status).toBe('approved');
+
+    const audit = await db.prepare(`
+      SELECT action, actor_email FROM audit_logs
+      WHERE tenant_id = ? AND entity_id = ?
+        AND action IN ('SUBMIT_PURCHASE_REQUEST', 'APPROVE_PURCHASE_REQUEST')
+      ORDER BY created_at, action
+    `).bind(tenantId, created.request.id).all<{ action: string; actor_email: string }>();
+    expect(audit.results).toHaveLength(2);
+    expect(audit.results.every((row) => row.actor_email === user.email)).toBe(true);
+  });
+
   it('创建申请时负责人必须可提交，复审人必须具备管理员复审权限', async () => {
     await db.prepare(`UPDATE members SET role = 'viewer' WHERE tenant_id = ? AND id = 'member-buyer'`)
       .bind(tenantId).run();

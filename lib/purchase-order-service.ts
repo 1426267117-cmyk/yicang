@@ -476,6 +476,7 @@ export async function createPurchaseOrder(
   user: UserContext,
   input: CreatePurchaseOrderInput,
   idempotencyKey: string,
+  options: { developmentOpenAccess?: boolean } = {},
 ) {
   requirePermission(user, 'purchase:order:create');
   validateIdempotencyKey(idempotencyKey);
@@ -493,7 +494,12 @@ export async function createPurchaseOrder(
       .sort((left, right) => left.purchaseRequestLineId.localeCompare(right.purchaseRequestLineId)),
   };
   const requestHash = await hashPayload(normalized);
-  const actorMemberId = await assertPurchaseRequestPurchaser(db, user, normalized.purchaseRequestId);
+  const actorMemberId = await assertPurchaseRequestPurchaser(
+    db,
+    user,
+    normalized.purchaseRequestId,
+    options.developmentOpenAccess === true,
+  );
   const replay = await db.prepare(`
     SELECT id, request_hash FROM purchase_orders
     WHERE tenant_id = ? AND idempotency_key = ?
@@ -673,6 +679,7 @@ export async function executePurchaseOrderAction(
   input: PurchaseOrderActionInput,
   idempotencyKey: string,
   options: {
+    developmentOpenAccess?: boolean;
     planningNow?: Date;
     validatePlanningEvidence?: (
       db: D1Database,
@@ -694,7 +701,12 @@ export async function executePurchaseOrderAction(
     : input.action === 'close'
       ? 'CLOSE_PURCHASE_ORDER_REMAINDER'
       : 'CANCEL_PURCHASE_ORDER';
-  await assertPurchaseOrderPurchaser(db, user, purchaseOrderId);
+  await assertPurchaseOrderPurchaser(
+    db,
+    user,
+    purchaseOrderId,
+    options.developmentOpenAccess === true,
+  );
   const replay = await readActionReplay(db, user.tenantId, purchaseOrderId, auditAction, requestHash, idempotencyKey);
   if (replay) return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: true };
 
@@ -1707,6 +1719,7 @@ async function assertPurchaseRequestPurchaser(
   db: D1Database,
   user: UserContext,
   purchaseRequestId: string,
+  developmentOpenAccess = false,
 ) {
   const request = await db.prepare(`
     SELECT purchaser_member_id
@@ -1718,7 +1731,7 @@ async function assertPurchaseRequestPurchaser(
     throw new HttpError(404, '采购申请不存在或不在当前数据范围内', 'PURCHASE_REQUEST_NOT_FOUND');
   }
   const actorMemberId = await resolveActorMemberId(db, user);
-  if (request.purchaser_member_id !== actorMemberId) {
+  if (!developmentOpenAccess && request.purchaser_member_id !== actorMemberId) {
     throw new HttpError(
       403,
       '只有该申请指定的采购负责人可以生成正式采购单',
@@ -1732,6 +1745,7 @@ async function assertPurchaseOrderPurchaser(
   db: D1Database,
   user: UserContext,
   purchaseOrderId: string,
+  developmentOpenAccess = false,
 ) {
   const order = await db.prepare(`
     SELECT request.purchaser_member_id
@@ -1746,7 +1760,7 @@ async function assertPurchaseOrderPurchaser(
     throw new HttpError(404, '采购单不存在或不在当前数据范围内', 'PURCHASE_ORDER_NOT_FOUND');
   }
   const actorMemberId = await resolveActorMemberId(db, user);
-  if (order.purchaser_member_id !== actorMemberId) {
+  if (!developmentOpenAccess && order.purchaser_member_id !== actorMemberId) {
     throw new HttpError(
       403,
       '只有来源申请指定的采购负责人可以确认、取消或关闭采购单剩余量',
