@@ -29,6 +29,13 @@
       "when": 1793379974796,
       "tag": "0003_fancy_jane_foster",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1793599651769,
+      "tag": "0004_illegal_black_panther",
+      "breakpoints": true
     }
   ]
 }

@@ -174,6 +174,29 @@ export const connectorCredentials = sqliteTable('connector_credentials', {
   index('idx_connector_credentials_tenant').on(table.tenantId, table.platform),
 ]);
 
+export const shopifyWebhookEvents = sqliteTable('shopify_webhook_events', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  storeKey: text('store_key').notNull(),
+  webhookId: text('webhook_id').notNull(),
+  topic: text('topic').notNull(),
+  shopDomain: text('shop_domain').notNull(),
+  sourceOrderId: text('source_order_id'),
+  apiVersion: text('api_version'),
+  triggeredAt: text('triggered_at'),
+  payloadHash: text('payload_hash').notNull(),
+  status: text('status', { enum: ['pending', 'processing', 'processed', 'failed', 'ignored'] }).notNull(),
+  attempts: integer('attempts').notNull().default(0),
+  lastErrorCode: text('last_error_code'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+  processedAt: text('processed_at'),
+}, (table) => [
+  uniqueIndex('uq_shopify_webhook_events_delivery').on(table.tenantId, table.storeKey, table.webhookId),
+  index('idx_shopify_webhook_events_pending').on(table.status, table.createdAt),
+  index('idx_shopify_webhook_events_order').on(table.tenantId, table.storeKey, table.sourceOrderId),
+]);
+
 export const platformOrders = sqliteTable('platform_orders', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),
