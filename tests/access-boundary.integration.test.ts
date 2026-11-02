@@ -82,9 +82,46 @@ describe('ERP 请求访问边界', () => {
     expect(await storedRole('owner-id')).toBe('admin');
   });
 
+  it('从开发开放切到正式模式时忽略开发成员，并由首位精确邮箱 owner 初始化管理员', async () => {
+    runtimeEnv.ERP_DEV_OPEN_ACCESS = 'true';
+    await requestContext(erpRequest());
+    await requestContext(erpRequest('dev-user-id', 'temporary@example.net'));
+    expect(await memberCount()).toBe(2);
+
+    runtimeEnv.ERP_DEV_OPEN_ACCESS = 'false';
+    runtimeEnv.ERP_ALLOWED_EMAILS = 'owner@example.com,staff@example.com';
+    runtimeEnv.ERP_ALLOWED_EMAIL_DOMAINS = 'example.com';
+
+    await expect(requestContext(erpRequest('staff-id', 'staff@example.com'))).rejects.toMatchObject({
+      status: 403,
+      code: 'ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED',
+    });
+    expect(await storedRole('staff-id')).toBeUndefined();
+
+    const owner = await requestContext(erpRequest('owner-id', 'OWNER@example.com'));
+    expect(owner.user.role).toBe('admin');
+    expect(await storedRole('owner-id')).toBe('admin');
+    await requestContext(erpRequest('owner-id', 'owner@example.com'));
+    expect(await memberCount()).toBe(3);
+
+    const staff = await requestContext(erpRequest('staff-id', 'staff@example.com'));
+    expect(staff.user.role).toBe('operator');
+    expect(await storedRole('staff-id')).toBe('operator');
+  });
+
+  it('仅配置域名且尚无正式管理员时拒绝自动抢占管理员', async () => {
+    runtimeEnv.ERP_ALLOWED_EMAIL_DOMAINS = '@muku.example';
+
+    await expect(requestContext(erpRequest('staff-id', 'staff@muku.example'))).rejects.toMatchObject({
+      status: 403,
+      code: 'ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED',
+    });
+    expect(await memberCount()).toBe(0);
+  });
+
   it('允许公司域账号加入已有工作区并默认成为操作员', async () => {
     runtimeEnv.ERP_ALLOWED_EMAIL_DOMAINS = '@muku.example';
-    await seedMember('owner-id', 'owner@example.com', 'admin');
+    await seedMember('owner-id', 'owner@muku.example', 'admin');
 
     const { user } = await requestContext(erpRequest('staff-id', 'staff@MUKU.EXAMPLE'));
 

@@ -14,6 +14,7 @@ describe('ERP 生产访问名单', () => {
     });
 
     expect(policy.configured).toBe(true);
+    expect(policy.bootstrapOwnerEmail).toBe('owner@example.com');
     expect(identityAllowed('OWNER@example.com', policy)).toBe(true);
     expect(identityAllowed('staff@muku.example', policy)).toBe(true);
     expect(identityAllowed('staff@company.test', policy)).toBe(true);
@@ -28,6 +29,7 @@ describe('ERP 生产访问名单', () => {
       ERP_ALLOWED_EMAIL_DOMAINS: '',
     });
     expect(policy.configured).toBe(false);
+    expect(policy.bootstrapOwnerEmail).toBeNull();
   });
 
   it('开放开发模式只接受明确的 true 开关', () => {

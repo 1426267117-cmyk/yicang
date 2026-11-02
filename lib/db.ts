@@ -80,18 +80,22 @@ export async function requestContext(request: Request) {
   if (!member) {
     let role: Role = 'admin';
     if (!developmentOpenAccess) {
-      const count = await db.prepare('SELECT COUNT(*) AS count FROM members WHERE tenant_id = ?')
-        .bind(TENANT_ID)
-        .first<{ count: number }>();
-      const isFirstMember = Number(count?.count ?? 0) === 0;
-      if (isFirstMember && !identityExplicitlyListed(identity.email, accessPolicy)) {
+      const bootstrapOwnerEmail = accessPolicy.bootstrapOwnerEmail;
+      const admins = await db.prepare(`
+        SELECT email FROM members
+        WHERE tenant_id = ? AND role = 'admin'
+      `).bind(TENANT_ID).all<{ email: string }>();
+      const hasFormalAdmin = admins.results.some((admin) => identityAllowed(admin.email, accessPolicy));
+      const needsOwnerBootstrap = !hasFormalAdmin;
+      const isBootstrapOwner = bootstrapOwnerEmail === identity.email.trim().toLowerCase();
+      if (needsOwnerBootstrap && !isBootstrapOwner) {
         throw new HttpError(
           403,
-          '首次管理员必须使用 ERP 精确邮箱名单中的账号初始化',
+          '正式管理员尚未初始化，请先使用 ERP 精确邮箱名单中的首位 owner 账号访问',
           'ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED',
         );
       }
-      role = isFirstMember ? 'admin' : 'operator';
+      role = needsOwnerBootstrap ? 'admin' : 'operator';
     }
     await db.prepare(
       `INSERT OR IGNORE INTO members

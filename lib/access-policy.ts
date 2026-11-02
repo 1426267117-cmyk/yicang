@@ -1,6 +1,7 @@
 export type ProductionAccessPolicy = {
   emails: Set<string>;
   domains: Set<string>;
+  bootstrapOwnerEmail: string | null;
   configured: boolean;
 };
 
@@ -11,13 +12,19 @@ export function developmentOpenAccessEnabled(runtimeEnv: Record<string, unknown>
 }
 
 export function readProductionAccessPolicy(runtimeEnv: Record<string, unknown>): ProductionAccessPolicy {
-  const emails = new Set(splitEnvList(runtimeEnv.ERP_ALLOWED_EMAILS).map((value) => value.toLowerCase()));
+  const normalizedEmails = splitEnvList(runtimeEnv.ERP_ALLOWED_EMAILS).map((value) => value.toLowerCase());
+  const emails = new Set(normalizedEmails);
   const domains = new Set(
     splitEnvList(runtimeEnv.ERP_ALLOWED_EMAIL_DOMAINS)
       .map((value) => value.toLowerCase().replace(/^@/, ''))
       .filter(Boolean),
   );
-  return { emails, domains, configured: emails.size > 0 || domains.size > 0 };
+  return {
+    emails,
+    domains,
+    bootstrapOwnerEmail: normalizedEmails[0] ?? null,
+    configured: emails.size > 0 || domains.size > 0,
+  };
 }
 
 export function identityAllowed(email: string, policy: ProductionAccessPolicy) {
