@@ -10,7 +10,12 @@ import {
   type ManagedMemberRole,
   type ManagedMemberView,
 } from '../lib/member-role-ui';
-import { activePurchaseRequestIds } from '../lib/procurement-ui';
+import {
+  activePurchaseRequestIds,
+  normalizedReceiptQuantities,
+  receiptCorrectionAvailability,
+  validateReceiptCorrectionDraft,
+} from '../lib/procurement-ui';
 
 type ModuleKey = 'dashboard' | 'platform' | 'orders' | 'inventory' | 'purchase' | 'warehouse' | 'logistics' | 'finance' | 'reports';
 type OrderStatus = 'pending_review' | 'reserved' | 'shipped' | 'cancelled';
@@ -98,6 +103,16 @@ type PurchaseReceipt = {
   warehouse: PurchaseWarehouse; status: 'posted'; note: string | null; receivedAt: string;
   createdAt: string; lineCount: number; totalQuantity: number; originalQuantity?: number;
   correctedQuantity?: number; netQuantity?: number; correctionCount?: number; lines: PurchaseReceiptLine[];
+};
+type PurchaseReceiptCorrectionLine = {
+  id: string; purchaseReceiptLineId: string; purchaseOrderLineId: string; skuId: string;
+  skuCode: string; skuName: string; warehouseId: string; quantity: number;
+};
+type PurchaseReceiptCorrection = {
+  id: string; correctionNo: string; purchaseReceiptId: string; purchaseReceiptNo: string;
+  purchaseOrderId: string; purchaseOrderNo: string; warehouse: PurchaseWarehouse; status: 'posted';
+  reason: string; createdBy: { memberId: string; email: string; displayName: string };
+  createdAt: string; lineCount: number; totalQuantity: number; lines: PurchaseReceiptCorrectionLine[];
 };
 type ProcurementSummary = {
   suppliers: number; draftOrders: number; issuedOrders: number; partiallyReceivedOrders: number;
@@ -518,6 +533,11 @@ export default function ErpClient() {
   const [showWarehouse, setShowWarehouse] = useState(false);
   const [purchaseOrderRequest, setPurchaseOrderRequest] = useState<PurchaseRequest | null>(null);
   const [receivingOrder, setReceivingOrder] = useState<PurchaseOrder | null>(null);
+  const [correctingReceipt, setCorrectingReceipt] = useState<PurchaseReceipt | null>(null);
+  const [receiptCorrections, setReceiptCorrections] = useState<PurchaseReceiptCorrection[]>([]);
+  const [receiptCorrectionsLoaded, setReceiptCorrectionsLoaded] = useState(false);
+  const [receiptCorrectionError, setReceiptCorrectionError] = useState('');
+  const [receiptCorrectionIdempotencyKey, setReceiptCorrectionIdempotencyKey] = useState('');
   const [purchaseBusy, setPurchaseBusy] = useState('');
   const [showMemberRoles, setShowMemberRoles] = useState(false);
   const [managedMembers, setManagedMembers] = useState<ManagedMemberView[]>([]);
@@ -1397,6 +1417,87 @@ export default function ErpClient() {
     } finally { setPurchaseBusy(''); }
   }
 
+  async function openReceiptCorrection(receipt: PurchaseReceipt) {
+    setCorrectingReceipt(receipt);
+    setReceiptCorrections([]);
+    setReceiptCorrectionsLoaded(false);
+    setReceiptCorrectionError('');
+    setReceiptCorrectionIdempotencyKey(crypto.randomUUID());
+    setPurchaseBusy(`load-corrections:${receipt.id}`);
+    try {
+      const response = await fetch(`/api/purchase/receipts/${encodeURIComponent(receipt.id)}/corrections`, {
+        cache: 'no-store',
+      });
+      const body = await response.json().catch(() => null) as {
+        corrections?: PurchaseReceiptCorrection[];
+        message?: string;
+      } | null;
+      if (!response.ok) throw new Error(readApiMessage(body, '到货冲正历史加载失败'));
+      setReceiptCorrections(Array.isArray(body?.corrections) ? body.corrections : []);
+      setReceiptCorrectionsLoaded(true);
+    } catch (cause) {
+      setReceiptCorrectionError(cause instanceof Error ? cause.message : '到货冲正历史加载失败');
+    } finally {
+      setPurchaseBusy('');
+    }
+  }
+
+  async function submitReceiptCorrection(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!correctingReceipt) return;
+    if (!receiptCorrectionsLoaded) {
+      setReceiptCorrectionError('必须先成功加载该到货单的冲正历史，才能提交新的冲正');
+      return;
+    }
+    const data = new FormData(event.currentTarget);
+    const availableLines = receiptCorrectionAvailability(correctingReceipt.lines, receiptCorrections);
+    const selectedLineIds = availableLines
+      .filter((line) => data.get(`selected:${line.id}`) === 'on')
+      .map((line) => line.id);
+    const quantities = Object.fromEntries(availableLines.map((line) => [
+      line.id,
+      data.get(`quantity:${line.id}`),
+    ]));
+    const draft = validateReceiptCorrectionDraft({
+      reason: String(data.get('reason') ?? ''),
+      availableLines,
+      selectedLineIds,
+      quantities,
+    });
+    if (!draft.ok) {
+      setReceiptCorrectionError(draft.message);
+      return;
+    }
+    setPurchaseBusy(`correct-receipt:${correctingReceipt.id}`);
+    setReceiptCorrectionError('');
+    try {
+      const response = await fetch(`/api/purchase/receipts/${encodeURIComponent(correctingReceipt.id)}/corrections`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': receiptCorrectionIdempotencyKey || crypto.randomUUID(),
+        },
+        body: JSON.stringify({ reason: draft.reason, lines: draft.lines }),
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiMessage(
+        body,
+        '冲正失败；若库存已被占用或消耗，请先核对并解除真实库存占用',
+      ));
+      setCorrectingReceipt(null);
+      setReceiptCorrections([]);
+      setReceiptCorrectionsLoaded(false);
+      setReceiptCorrectionIdempotencyKey('');
+      await loadData();
+      setPurchaseTab('received');
+      flash('错录到货已追加冲正，原记录保留，库存和采购单已按净收货量回算');
+    } catch (cause) {
+      setReceiptCorrectionError(cause instanceof Error ? cause.message : '到货冲正失败');
+    } finally {
+      setPurchaseBusy('');
+    }
+  }
+
   const activeLabel = nav.find((item) => item.key === active)?.label ?? '工作台';
   const displayName = payload?.user.displayName || '未登录';
   const initials = displayName.slice(0, 2).toUpperCase();
@@ -1429,7 +1530,7 @@ export default function ErpClient() {
             {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}
             {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
             {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} source={inventorySource} setSource={switchInventorySource} mukuStatus={mukuStatus} mukuRuns={mukuRuns} mukuInventory={mukuInventory} mukuRisk={mukuRisk} mukuInventoryRows={filteredMukuInventory} mukuRiskRows={filteredMukuRisk} mukuPage={mukuPage} setMukuPage={setMukuPage} mukuFilters={mukuFilters} applyMukuFilters={applyMukuFilters} mukuBusy={mukuBusy} mukuError={mukuError} canRead={can('connectors:read')} canSync={can('connectors:sync')} testConnection={testMukuConnection} syncReadOnly={syncMukuReadOnly} />}
-            {active === 'purchase' && <PurchaseWorkspaceView planning={purchasePlanning} planningRows={filteredPurchasePlanningRows} planningError={planningError} demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedPlanRowIds={selectedPlanRowIds} togglePlanningRow={togglePlanningRow} openPlanningRequest={() => setShowPlanningRequest(true)} openPlanningMapping={setPlanningMapping} openPlanningPolicy={setPlanningPolicy} openInventoryConfirmation={setInventoryConfirmationRow} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openMemberRoles={() => { void openMemberRoles(); }} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={setReceivingOrder} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
+            {active === 'purchase' && <PurchaseWorkspaceView planning={purchasePlanning} planningRows={filteredPurchasePlanningRows} planningError={planningError} demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedPlanRowIds={selectedPlanRowIds} togglePlanningRow={togglePlanningRow} openPlanningRequest={() => setShowPlanningRequest(true)} openPlanningMapping={setPlanningMapping} openPlanningPolicy={setPlanningPolicy} openInventoryConfirmation={setInventoryConfirmationRow} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openMemberRoles={() => { void openMemberRoles(); }} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={setReceivingOrder} openReceiptCorrection={(receipt) => { void openReceiptCorrection(receipt); }} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
             {!['dashboard','platform','orders','inventory','purchase'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
           </>
         ) : <LoadingState message={error || '暂时无法加载业务数据'} />}
@@ -1447,6 +1548,7 @@ export default function ErpClient() {
       {showMemberRoles && <MemberRolesModal members={managedMembers} currentUserEmail={payload?.user.email ?? ''} busy={memberRoleBusy} error={memberRoleError} onRetry={() => { void openMemberRoles(); }} onChange={(member, role) => { void updateMemberRole(member, role); }} onClose={() => { if (!memberRoleBusy) { setShowMemberRoles(false); setMemberRoleError(''); } }} />}
       {purchaseOrderRequest && purchasePayload && <PurchaseOrderModal request={purchaseOrderRequest} suppliers={purchasePayload.suppliers} busy={purchaseBusy.startsWith('create-order:')} error={error} openSupplier={() => setShowSupplier(true)} onClose={() => { if (!purchaseBusy) { setPurchaseOrderRequest(null); setError(''); } }} onSubmit={submitPurchaseOrder} />}
       {receivingOrder && purchasePayload && <PurchaseReceiptModal order={receivingOrder} warehouses={purchasePayload.warehouses} busy={purchaseBusy.startsWith('receive:')} error={error} canCreateWarehouse={can('warehouse:manage')} openWarehouse={() => setShowWarehouse(true)} onClose={() => { if (!purchaseBusy) { setReceivingOrder(null); setError(''); } }} onSubmit={submitPurchaseReceipt} />}
+      {correctingReceipt && <PurchaseReceiptCorrectionModal key={correctingReceipt.id} receipt={correctingReceipt} corrections={receiptCorrections} historyReady={receiptCorrectionsLoaded} loading={purchaseBusy === `load-corrections:${correctingReceipt.id}`} busy={purchaseBusy === `correct-receipt:${correctingReceipt.id}`} error={receiptCorrectionError} onRetry={() => { void openReceiptCorrection(correctingReceipt); }} onClose={() => { if (!purchaseBusy) { setCorrectingReceipt(null); setReceiptCorrections([]); setReceiptCorrectionsLoaded(false); setReceiptCorrectionIdempotencyKey(''); setReceiptCorrectionError(''); } }} onSubmit={submitReceiptCorrection} />}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
     </main>
   );
@@ -1592,7 +1694,7 @@ function MukuPaginationView({ pagination, currentPage, setPage, busy, fallbackTe
   return <div className="pagination muku-pagination"><span>{fallbackText}</span><div><button aria-label="上一页" disabled={busy || page <= 1} onClick={() => setPage(Math.max(1, page - 1))}>‹</button><button className="current" disabled>{page} / {totalPages}</button><button aria-label="下一页" disabled={busy || !(pagination?.hasNext ?? false)} onClick={() => setPage(page + 1)}>›</button></div></div>;
 }
 
-function PurchaseWorkspaceView({ planning, planningRows, planningError, demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedPlanRowIds, togglePlanningRow, openPlanningRequest, openPlanningMapping, openPlanningPolicy, openInventoryConfirmation, selectedDemandIds, toggleDemand, openMapping, openRequest, openSupplier, openWarehouse, openMemberRoles, openPurchaseOrder, openReceipt, can, busy, runAction, runOrderAction, hasQuery }: {
+function PurchaseWorkspaceView({ planning, planningRows, planningError, demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedPlanRowIds, togglePlanningRow, openPlanningRequest, openPlanningMapping, openPlanningPolicy, openInventoryConfirmation, selectedDemandIds, toggleDemand, openMapping, openRequest, openSupplier, openWarehouse, openMemberRoles, openPurchaseOrder, openReceipt, openReceiptCorrection, can, busy, runAction, runOrderAction, hasQuery }: {
   planning: PurchasePlanningPayload | null; planningRows: PurchasePlanningRow[]; planningError: string;
   demands: PurchaseDemand[]; requests: PurchaseRequest[]; purchaseOrders: PurchaseOrder[]; purchaseReceipts: PurchaseReceipt[];
   workspace: PurchaseWorkspacePayload | null; tab: PurchaseTab; setTab: (tab: PurchaseTab) => void;
@@ -1604,6 +1706,7 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
   openMapping: (demand: PurchaseDemand) => void; openRequest: () => void; openSupplier: () => void; openWarehouse: () => void;
   openMemberRoles: () => void;
   openPurchaseOrder: (request: PurchaseRequest) => void; openReceipt: (order: PurchaseOrder) => void;
+  openReceiptCorrection: (receipt: PurchaseReceipt) => void;
   can: (permission: Permission) => boolean; busy: string;
   runAction: (request: PurchaseRequest, action: PurchaseRequestAction) => void;
   runOrderAction: (order: PurchaseOrder, action: 'issue' | 'cancel' | 'close') => void; hasQuery: boolean;
@@ -1673,7 +1776,7 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
       </> : tab === 'requests' ? <><div className="planning-inline-warning"><strong>{workspace?.developmentOpenAccess ? '开发试运行模式' : '正式岗位分离'}</strong> {workspace?.developmentOpenAccess ? '当前允许同一人兼任采购负责人和复审人，仅用于开发测试；操作仍只对被分配成员开放。' : '采购负责人负责提交，指定复审人负责批准或驳回，且两者必须为不同成员。'}</div><PurchaseRequestTable requests={visibleRequests} currentMemberId={workspace?.currentMemberId ?? null} can={can} busy={busy} runAction={runAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购申请' : '暂无草稿或待复审申请，可从待处理需求生成'} /></>
         : tab === 'approved' ? <PurchaseRequestTable requests={approvedRequests} currentMemberId={workspace?.currentMemberId ?? null} can={can} busy={busy} runAction={runAction} openPurchaseOrder={openPurchaseOrder} emptyMessage={hasQuery ? '没有符合当前搜索条件的已批准申请' : '暂无待转采购单；采购申请批准后会出现在这里'} />
           : tab === 'orders' ? <PurchaseOrderTable orders={activeOrders} assignedPurchaseRequestIds={assignedPurchaseRequestIds} purchaserNamesByRequestId={purchaserNamesByRequestId} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购单' : '暂无待下单或待到货采购单'} />
-            : tab === 'received' ? <PurchaseReceiptTable receipts={purchaseReceipts} emptyMessage={hasQuery ? '没有符合当前搜索条件的到货记录' : '暂无到货记录；确认采购单下单后可分批登记到货'} />
+            : tab === 'received' ? <PurchaseReceiptTable receipts={purchaseReceipts} canCorrect={can('inventory:receive')} busy={busy} openCorrection={openReceiptCorrection} emptyMessage={hasQuery ? '没有符合当前搜索条件的到货记录' : '暂无到货记录；确认采购单下单后可分批登记到货'} />
               : <div className="purchase-history-sections"><div><h3>已结束的申请</h3><PurchaseRequestTable requests={historyRequests} currentMemberId={workspace?.currentMemberId ?? null} can={can} busy={busy} runAction={runAction} emptyMessage="暂无驳回或取消的采购申请" /></div><div><h3>已结束的采购单</h3><PurchaseOrderTable orders={closedOrders} assignedPurchaseRequestIds={assignedPurchaseRequestIds} purchaserNamesByRequestId={purchaserNamesByRequestId} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage="暂无完成或取消的正式采购单" /></div></div>}
       <div className="pagination"><span>取消、退款、到货和库存变化均保留原始记录；系统不物理删除采购历史</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div>
     </article>
@@ -1820,8 +1923,32 @@ function PurchaseOrderTable({ orders, assignedPurchaseRequestIds, purchaserNames
   }) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
-function PurchaseReceiptTable({ receipts, emptyMessage }: { receipts: PurchaseReceipt[]; emptyMessage: string }) {
-  return <div className="table-wrap module-table"><table className="purchase-receipt-table"><thead><tr><th>到货单</th><th>采购单</th><th>入库仓</th><th>明细 / 件数</th><th>SKU</th><th>到货时间</th><th>状态</th></tr></thead><tbody>{receipts.length ? receipts.map((receipt) => <tr key={receipt.id}><td><strong>{receipt.receiptNo}</strong><small className="cell-sub">{receipt.note ?? '不可变入库记录'}</small></td><td>{receipt.purchaseOrderNo}</td><td><strong>{receipt.warehouse.name}</strong><small className="cell-sub">{receipt.warehouse.code}</small></td><td>{receipt.lineCount} 行 / 净 {receipt.netQuantity ?? receipt.totalQuantity} 件{Boolean(receipt.correctedQuantity) && <small className="cell-sub">原收 {receipt.originalQuantity ?? receipt.totalQuantity} · 已冲正 {receipt.correctedQuantity}</small>}</td><td>{receipt.lines.slice(0, 2).map((line) => line.skuCode).join('、')}{receipt.lines.length > 2 ? ` 等 ${receipt.lines.length} 项` : ''}</td><td>{formatTime(receipt.receivedAt)}</td><td><span className="status-pill success">已入库</span></td></tr>) : <tr><td className="empty-cell" colSpan={7}>{emptyMessage}</td></tr>}</tbody></table></div>;
+function PurchaseReceiptTable({ receipts, canCorrect, busy, openCorrection, emptyMessage }: {
+  receipts: PurchaseReceipt[];
+  canCorrect: boolean;
+  busy: string;
+  openCorrection: (receipt: PurchaseReceipt) => void;
+  emptyMessage: string;
+}) {
+  return <div className="table-wrap module-table"><table className="purchase-receipt-table"><thead><tr><th>到货单</th><th>采购单</th><th>入库仓</th><th>明细 / 件数</th><th>SKU</th><th>到货时间</th><th>状态</th><th>操作</th></tr></thead><tbody>{receipts.length ? receipts.map((receipt) => {
+    const quantities = normalizedReceiptQuantities(receipt);
+    return <tr key={receipt.id}>
+      <td><strong>{receipt.receiptNo}</strong><small className="cell-sub">{receipt.note ?? '不可变入库记录'}</small></td>
+      <td>{receipt.purchaseOrderNo}</td>
+      <td><strong>{receipt.warehouse.name}</strong><small className="cell-sub">{receipt.warehouse.code}</small></td>
+      <td>{receipt.lineCount} 行 / 净 {quantities.netQuantity} 件<small className="cell-sub">原收 {quantities.originalQuantity} · 已冲正 {quantities.correctedQuantity}</small></td>
+      <td>{receipt.lines.slice(0, 2).map((line) => line.skuCode).join('、')}{receipt.lines.length > 2 ? ` 等 ${receipt.lines.length} 项` : ''}</td>
+      <td>{formatTime(receipt.receivedAt)}</td>
+      <td>{quantities.correctedQuantity > 0
+        ? <><span className={`status-pill ${quantities.netQuantity > 0 ? 'purchase-receipt-corrected' : 'purchase-receipt-reversed'}`}>{quantities.netQuantity > 0 ? '部分冲正' : '已全部冲正'}</span><small className="cell-sub">{quantities.correctionCount} 张冲正单 · 原记录保留</small></>
+        : <span className="status-pill success">已入库</span>}</td>
+      <td><div className="row-actions">{canCorrect && quantities.netQuantity > 0
+        ? <button className="action-muted" disabled={Boolean(busy)} onClick={() => openCorrection(receipt)}>冲正错录</button>
+        : quantities.netQuantity === 0
+          ? <span className="terminal-label">已无可冲正数量</span>
+          : <span className="terminal-label">仅入库人员可冲正</span>}</div></td>
+    </tr>;
+  }) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
 function PlannedModule({ module }: { module: (typeof plannedModules)[keyof typeof plannedModules] }) {
@@ -1972,6 +2099,47 @@ function PurchaseReceiptModal({ order, warehouses, busy, error, canCreateWarehou
   const now = new Date();
   const localDateTime = new Date(now.getTime() - now.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
   return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal procurement-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>登记采购到货</h2><p>{order.orderNo} · {order.supplier.name}</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>本次入库仓<div className="select-with-action"><select name="warehouseId" required defaultValue={warehouses[0]?.id ?? ''}><option value="" disabled>请选择仓库</option>{warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.code} · {warehouse.name}</option>)}</select>{canCreateWarehouse && <button type="button" onClick={openWarehouse} disabled={busy}>＋ 新增</button>}</div></label><label>实际到货时间<input name="receivedAt" type="datetime-local" defaultValue={localDateTime} required /></label><label className="full">到货备注<textarea name="note" rows={2} maxLength={500} placeholder="可填写送货单号、批次或异常说明" /></label></div><div className="purchase-order-lines"><div className="purchase-order-lines-head"><strong>本次实际到货</strong><span>可以分批登记，累计数量不能超过采购数量</span></div>{receivableLines.map((line) => <div className="purchase-order-line receipt-line" key={line.id}><div><strong>{line.skuCode}</strong><span>{line.skuName}</span></div><b>已到 {line.receivedQuantity} / 未到 {line.remainingQuantity}</b><label>本次到货<input name={`quantity:${line.id}`} type="number" min="0" max={line.remainingQuantity} step="1" defaultValue={line.remainingQuantity} inputMode="numeric" /></label></div>)}</div>{!warehouses.length && <div className="form-error missing-master-data"><span>当前没有可用仓库，无法登记入库。</span>{canCreateWarehouse && <button type="button" onClick={openWarehouse}>立即新增仓库</button>}</div>}{error && <div className="form-error">{error}</div>}<div className="modal-safety"><span>库存规则</span>提交后自动增加 ERP 现存库存并写入不可变入库流水 · 重复提交不会重复加库存</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || !warehouses.length || !receivableLines.length}>{busy ? '正在入库…' : '确认本次到货并入库'}</button></div></form></div>;
+}
+
+function PurchaseReceiptCorrectionModal({ receipt, corrections, historyReady, loading, busy, error, onRetry, onClose, onSubmit }: {
+  receipt: PurchaseReceipt;
+  corrections: PurchaseReceiptCorrection[];
+  historyReady: boolean;
+  loading: boolean;
+  busy: boolean;
+  error: string;
+  onRetry: () => void;
+  onClose: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const availableLines = receiptCorrectionAvailability(receipt.lines, corrections);
+  const quantities = normalizedReceiptQuantities(receipt);
+  const [selectedLineIds, setSelectedLineIds] = useState<Set<string>>(new Set());
+  const toggleLine = (lineId: string) => setSelectedLineIds((current) => {
+    const next = new Set(current);
+    if (next.has(lineId)) next.delete(lineId);
+    else next.add(lineId);
+    return next;
+  });
+  return <div className="modal-backdrop modal-layer-top" onMouseDown={onClose}><form className="modal procurement-modal receipt-correction-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>冲正错录到货</h2><p>{receipt.receiptNo} · {receipt.purchaseOrderNo} · {receipt.warehouse.name}</p></div><button type="button" onClick={onClose} disabled={busy || loading}>×</button></div>
+    <div className="receipt-correction-summary"><article><span>原始收货</span><strong>{quantities.originalQuantity} 件</strong></article><article><span>已冲正</span><strong>{quantities.correctedQuantity} 件</strong></article><article><span>当前净收</span><strong>{quantities.netQuantity} 件</strong></article></div>
+    {loading ? <div className="receipt-correction-loading"><span className="loader" /><p>正在核对已有冲正历史…</p></div> : <>
+      {error && <div className="member-role-error receipt-correction-error"><span>{error}</span>{!historyReady && <button type="button" onClick={onRetry}>重新加载历史</button>}</div>}
+      <div className="purchase-order-lines receipt-correction-lines"><div className="purchase-order-lines-head"><strong>选择错录明细</strong><span>逐行按剩余可冲正数量填写</span></div>{availableLines.map((line) => {
+        const selected = selectedLineIds.has(line.id);
+        return <div className="purchase-order-line receipt-correction-line" key={line.id}>
+          <input className="purchase-check" type="checkbox" name={`selected:${line.id}`} aria-label={`选择冲正 ${line.skuCode}`} checked={selected} disabled={busy || !historyReady || line.remainingQuantity <= 0} onChange={() => toggleLine(line.id)} />
+          <div><strong>{line.skuCode}</strong><span>{line.skuName}</span></div>
+          <b>原收 {line.quantity} · 已冲 {line.correctedQuantity} · 可冲 {line.remainingQuantity}</b>
+          <label>本次冲正<input name={`quantity:${line.id}`} type="number" min="1" max={line.remainingQuantity} step="1" defaultValue="1" inputMode="numeric" disabled={!selected || busy || !historyReady} /></label>
+        </div>;
+      })}</div>
+      <div className="form-grid receipt-correction-reason"><label className="full">冲正原因<textarea name="reason" rows={3} minLength={2} maxLength={500} required placeholder="例如：仓库复核发现本批多录 2 件；请填写真实依据" disabled={busy || !historyReady} /></label></div>
+      <section className="receipt-correction-history"><div className="purchase-order-lines-head"><strong>历史冲正</strong><span>{corrections.length} 张，原到货记录始终保留</span></div>{corrections.length ? corrections.map((correction) => <article key={correction.id}><div><strong>{correction.correctionNo}</strong><span>{correction.createdBy.displayName} · {formatTime(correction.createdAt)}</span></div><b>-{correction.totalQuantity} 件</b><p>{correction.reason}</p></article>) : <p className="receipt-correction-empty">暂无历史冲正</p>}</section>
+    </>}
+    <div className="modal-safety receipt-correction-safety"><span>只追加、不删除</span>提交会新增冲正单和负向库存流水，原到货单不会被修改。库存已消耗或被订单占用时，系统会拒绝冲正，避免库存变负。</div>
+    <div className="modal-actions"><button type="button" onClick={onClose} disabled={busy || loading}>取消</button><button className="primary-button" type="submit" disabled={busy || loading || !historyReady || selectedLineIds.size === 0}>{busy ? '正在冲正…' : '确认追加冲正'}</button></div>
+  </form></div>;
 }
 
 function Status({ status }: { status: OrderStatus }) {
@@ -2316,6 +2484,11 @@ function normalizePurchaseWorkspace(body: PurchaseWorkspacePayload | PurchaseDem
       receivedQuantity: order.receivedQuantity ?? order.lines?.reduce((sum, line) => sum + line.receivedQuantity, 0) ?? 0,
       currency: order.currency ?? null,
     })) : [];
+    const purchaseReceipts = Array.isArray(body.purchaseReceipts) ? body.purchaseReceipts.map((receipt) => ({
+      ...receipt,
+      ...normalizedReceiptQuantities(receipt),
+      lines: Array.isArray(receipt.lines) ? receipt.lines : [],
+    })) : [];
     return {
       ...body,
       demands,
@@ -2327,8 +2500,8 @@ function normalizePurchaseWorkspace(body: PurchaseWorkspacePayload | PurchaseDem
       suppliers: Array.isArray(body.suppliers) ? body.suppliers : [],
       warehouses: Array.isArray(body.warehouses) ? body.warehouses : [],
       purchaseOrders,
-      purchaseReceipts: Array.isArray(body.purchaseReceipts) ? body.purchaseReceipts : [],
-      procurementSummary: body.procurementSummary ?? summarizeProcurement(purchaseOrders, body.purchaseReceipts ?? [], body.suppliers ?? []),
+      purchaseReceipts,
+      procurementSummary: body.procurementSummary ?? summarizeProcurement(purchaseOrders, purchaseReceipts, body.suppliers ?? []),
     };
   }
   return {
@@ -2369,9 +2542,9 @@ function summarizeProcurement(orders: PurchaseOrder[], receipts: PurchaseReceipt
     closedShortOrders: orders.filter((order) => order.status === 'closed_short').length,
     pendingReceiptQuantity: orders.filter((order) => ['issued', 'partially_received'].includes(order.status)).reduce((sum, order) => sum + Math.max(0, order.orderedQuantity - order.receivedQuantity), 0),
     receiptCount: receipts.length,
-    correctionCount: receipts.reduce((sum, receipt) => sum + Number(receipt.correctionCount ?? 0), 0),
-    correctedQuantity: receipts.reduce((sum, receipt) => sum + Number(receipt.correctedQuantity ?? 0), 0),
-    receivedQuantity: receipts.reduce((sum, receipt) => sum + Number(receipt.netQuantity ?? receipt.totalQuantity), 0),
+    correctionCount: receipts.reduce((sum, receipt) => sum + normalizedReceiptQuantities(receipt).correctionCount, 0),
+    correctedQuantity: receipts.reduce((sum, receipt) => sum + normalizedReceiptQuantities(receipt).correctedQuantity, 0),
+    receivedQuantity: receipts.reduce((sum, receipt) => sum + normalizedReceiptQuantities(receipt).netQuantity, 0),
   };
 }
 
