@@ -85,6 +85,9 @@ export async function updateManagedMemberRole(
   const auditId = crypto.randomUUID();
   const requestId = crypto.randomUUID();
   const protectedEmail = normalizeEmail(input.bootstrapOwnerEmail) ?? '';
+  const nextPermissions = ROLE_PERMISSIONS[input.role];
+  const keepsSubmitPermission = nextPermissions.includes('purchase:submit') ? 1 : 0;
+  const keepsReviewPermission = nextPermissions.includes('purchase:review') ? 1 : 0;
   const results = await db.batch([
     db.prepare(`
       UPDATE members
@@ -98,6 +101,35 @@ export async function updateManagedMemberRole(
           )
         )
         AND (? = 'admin' OR ? = '' OR lower(email) <> ?)
+        AND (
+          ? = 1
+          OR NOT EXISTS (
+            SELECT 1 FROM purchase_requests request
+            WHERE request.tenant_id = members.tenant_id
+              AND request.purchaser_member_id = members.id
+              AND (
+                request.status IN ('draft', 'pending_review')
+                OR (
+                  request.status = 'approved'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM purchase_orders purchase_order
+                    WHERE purchase_order.tenant_id = request.tenant_id
+                      AND purchase_order.purchase_request_id = request.id
+                      AND purchase_order.status <> 'cancelled'
+                  )
+                )
+              )
+          )
+        )
+        AND (
+          ? = 1
+          OR NOT EXISTS (
+            SELECT 1 FROM purchase_requests request
+            WHERE request.tenant_id = members.tenant_id
+              AND request.reviewer_member_id = members.id
+              AND request.status IN ('draft', 'pending_review')
+          )
+        )
     `).bind(
       input.role,
       user.tenantId,
@@ -108,6 +140,8 @@ export async function updateManagedMemberRole(
       input.role,
       protectedEmail,
       protectedEmail,
+      keepsSubmitPermission,
+      keepsReviewPermission,
     ),
     db.prepare(`
       INSERT INTO audit_logs (
@@ -143,6 +177,7 @@ export async function updateManagedMemberRole(
     if (isBootstrapOwner(current.email, input.bootstrapOwnerEmail) && input.role !== 'admin') {
       throw new HttpError(409, '工作区负责人必须保留管理员角色', 'BOOTSTRAP_OWNER_ROLE_PROTECTED');
     }
+    await assertRoleChangeDoesNotStrandProcurement(db, user.tenantId, current.id, input.role);
     throw new HttpError(409, '成员角色已变化，请刷新后重试', 'MEMBER_ROLE_CONFLICT');
   }
 
