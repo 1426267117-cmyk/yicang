@@ -34,6 +34,7 @@ type PurchaseOrderRow = {
   order_no: string;
   purchase_request_id: string;
   purchase_request_no: string;
+  purchaser_member_id: string;
   supplier_id: string;
   supplier_code: string;
   supplier_name: string;
@@ -891,6 +892,7 @@ const PURCHASE_ORDER_SELECT = `
     po.order_no,
     po.purchase_request_id,
     pr.request_no AS purchase_request_no,
+    pr.purchaser_member_id,
     po.supplier_id,
     supplier.code AS supplier_code,
     supplier.name AS supplier_name,
@@ -1001,6 +1003,7 @@ function mapPurchaseOrder(row: PurchaseOrderRow, lines: ReturnType<typeof mapPur
     orderNo: row.order_no,
     purchaseRequestId: row.purchase_request_id,
     purchaseRequestNo: row.purchase_request_no,
+    purchaserMemberId: row.purchaser_member_id,
     supplier: { id: row.supplier_id, code: row.supplier_code, name: row.supplier_name },
     status: row.status,
     currency: row.currency,

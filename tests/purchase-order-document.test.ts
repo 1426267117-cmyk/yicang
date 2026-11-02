@@ -158,6 +158,7 @@ function sourceOrder(overrides: Partial<SourceOrder> = {}): SourceOrder {
     orderNo: 'CGD261102-TEST',
     purchaseRequestId: 'request-1',
     purchaseRequestNo: 'CG261102-TEST',
+    purchaserMemberId: 'member-buyer',
     supplier: { id: 'supplier-1', code: 'SUP-01', name: '测试供应商' },
     status: 'issued',
     currency: 'CNY',

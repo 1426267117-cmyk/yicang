@@ -76,6 +76,7 @@ type CreateDemandRow = {
   required_quantity: number;
   source_updated_at: string;
   active_line_id: string | null;
+  closed_received_quantity: number;
 };
 
 type CurrentRequestRow = {
@@ -132,11 +133,35 @@ export async function getPurchaseWorkspace(
   const demandPayload = await getPurchaseDemands(db, user);
   const [allocations, requestRows, lineRows, members, skuOptions, availability] = await Promise.all([
     db.prepare(`
-      SELECT purchase_demand_id, COALESCE(SUM(requested_quantity), 0) AS allocated_quantity
-      FROM purchase_request_lines
-      WHERE tenant_id = ? AND active = 1
-      GROUP BY purchase_demand_id
-    `).bind(user.tenantId).all<{ purchase_demand_id: string; allocated_quantity: number }>(),
+      WITH active_allocations AS (
+        SELECT purchase_demand_id, SUM(requested_quantity) AS quantity
+        FROM purchase_request_lines
+        WHERE tenant_id = ? AND active = 1
+        GROUP BY purchase_demand_id
+      ), closed_receipts AS (
+        SELECT request_line.purchase_demand_id, SUM(order_line.received_quantity) AS quantity
+        FROM purchase_request_lines request_line
+        JOIN purchase_order_lines order_line
+          ON order_line.purchase_request_line_id = request_line.id
+          AND order_line.tenant_id = request_line.tenant_id
+        JOIN purchase_orders purchase_order
+          ON purchase_order.id = order_line.purchase_order_id
+          AND purchase_order.tenant_id = order_line.tenant_id
+        WHERE request_line.tenant_id = ?
+          AND request_line.active = 0
+          AND purchase_order.status = 'closed_short'
+        GROUP BY request_line.purchase_demand_id
+      )
+      SELECT
+        demand.id AS purchase_demand_id,
+        COALESCE(active_allocations.quantity, 0) + COALESCE(closed_receipts.quantity, 0)
+          AS allocated_quantity
+      FROM purchase_demands demand
+      LEFT JOIN active_allocations ON active_allocations.purchase_demand_id = demand.id
+      LEFT JOIN closed_receipts ON closed_receipts.purchase_demand_id = demand.id
+      WHERE demand.tenant_id = ?
+    `).bind(user.tenantId, user.tenantId, user.tenantId)
+      .all<{ purchase_demand_id: string; allocated_quantity: number }>(),
     db.prepare(`${PURCHASE_REQUEST_SELECT}
       WHERE pr.tenant_id = ?
       GROUP BY pr.id
@@ -170,17 +195,34 @@ export async function getPurchaseWorkspace(
         FROM purchase_request_lines
         WHERE tenant_id = ? AND active = 1
         GROUP BY purchase_demand_id
+      ), closed_received AS (
+        SELECT request_line.purchase_demand_id, SUM(order_line.received_quantity) AS quantity
+        FROM purchase_request_lines request_line
+        JOIN purchase_order_lines order_line
+          ON order_line.purchase_request_line_id = request_line.id
+          AND order_line.tenant_id = request_line.tenant_id
+        JOIN purchase_orders purchase_order
+          ON purchase_order.id = order_line.purchase_order_id
+          AND purchase_order.tenant_id = order_line.tenant_id
+        WHERE request_line.tenant_id = ?
+          AND request_line.active = 0
+          AND purchase_order.status = 'closed_short'
+        GROUP BY request_line.purchase_demand_id
       )
       SELECT
-        COALESCE(SUM(CASE WHEN pd.status = 'open' THEN COALESCE(allocated.quantity, 0) ELSE 0 END), 0)
+        COALESCE(SUM(CASE WHEN pd.status = 'open'
+          THEN COALESCE(allocated.quantity, 0) + COALESCE(closed_received.quantity, 0)
+          ELSE 0 END), 0)
           AS allocated_quantity,
         COALESCE(SUM(CASE WHEN pd.status = 'open'
-          THEN MAX(0, pd.required_quantity - COALESCE(allocated.quantity, 0)) ELSE 0 END), 0)
+          THEN MAX(0, pd.required_quantity - COALESCE(allocated.quantity, 0)
+            - COALESCE(closed_received.quantity, 0)) ELSE 0 END), 0)
           AS available_quantity
       FROM purchase_demands pd
       LEFT JOIN allocated ON allocated.purchase_demand_id = pd.id
+      LEFT JOIN closed_received ON closed_received.purchase_demand_id = pd.id
       WHERE pd.tenant_id = ?
-    `).bind(user.tenantId, user.tenantId).first<{
+    `).bind(user.tenantId, user.tenantId, user.tenantId).first<{
       allocated_quantity: number;
       available_quantity: number;
     }>(),
@@ -363,9 +405,13 @@ async function createPurchaseRequestWithAllocations(
   const demandById = new Map(demands.map((demand) => [demand.id, demand]));
   const resolvedAllocations = input.allocations.map((allocation) => {
     const demand = demandById.get(allocation.demandId)!;
-    const requestedQuantity = allocation.requestedQuantity ?? Number(demand.required_quantity);
+    const availableQuantity = Math.max(
+      0,
+      Number(demand.required_quantity) - Number(demand.closed_received_quantity),
+    );
+    const requestedQuantity = allocation.requestedQuantity ?? availableQuantity;
     if (!Number.isSafeInteger(requestedQuantity) || requestedQuantity <= 0
-      || requestedQuantity > Number(demand.required_quantity)) {
+      || requestedQuantity > availableQuantity) {
       throw new HttpError(
         409,
         '采购建议分配量已超过当前订单需求，请刷新后重试',
@@ -875,7 +921,21 @@ async function loadCreateDemands(db: D1Database, tenantId: string, demandIds: st
       pd.mapped_sku_id,
       pd.required_quantity,
       pd.source_updated_at,
-      active_line.id AS active_line_id
+      active_line.id AS active_line_id,
+      COALESCE((
+        SELECT SUM(order_line.received_quantity)
+        FROM purchase_request_lines historical_line
+        JOIN purchase_order_lines order_line
+          ON order_line.purchase_request_line_id = historical_line.id
+          AND order_line.tenant_id = historical_line.tenant_id
+        JOIN purchase_orders purchase_order
+          ON purchase_order.id = order_line.purchase_order_id
+          AND purchase_order.tenant_id = order_line.tenant_id
+        WHERE historical_line.tenant_id = pd.tenant_id
+          AND historical_line.purchase_demand_id = pd.id
+          AND historical_line.active = 0
+          AND purchase_order.status = 'closed_short'
+      ), 0) AS closed_received_quantity
     FROM purchase_demands pd
     LEFT JOIN purchase_request_lines active_line
       ON active_line.tenant_id = pd.tenant_id

@@ -25,6 +25,7 @@ import {
 import {
   createPurchaseRequest,
   executePurchaseRequestAction,
+  getPurchaseWorkspace,
 } from '../lib/purchase-workflow-service';
 import { shopifyOrderFixture } from './fixtures/shopify-order';
 
@@ -191,6 +192,7 @@ describe('正式采购单与到货入库闭环', () => {
     expect(created.replayed).toBe(false);
     expect(created.purchaseOrder).toEqual(expect.objectContaining({
       status: 'draft', purchaseRequestId: approvedRequestId,
+      purchaserMemberId: 'member-buyer',
       currency: 'USD', orderedQuantity: 5, receivedQuantity: 0,
       supplier: expect.objectContaining({ code: 'SUP-01' }),
     }));
@@ -462,6 +464,11 @@ describe('正式采购单与到货入库闭环', () => {
     expect(closed.purchaseOrder).toEqual(expect.objectContaining({
       status: 'closed_short', orderedQuantity: 5, receivedQuantity: 2,
     }));
+    const closedWorkspace = await getPurchaseWorkspace(db, user);
+    expect(closedWorkspace.demands[0]).toEqual(expect.objectContaining({
+      allocatedQuantity: 2,
+      availableQuantity: 3,
+    }));
 
     const corrected = await createPurchaseReceiptCorrection(db, user, receipt.receipt.id, {
       reason: '已到货中有 1 件错录',
@@ -476,6 +483,20 @@ describe('正式采购单与到货入库闭环', () => {
       WHERE tenant_id = ? AND request_id = ? LIMIT 1
     `).bind(tenantId, approvedRequestId).first<{ active: number }>();
     expect(Number(line?.active)).toBe(0);
+
+    const correctedWorkspace = await getPurchaseWorkspace(db, user);
+    const demand = correctedWorkspace.demands[0]!;
+    expect(demand).toEqual(expect.objectContaining({
+      allocatedQuantity: 1,
+      availableQuantity: 4,
+    }));
+    const replacement = await createPurchaseRequest(db, user, {
+      demandIds: [demand.id],
+      purchaserMemberId: 'member-buyer',
+      reviewerMemberId: 'member-reviewer',
+      note: '只重新申请净未满足数量',
+    }, 'purchase-order-close-correct-replacement-0001');
+    expect(replacement.request.totalQuantity).toBe(4);
   });
 
   it('收货错录通过追加冲正恢复库存和采购单状态，原收货记录保持不变', async () => {

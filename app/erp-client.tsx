@@ -83,6 +83,7 @@ type PurchaseOrderLine = {
 };
 type PurchaseOrder = {
   id: string; orderNo: string; purchaseRequestId: string; purchaseRequestNo: string;
+  purchaserMemberId?: string;
   supplier: Pick<PurchaseSupplier, 'id' | 'code' | 'name'>; status: PurchaseOrderStatus;
   currency: string | null; note: string | null; actionNote: string | null; version: number; lineCount: number;
   orderedQuantity: number; receivedQuantity: number; issuedAt: string | null; closedAt: string | null; cancelledAt: string | null;
@@ -1616,6 +1617,11 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
   const assignedPurchaseRequestIds = new Set(allRequests.filter((request) => (
     request.buyer?.id ?? request.purchaser?.id ?? request.purchaserMemberId
   ) === workspace?.currentMemberId).map((request) => request.id));
+  for (const order of allOrders) {
+    if (workspace?.currentMemberId && order.purchaserMemberId === workspace.currentMemberId) {
+      assignedPurchaseRequestIds.add(order.purchaseRequestId);
+    }
+  }
   const purchaserNamesByRequestId = new Map(allRequests.map((request) => [
     request.id,
     request.buyer?.displayName ?? request.purchaser?.displayName ?? request.purchaserName ?? '采购负责人',
