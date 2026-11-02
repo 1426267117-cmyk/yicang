@@ -249,6 +249,17 @@ export const platformOrders = sqliteTable('platform_orders', {
   index('idx_platform_orders_status').on(table.platformStoreId, table.financialStatus, table.fulfillmentStatus),
 ]);
 
+export const platformOrderWriteLeases = sqliteTable('platform_order_write_leases', {
+  orderId: text('order_id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  leaseId: text('lease_id'),
+  leaseExpiresAt: text('lease_expires_at'),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  index('idx_platform_order_write_leases_expiry').on(table.leaseExpiresAt),
+  index('idx_platform_order_write_leases_tenant').on(table.tenantId),
+]);
+
 export const platformOrderLines = sqliteTable('platform_order_lines', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),

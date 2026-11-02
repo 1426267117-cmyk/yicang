@@ -127,13 +127,131 @@ describe('Shopify 订单行采购需求池', () => {
     `).first<{ total: number; open_count: number; not_required_count: number }>();
     expect(summary).toEqual({ total: 2, open_count: 0, not_required_count: 2 });
   });
+
+  it('部分退款只保留剩余件数，全额退款后采购需求归零', async () => {
+    const template = purchaseGraph({ refunds: [], fulfillments: [] });
+    const templateLines = rawLineNodes(template);
+    const initial = purchaseGraph({
+      updatedAt: '2026-11-02T05:00:00Z',
+      displayFinancialStatus: 'PAID',
+      displayFulfillmentStatus: 'UNFULFILLED',
+      refunds: [],
+      fulfillments: [],
+      lineItems: rawLineConnection(templateLines.map((line) => line.id === 'gid://shopify/LineItem/2'
+        ? { ...line, sku: 'SERVICE-01', quantity: 3, currentQuantity: 3, unfulfilledQuantity: 3 }
+        : line)),
+    });
+    await repository.upsertOrderGraph({
+      storeId, graph: initial, apiVersion: '2026-07', runId: null,
+      fetchedAt: '2026-11-02T05:00:01.000Z',
+    });
+    await mapServiceSku(db, storeId);
+    await repository.upsertOrderGraph({
+      storeId, graph: initial, apiVersion: '2026-07', runId: null,
+      fetchedAt: '2026-11-02T05:00:02.000Z',
+    });
+    expect(await demandForLine(db, 'gid://shopify/LineItem/2')).toEqual(expect.objectContaining({
+      status: 'open', required_quantity: 3,
+    }));
+
+    const partial = purchaseGraph({
+      updatedAt: '2026-11-02T06:00:00Z',
+      displayFinancialStatus: 'PARTIALLY_REFUNDED',
+      displayFulfillmentStatus: 'UNFULFILLED',
+      refunds: [],
+      fulfillments: [],
+      lineItems: rawLineConnection(templateLines.map((line) => line.id === 'gid://shopify/LineItem/2'
+        ? { ...line, sku: 'SERVICE-01', quantity: 3, currentQuantity: 2, unfulfilledQuantity: 3 }
+        : line)),
+    });
+    await repository.upsertOrderGraph({
+      storeId, graph: partial, apiVersion: '2026-07', runId: null,
+      fetchedAt: '2026-11-02T06:00:01.000Z',
+    });
+    expect(await demandForLine(db, 'gid://shopify/LineItem/2')).toEqual(expect.objectContaining({
+      status: 'open', required_quantity: 2,
+    }));
+
+    const fullyRefunded = purchaseGraph({
+      updatedAt: '2026-11-02T07:00:00Z',
+      displayFinancialStatus: 'REFUNDED',
+      displayFulfillmentStatus: 'UNFULFILLED',
+      refunds: [],
+      fulfillments: [],
+      lineItems: rawLineConnection(templateLines.map((line) => line.id === 'gid://shopify/LineItem/2'
+        ? { ...line, sku: 'SERVICE-01', quantity: 3, currentQuantity: 0, unfulfilledQuantity: 3 }
+        : line)),
+    });
+    await repository.upsertOrderGraph({
+      storeId, graph: fullyRefunded, apiVersion: '2026-07', runId: null,
+      fetchedAt: '2026-11-02T07:00:01.000Z',
+    });
+    expect(await demandForLine(db, 'gid://shopify/LineItem/2')).toEqual(expect.objectContaining({
+      status: 'not_required', required_quantity: 0, reason_code: 'no_unfulfilled_quantity',
+    }));
+  });
+
+  it('订单行被移除后保留历史并关闭采购需求', async () => {
+    const first = purchaseGraph({
+      updatedAt: '2026-11-02T08:00:00Z',
+      displayFulfillmentStatus: 'UNFULFILLED',
+      refunds: [],
+      fulfillments: [],
+    });
+    await repository.upsertOrderGraph({
+      storeId, graph: first, apiVersion: '2026-07', runId: null,
+      fetchedAt: '2026-11-02T08:00:01.000Z',
+    });
+    const remainingLine = rawLineNodes(first)[0];
+    const removed = purchaseGraph({
+      updatedAt: '2026-11-02T09:00:00Z',
+      displayFulfillmentStatus: 'UNFULFILLED',
+      refunds: [],
+      fulfillments: [],
+      lineItems: rawLineConnection([remainingLine]),
+    });
+    await repository.upsertOrderGraph({
+      storeId, graph: removed, apiVersion: '2026-07', runId: null,
+      fetchedAt: '2026-11-02T09:00:01.000Z',
+    });
+
+    expect(await count(db, 'purchase_demands')).toBe(2);
+    expect(await demandForLine(db, 'gid://shopify/LineItem/2')).toEqual(expect.objectContaining({
+      status: 'not_required', required_quantity: 0, reason_code: 'line_removed',
+    }));
+  });
 });
 
 function purchaseGraph(overrides: Record<string, unknown>) {
   const graph = shopifyOrderFixture(overrides);
-  graph.lines[1].rawSku = 'SERVICE-01';
-  graph.lines[1].normalizedSku = 'SERVICE-01';
+  if (graph.lines[1]) {
+    graph.lines[1].rawSku = 'SERVICE-01';
+    graph.lines[1].normalizedSku = 'SERVICE-01';
+  }
   return graph;
+}
+
+type RawLine = Record<string, unknown> & { id: string };
+
+function rawLineNodes(graph: ReturnType<typeof purchaseGraph>) {
+  return (graph.raw as { lineItems: { nodes: RawLine[] } }).lineItems.nodes;
+}
+
+function rawLineConnection(nodes: RawLine[]) {
+  return { nodes, pageInfo: { hasNextPage: false, endCursor: null } };
+}
+
+async function mapServiceSku(db: D1Database, storeId: string) {
+  const now = '2026-11-02T05:00:01.500Z';
+  await db.prepare(`
+    INSERT INTO skus (id, tenant_id, code, name, active, created_at)
+    VALUES ('sku_service_refund', ?, 'SERVICE-01', 'Service item', 1, ?)
+  `).bind(tenantId, now).run();
+  await db.prepare(`
+    UPDATE platform_sku_mappings
+    SET sku_id = 'sku_service_refund', status = 'mapped', mapping_source = 'test_mapping', updated_at = ?
+    WHERE tenant_id = ? AND platform_store_id = ? AND raw_sku = 'SERVICE-01'
+  `).bind(now, tenantId, storeId).run();
 }
 
 async function demandRows(db: D1Database) {
@@ -164,6 +282,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0004_illegal_black_panther.sql',
     '../drizzle/0005_chilly_obadiah_stane.sql',
     '../drizzle/0006_soft_wither.sql',
+    '../drizzle/0007_worried_stone_men.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {

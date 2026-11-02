@@ -5,6 +5,9 @@ import type { ShopifyShopContext } from './shopify/connector';
 import { ShopifyConnectorError } from './shopify/errors';
 
 const SYNC_LEASE_MILLISECONDS = 60 * 60 * 1000;
+const ORDER_WRITE_LEASE_MILLISECONDS = 2 * 60 * 1000;
+const ORDER_WRITE_LEASE_WAIT_MILLISECONDS = 5 * 1000;
+const ORDER_WRITE_LEASE_RETRY_MILLISECONDS = 25;
 
 export type PlatformStoreRecord = {
   id: string;
@@ -421,6 +424,24 @@ export class PlatformOrderRepository {
     fetchedAt: string;
   }): Promise<'inserted' | 'updated' | 'unchanged'> {
     const orderId = await stableId('porder', this.tenantId, input.storeId, input.graph.sourceOrderId);
+    const leaseId = await this.acquireOrderWriteLease(orderId);
+    try {
+      return await this.upsertOrderGraphWithLease(orderId, input);
+    } finally {
+      await this.releaseOrderWriteLease(orderId, leaseId);
+    }
+  }
+
+  private async upsertOrderGraphWithLease(
+    orderId: string,
+    input: {
+      storeId: string;
+      graph: CanonicalOrderGraph;
+      apiVersion: string;
+      runId: string | null;
+      fetchedAt: string;
+    },
+  ): Promise<'inserted' | 'updated' | 'unchanged'> {
     const rawJson = stableJson(input.graph.raw);
     const rawHash = await sha256Hex(rawJson);
     const existing = await this.db.prepare(
@@ -645,6 +666,46 @@ export class PlatformOrderRepository {
     return existing ? 'updated' : 'inserted';
   }
 
+  private async acquireOrderWriteLease(orderId: string) {
+    const leaseId = crypto.randomUUID();
+    const deadline = Date.now() + ORDER_WRITE_LEASE_WAIT_MILLISECONDS;
+    while (true) {
+      const now = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + ORDER_WRITE_LEASE_MILLISECONDS).toISOString();
+      const results = await this.db.batch([
+        this.db.prepare(`
+          INSERT OR IGNORE INTO platform_order_write_leases (
+            order_id, tenant_id, lease_id, lease_expires_at, updated_at
+          ) VALUES (?, ?, NULL, NULL, ?)
+        `).bind(orderId, this.tenantId, now),
+        this.db.prepare(`
+          UPDATE platform_order_write_leases
+          SET lease_id = ?, lease_expires_at = ?, updated_at = ?
+          WHERE order_id = ? AND tenant_id = ?
+            AND (lease_id IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+        `).bind(leaseId, expiresAt, now, orderId, this.tenantId, now),
+      ]);
+      if (changedRows(results[1]) === 1) return leaseId;
+      if (Date.now() >= deadline) {
+        throw new ShopifyConnectorError(
+          'SHOPIFY_ORDER_WRITE_BUSY',
+          '同一订单正在由另一同步任务更新，请稍后重试',
+          true,
+          409,
+        );
+      }
+      await wait(ORDER_WRITE_LEASE_RETRY_MILLISECONDS);
+    }
+  }
+
+  private async releaseOrderWriteLease(orderId: string, leaseId: string) {
+    await this.db.prepare(`
+      UPDATE platform_order_write_leases
+      SET lease_id = NULL, lease_expires_at = NULL, updated_at = ?
+      WHERE order_id = ? AND tenant_id = ? AND lease_id = ?
+    `).bind(new Date().toISOString(), orderId, this.tenantId, leaseId).run();
+  }
+
   private orderUpsertStatement(
     orderId: string,
     input: {
@@ -834,6 +895,10 @@ function firstCurrency(line: CanonicalOrderGraph['lines'][number]) {
 
 function changedRows(result: D1Result<unknown> | undefined) {
   return Number(result?.meta?.changes ?? 0);
+}
+
+function wait(milliseconds: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function syncLeaseLost() {

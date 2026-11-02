@@ -132,6 +132,39 @@ describe('平台订单 D1 幂等入库', () => {
     expect(await count(db, 'platform_order_snapshots')).toBe(1);
   });
 
+  it('同步与 webhook 并发写同一订单时旧快照不能覆盖新快照', async () => {
+    const newest = shopifyOrderFixture({
+      updatedAt: '2026-10-22T04:00:00Z',
+      displayFinancialStatus: 'REFUNDED',
+    });
+    const stale = shopifyOrderFixture({
+      updatedAt: '2026-10-22T03:00:00Z',
+      displayFinancialStatus: 'PENDING',
+    });
+
+    await Promise.all([
+      repository.upsertOrderGraph({
+        storeId, graph: newest, apiVersion: '2026-07', runId,
+        fetchedAt: '2026-10-30T00:00:02.000Z',
+      }),
+      new PlatformOrderRepository(db, tenantId).upsertOrderGraph({
+        storeId, graph: stale, apiVersion: '2026-07', runId: null,
+        fetchedAt: '2026-10-30T00:00:03.000Z',
+      }),
+    ]);
+
+    const order = await db.prepare(`
+      SELECT source_updated_at, financial_status FROM platform_orders LIMIT 1
+    `).first<{ source_updated_at: string; financial_status: string }>();
+    expect(order).toEqual({ source_updated_at: '2026-10-22T04:00:00Z', financial_status: 'REFUNDED' });
+    expect(await count(db, 'platform_orders')).toBe(1);
+    expect(await count(db, 'platform_order_snapshots')).toBeGreaterThanOrEqual(1);
+    const lease = await db.prepare(`
+      SELECT lease_id FROM platform_order_write_leases LIMIT 1
+    `).first<{ lease_id: string | null }>();
+    expect(lease?.lease_id).toBeNull();
+  });
+
   it('同一官方 Shop ID 不能跨 ERP 店铺配置重复绑定', async () => {
     const otherConfig = { ...config, key: 'kaguyasu' as const, displayName: 'Kaguyasu' };
     await expect(repository.upsertVerifiedShopifyStore(
@@ -151,6 +184,7 @@ async function applyMigrations(db: D1Database) {
     '../drizzle/0004_illegal_black_panther.sql',
     '../drizzle/0005_chilly_obadiah_stane.sql',
     '../drizzle/0006_soft_wither.sql',
+    '../drizzle/0007_worried_stone_men.sql',
   ]) {
     const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
     for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {
