@@ -2,7 +2,7 @@ import { env } from 'cloudflare:workers';
 import {
   hasShopifyAppCredentials,
   hasShopifyCredentials,
-  resolveShopifyStoreConfig,
+  inspectShopifyStoreConfiguration,
   SHOPIFY_API_VERSION,
   SHOPIFY_STORE_CANDIDATES,
 } from '../../../../../lib/connectors/shopify/config';
@@ -51,9 +51,35 @@ export async function GET(request: Request) {
     }>();
     const credentialByKey = new Map(oauthCredentials.results.map((row) => [row.store_key, row]));
     const stores = SHOPIFY_STORE_CANDIDATES.map((candidate) => {
-      const config = resolveShopifyStoreConfig(runtimeEnv, candidate.key);
       const row = byKey.get(candidate.key);
       const oauth = credentialByKey.get(candidate.key);
+      const inspection = inspectShopifyStoreConfiguration(runtimeEnv, candidate.key);
+      if (!inspection.ok) {
+        return {
+          key: candidate.key,
+          displayName: row?.display_name ?? candidate.displayName,
+          expectedDomain: candidate.expectedDomain,
+          configurationErrorCode: inspection.errorCode,
+          appConfigured: false,
+          encryptionReady: hasValidCredentialEncryptionKey(runtimeEnv),
+          credentialsConfigured: false,
+          authorizationRequired: false,
+          authorizationStartUrl: null,
+          authorizationVerified: Boolean(oauth),
+          authorizationUpdatedAt: oauth?.updated_at ?? null,
+          accessTokenExpiresAt: oauth?.access_token_expires_at ?? null,
+          refreshTokenExpiresAt: oauth?.refresh_token_expires_at ?? null,
+          identityVerified: Boolean(row),
+          officialStoreId: row?.official_store_id ?? oauth?.official_store_id ?? null,
+          verifiedDomain: row?.source_domain ?? oauth?.shop_domain ?? null,
+          identityVerifiedAt: row?.identity_verified_at ?? null,
+          lastSuccessfulSyncAt: row?.last_successful_sync_at ?? null,
+          completedWatermark: row?.completed_watermark ?? null,
+          syncStatus: 'configuration_error',
+          lastErrorCode: inspection.errorCode,
+        };
+      }
+      const config = inspection.config;
       const appConfigured = hasShopifyAppCredentials(config);
       const encryptionReady = hasValidCredentialEncryptionKey(runtimeEnv);
       const credentialsConfigured = hasShopifyCredentials(config) || Boolean(oauth);
@@ -61,6 +87,7 @@ export async function GET(request: Request) {
         key: candidate.key,
         displayName: row?.display_name ?? candidate.displayName,
         expectedDomain: config.domain,
+        configurationErrorCode: null,
         appConfigured,
         encryptionReady,
         credentialsConfigured,

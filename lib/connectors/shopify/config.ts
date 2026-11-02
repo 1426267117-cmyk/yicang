@@ -55,6 +55,15 @@ export type ShopifyCredentialConfig = {
   clientSecret: string | null;
 };
 
+export type ShopifyStoreConfigurationInspection =
+  | { ok: true; config: ShopifyCredentialConfig; errorCode: null }
+  | {
+      ok: false;
+      config: null;
+      errorCode: 'INVALID_SHOPIFY_DOMAIN' | 'SHOPIFY_CONFIGURATION_INVALID';
+      candidate: (typeof SHOPIFY_STORE_CANDIDATES)[number];
+    };
+
 export function resolveShopifyStoreConfig(
   runtimeEnv: Record<string, unknown>,
   storeKey: ShopifyStoreKey,
@@ -76,6 +85,26 @@ export function resolveShopifyStoreConfig(
     clientId: envString(runtimeEnv, `${candidate.environmentPrefix}_CLIENT_ID`),
     clientSecret: envString(runtimeEnv, `${candidate.environmentPrefix}_CLIENT_SECRET`),
   };
+}
+
+export function inspectShopifyStoreConfiguration(
+  runtimeEnv: Record<string, unknown>,
+  storeKey: ShopifyStoreKey,
+): ShopifyStoreConfigurationInspection {
+  const candidate = SHOPIFY_STORE_CANDIDATES.find((item) => item.key === storeKey);
+  if (!candidate) throw new Error('UNKNOWN_SHOPIFY_STORE');
+  try {
+    return { ok: true, config: resolveShopifyStoreConfig(runtimeEnv, storeKey), errorCode: null };
+  } catch (error) {
+    return {
+      ok: false,
+      config: null,
+      errorCode: error instanceof Error && error.message === 'INVALID_SHOPIFY_DOMAIN'
+        ? 'INVALID_SHOPIFY_DOMAIN'
+        : 'SHOPIFY_CONFIGURATION_INVALID',
+      candidate,
+    };
+  }
 }
 
 export function hasShopifyCredentials(config: ShopifyCredentialConfig) {
