@@ -50,6 +50,18 @@ MUKU 清单中其余数据集已识别，后续按业务阶段接入：履约单
 
 当前工程只提供受保护的任务入口，没有声明 Cloudflare Cron、Sites 定时器或 Codex automation 已经配置。生产若需要无人访问页面时仍定时刷新，必须由实际部署环境的调度器调用此接口；建议每 5～10 分钟触发一次，由服务端限频和幂等逻辑决定是否真正拉取。
 
+## 采购规划闭环
+
+- “今日采购建议”按 ERP SKU 计算：`订单未履约需求 + 安全库存 - MUKU 可用库存 - ERP 未完成采购覆盖`，再应用 MOQ 与包装量。
+- MUKU 在途只展示，不参与抵扣；未确认它与 ERP 采购链是否重叠前，不把它当成可用库存。
+- MUKU SKU 必须唯一匹配或人工映射到 ERP SKU。未映射、歧义、库存未知、源时间过旧、到货尚未在 MUKU 中确认时都 fail-closed。
+- MUKU 导出生成时间与仓库业务源时间分别校验。默认导出/ERP 同步不超过 30 分钟，仓库源行不超过 48 小时。
+- 只有非 LOCAL-QA 的官方订单源且最近成功同步未超过 30 分钟，建议才能转采购申请。
+- 转申请时服务端重新计算并核对 `recommendationVersion`；旧建议、重复提交、MOQ/包装量无法安全承载等情况返回冲突，不产生第二份业务结果。
+- 采购申请、复审、正式采购单、分批收货和库存流水继续使用现有 ERP 流程；取消和历史记录不物理删除。
+
+当前安全边界：纯安全库存补货还没有独立的 replenishment demand，因此只展示、不伪造平台订单；同一订单需求已有 active 部分采购后再次出现缺口，会明确提示人工处理旧采购链，不创建第二条 active 需求。
+
 ## 本地配置与验证
 
 1. 在 `.env.local` 或部署平台的后端 Secret 中设置：
@@ -57,6 +69,7 @@ MUKU 清单中其余数据集已识别，后续按业务阶段接入：履约单
    - `MUKU_DASHBOARD_API_KEY`
    - `ERP_INTERNAL_JOB_TOKEN`（仅部署调度需要，至少 32 个随机字符）
    - 可选：`MUKU_FRESHNESS_MAX_AGE_MINUTES`、`MUKU_AUTO_REFRESH_MIN_INTERVAL_MINUTES`
+   - 可选：`MUKU_INVENTORY_SOURCE_MAX_AGE_MINUTES`（默认 2880）、`ERP_ORDER_SYNC_MAX_AGE_MINUTES`（默认 30）
 2. 启动 ERP 后，在库存页点击“测试连接”。
 3. 测试成功后点击“同步 MUKU 只读数据”。
 4. 在“MUKU 只读库存”和“库存风险”页签核对记录数、数据时间、时区和来源状态。
