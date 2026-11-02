@@ -19,7 +19,10 @@ describe('Shopify 凭证加密', () => {
   it('AAD 不一致或密文被篡改时拒绝解密', async () => {
     const encrypted = await encryptShopifySecret('shpat_test_only_secret', key, aad);
     await expect(decryptShopifySecret(encrypted, key, `${aad}:other`)).rejects.toThrow();
-    const tampered = `${encrypted.slice(0, -1)}${encrypted.endsWith('A') ? 'B' : 'A'}`;
+    const [version, iv, cipher] = encrypted.split(':');
+    const index = Math.floor(cipher.length / 2);
+    const tamperedCipher = `${cipher.slice(0, index)}${cipher[index] === 'A' ? 'B' : 'A'}${cipher.slice(index + 1)}`;
+    const tampered = `${version}:${iv}:${tamperedCipher}`;
     await expect(decryptShopifySecret(tampered, key, aad)).rejects.toThrow();
   });
 });

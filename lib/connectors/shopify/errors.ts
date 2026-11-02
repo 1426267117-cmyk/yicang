@@ -4,8 +4,11 @@ export class ShopifyConnectorError extends Error {
     message: string,
     public readonly retryable = false,
     public readonly status: number | null = null,
+    public readonly diagnostic: string | null = null,
+    public readonly requestId: string | null = null,
   ) {
     super(message);
+    this.name = 'ShopifyConnectorError';
   }
 }
 

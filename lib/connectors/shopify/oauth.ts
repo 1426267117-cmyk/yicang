@@ -3,12 +3,9 @@ import { ApiVersion, LogSeverity, shopifyApi } from '@shopify/shopify-api';
 import type { ShopifyCredentialConfig } from './config';
 import { ShopifyConnectorError } from './errors';
 
-export const SHOPIFY_ORDER_READ_SCOPES = [
-  'read_orders',
-  'read_assigned_fulfillment_orders',
-  'read_merchant_managed_fulfillment_orders',
-  'read_third_party_fulfillment_orders',
-] as const;
+export const SHOPIFY_ORDER_READ_SCOPES = ['read_orders'] as const;
+
+export const SHOPIFY_REQUIRED_ORDER_READ_SCOPES = SHOPIFY_ORDER_READ_SCOPES;
 
 export function createShopifyOAuthApi(config: ShopifyCredentialConfig, requestUrl: string) {
   if (!cfWorkerAdapterInitialized) {

@@ -14,7 +14,10 @@ import {
   classifyShopifyOAuthFailure,
   type ShopifyOAuthStage,
 } from '../../../../../../../lib/connectors/shopify/oauth-failure';
-import { createShopifyOAuthApi, SHOPIFY_ORDER_READ_SCOPES } from '../../../../../../../lib/connectors/shopify/oauth';
+import {
+  createShopifyOAuthApi,
+  SHOPIFY_REQUIRED_ORDER_READ_SCOPES,
+} from '../../../../../../../lib/connectors/shopify/oauth';
 import {
   HttpError,
   requestContext,
@@ -75,7 +78,7 @@ export async function GET(
     stage = 'shop_context';
     const shop = await connector.getShopContext();
     stage = 'scope_check';
-    const missingScopes = SHOPIFY_ORDER_READ_SCOPES.filter((scope) => !shop.scopes.has(scope));
+    const missingScopes = SHOPIFY_REQUIRED_ORDER_READ_SCOPES.filter((scope) => !shop.scopes.has(scope));
     if (missingScopes.length) {
       throw new ShopifyConnectorError(
         'SHOPIFY_REQUIRED_SCOPE_MISSING',
@@ -100,7 +103,15 @@ export async function GET(
     headers.set('Referrer-Policy', 'no-referrer');
     return new Response(null, { status: 303, headers });
   } catch (error) {
-    let failure: { code: string; message: string; retryable: boolean; errorName: string; upstreamStatus: number | null };
+    let failure: {
+      code: string;
+      message: string;
+      retryable: boolean;
+      errorName: string;
+      upstreamStatus: number | null;
+      diagnostic: string | null;
+      shopifyRequestId: string | null;
+    };
     if (error instanceof HttpError) {
       failure = {
         code: error.code,
@@ -108,6 +119,8 @@ export async function GET(
         retryable: error.status >= 500,
         errorName: error.constructor.name || error.name,
         upstreamStatus: null,
+        diagnostic: null,
+        shopifyRequestId: null,
       };
     } else if (error instanceof ShopifyConnectorError) {
       const sanitized = sanitizedConnectorError(error);
@@ -115,9 +128,15 @@ export async function GET(
         ...sanitized,
         errorName: error.constructor.name || error.name,
         upstreamStatus: error.status,
+        diagnostic: error.diagnostic,
+        shopifyRequestId: error.requestId,
       };
     } else {
-      failure = classifyShopifyOAuthFailure(error);
+      failure = {
+        ...classifyShopifyOAuthFailure(error),
+        diagnostic: null,
+        shopifyRequestId: null,
+      };
     }
 
     console.error('shopify_oauth_callback_failed', JSON.stringify({
@@ -127,6 +146,8 @@ export async function GET(
       errorName: failure.errorName,
       upstreamStatus: failure.upstreamStatus,
       retryable: failure.retryable,
+      diagnostic: failure.diagnostic,
+      shopifyRequestId: failure.shopifyRequestId,
     }));
 
     const redirect = new URL('/', request.url);
