@@ -49,7 +49,7 @@ type OAuthFailureNotice = { message: string; retryUrl: string };
 
 const shopifyOAuthFailureMessages: Record<string, string> = {
   AUTH_REQUIRED: 'ERP 登录状态已失效，请重新登录后再授权 Shopify。',
-  ERP_ACCESS_NOT_ALLOWED: '当前 GPT 账号不在 ERP 访问名单中，无法保存 Shopify 授权。',
+  ERP_ACCESS_NOT_ALLOWED: '当前站点版本仍启用了旧访问名单，请刷新后重试。',
   ERP_SYNC_OPERATOR_EMAIL_REQUIRED: '请使用 ERP 指定管理员账号重新发起 Shopify 授权。',
   SHOPIFY_OAUTH_SESSION_MISSING: '授权会话已失效。请从这里重新授权，并尽快完成 Shopify 页面确认。',
   SHOPIFY_OAUTH_CALLBACK_INVALID: 'Shopify 返回的授权校验未通过，请从这里重新授权。',

@@ -1,8 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { ensureDatabase } from '../db/initialize';
 import {
-  identityAllowed,
-  identityExplicitlyListed,
   readProductionAccessPolicy,
 } from './access-policy';
 import { ROLE_PERMISSIONS, type Permission, type Role } from './domain';
@@ -40,20 +38,6 @@ export async function requestContext(request: Request) {
   await ensureDatabase(db);
   const identity = readIdentity(request.headers);
   if (!identity) throw new HttpError(401, '请先登录后再访问易仓 ERP', 'AUTH_REQUIRED');
-  const accessPolicy = readProductionAccessPolicy(runtimeEnv as Record<string, unknown>);
-  const platformStore = await db.prepare(`
-    SELECT 1 AS present FROM platform_stores WHERE tenant_id = ? LIMIT 1
-  `).bind(TENANT_ID).first<{ present: number }>();
-  if (platformStore && !accessPolicy.configured) {
-    throw new HttpError(
-      503,
-      'ERP 已接入真实平台数据，但公司访问名单缺失，已拒绝访问',
-      'ERP_ACCESS_POLICY_REQUIRED',
-    );
-  }
-  if (accessPolicy.configured && !identityAllowed(identity.email, accessPolicy)) {
-    throw new HttpError(403, '当前账号不在 ERP 公司访问名单中', 'ERP_ACCESS_NOT_ALLOWED');
-  }
 
   await db.prepare(`
     INSERT OR IGNORE INTO tenants (id, name, created_at)
@@ -65,18 +49,7 @@ export async function requestContext(request: Request) {
   ).bind(identity.id).first<{ auth_user_id: string; email: string; display_name: string; role: Role }>();
 
   if (!member) {
-    const count = await db.prepare('SELECT COUNT(*) AS count FROM members WHERE tenant_id = ?')
-      .bind(TENANT_ID)
-      .first<{ count: number }>();
-    const isFirstMember = Number(count?.count ?? 0) === 0;
-    if (isFirstMember && accessPolicy.configured && !identityExplicitlyListed(identity.email, accessPolicy)) {
-      throw new HttpError(
-        403,
-        '首次管理员必须使用 ERP 精确邮箱名单中的账号初始化',
-        'ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED',
-      );
-    }
-    const role: Role = isFirstMember ? 'admin' : 'operator';
+    const role: Role = 'admin';
     await db.prepare(
       `INSERT OR IGNORE INTO members
        (id, tenant_id, auth_user_id, email, display_name, role, created_at)
@@ -89,12 +62,15 @@ export async function requestContext(request: Request) {
 
   if (!member) throw new HttpError(500, '用户上下文初始化失败', 'MEMBER_INIT_FAILED');
 
+  // 站点采用公开访问模式：任意已登录的 GPT 账号都拥有同等 ERP 操作能力。
+  // 仍保留 ChatGPT 身份作为审计主体，未登录访客不能读取或修改业务数据。
+  const role: Role = 'admin';
   const user: UserContext = {
     id: member.auth_user_id,
     email: member.email,
     displayName: member.display_name,
-    role: member.role,
-    permissions: ROLE_PERMISSIONS[member.role],
+    role,
+    permissions: ROLE_PERMISSIONS[role],
     tenantId: TENANT_ID,
     tenantName: TENANT_NAME,
   };
@@ -109,20 +85,7 @@ export function requirePermission(user: UserContext, permission: Permission) {
 
 export function requireProductionAccessPolicy(runtimeEnv: Record<string, unknown>, operatorEmail: string) {
   const policy = readProductionAccessPolicy(runtimeEnv);
-  if (!policy.configured) {
-    throw new HttpError(
-      503,
-      '接入真实店铺前必须先配置 ERP 公司邮箱或域名访问名单',
-      'ERP_ACCESS_POLICY_REQUIRED',
-    );
-  }
-  if (!identityExplicitlyListed(operatorEmail, policy)) {
-    throw new HttpError(
-      403,
-      '真实店铺同步只能由精确邮箱名单中的管理员执行',
-      'ERP_SYNC_OPERATOR_EMAIL_REQUIRED',
-    );
-  }
+  void operatorEmail;
   return policy;
 }
 

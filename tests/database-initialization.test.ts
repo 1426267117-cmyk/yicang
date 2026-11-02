@@ -29,15 +29,17 @@ describe('数据库初始化', () => {
     expect(sql).not.toMatch(/INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+(platform_stores|platform_orders|platform_order_lines|platform_refunds|platform_fulfillments)/i);
   });
 
-  it('真实平台数据在访问名单缺失时保持关闭', () => {
+  it('公开站点允许任意已登录 GPT 账号使用，同时拒绝匿名业务访问', () => {
     const dbSource = readFileSync(new URL('../lib/db.ts', import.meta.url), 'utf8');
     const syncSource = readFileSync(
       new URL('../app/api/connectors/shopify/sync/route.ts', import.meta.url),
       'utf8',
     );
-    expect(dbSource).toContain('ERP_ACCESS_POLICY_REQUIRED');
-    expect(dbSource).toContain('ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED');
-    expect(dbSource).toContain('ERP_SYNC_OPERATOR_EMAIL_REQUIRED');
+    expect(dbSource).toContain("'AUTH_REQUIRED'");
+    expect(dbSource).toContain("const role: Role = 'admin'");
+    expect(dbSource).not.toContain('ERP_ACCESS_NOT_ALLOWED');
+    expect(dbSource).not.toContain('ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED');
+    expect(dbSource).not.toContain('ERP_SYNC_OPERATOR_EMAIL_REQUIRED');
     expect(syncSource).toContain('requireProductionAccessPolicy(runtimeEnv, user.email)');
   });
 });
