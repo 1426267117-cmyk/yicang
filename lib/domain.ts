@@ -10,12 +10,24 @@ export type Permission =
   | 'orders:cancel'
   | 'audit:read'
   | 'connectors:read'
-  | 'connectors:sync';
+  | 'connectors:sync'
+  | 'purchase:read'
+  | 'purchase:create'
+  | 'purchase:submit'
+  | 'purchase:review'
+  | 'purchase:mapping';
 
 export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
-  admin: ['orders:read', 'orders:create', 'orders:approve', 'orders:ship', 'orders:cancel', 'audit:read', 'connectors:read', 'connectors:sync'],
-  operator: ['orders:read', 'orders:create', 'orders:ship', 'orders:cancel', 'connectors:read'],
-  viewer: ['orders:read', 'connectors:read'],
+  admin: [
+    'orders:read', 'orders:create', 'orders:approve', 'orders:ship', 'orders:cancel',
+    'audit:read', 'connectors:read', 'connectors:sync',
+    'purchase:read', 'purchase:create', 'purchase:submit', 'purchase:review', 'purchase:mapping',
+  ],
+  operator: [
+    'orders:read', 'orders:create', 'orders:ship', 'orders:cancel', 'connectors:read',
+    'purchase:read', 'purchase:create', 'purchase:submit', 'purchase:mapping',
+  ],
+  viewer: ['orders:read', 'connectors:read', 'purchase:read'],
 };
 
 export const ACTION_TARGET: Record<OrderAction, { from: OrderStatus[]; to: OrderStatus; permission: Permission }> = {

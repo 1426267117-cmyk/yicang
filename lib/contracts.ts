@@ -42,6 +42,28 @@ export const shopifyWebhookProcessSchema = z.object({
   maxEvents: z.number().int().min(1).max(10).default(5),
 });
 
+export const createPurchaseRequestSchema = z.object({
+  demandIds: z.array(z.string().trim().min(1)).min(1).max(100),
+  purchaserMemberId: z.string().trim().min(1),
+  reviewerMemberId: z.string().trim().min(1),
+  note: z.string().trim().max(500).optional(),
+}).superRefine((value, context) => {
+  if (new Set(value.demandIds).size !== value.demandIds.length) {
+    context.addIssue({ code: 'custom', message: '采购需求不能重复选择', path: ['demandIds'] });
+  }
+});
+
+export const purchaseRequestActionSchema = z.object({
+  action: z.enum(['submit', 'approve', 'reject', 'cancel']),
+  note: z.string().trim().max(500).optional(),
+}).superRefine((value, context) => {
+  if (value.action === 'reject' && !value.note) {
+    context.addIssue({ code: 'custom', message: '驳回采购申请时必须填写原因', path: ['note'] });
+  }
+});
+
 export type CreateOrderInput = z.infer<typeof createOrderSchema>;
 export type ShopifyOrderSyncInput = z.infer<typeof shopifyOrderSyncSchema>;
 export type ShopifyWebhookProcessInput = z.infer<typeof shopifyWebhookProcessSchema>;
+export type CreatePurchaseRequestInput = z.infer<typeof createPurchaseRequestSchema>;
+export type PurchaseRequestActionInput = z.infer<typeof purchaseRequestActionSchema>;

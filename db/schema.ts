@@ -331,6 +331,55 @@ export const purchaseDemands = sqliteTable('purchase_demands', {
   check('ck_purchase_demands_required_non_negative', sql`${table.requiredQuantity} >= 0`),
 ]);
 
+export const purchaseRequests = sqliteTable('purchase_requests', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  requestNo: text('request_no').notNull(),
+  status: text('status', {
+    enum: ['draft', 'pending_review', 'approved', 'rejected', 'cancelled'],
+  }).notNull(),
+  purchaserMemberId: text('purchaser_member_id').notNull().references(() => members.id),
+  reviewerMemberId: text('reviewer_member_id').notNull().references(() => members.id),
+  createdByMemberId: text('created_by_member_id').notNull().references(() => members.id),
+  note: text('note'),
+  reviewNote: text('review_note'),
+  version: integer('version').notNull().default(1),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  lastActionKey: text('last_action_key').notNull(),
+  submittedAt: text('submitted_at'),
+  reviewedAt: text('reviewed_at'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_purchase_requests_number').on(table.tenantId, table.requestNo),
+  uniqueIndex('uq_purchase_requests_idempotency').on(table.tenantId, table.idempotencyKey),
+  index('idx_purchase_requests_status').on(table.tenantId, table.status, table.updatedAt),
+  index('idx_purchase_requests_purchaser').on(table.tenantId, table.purchaserMemberId),
+  index('idx_purchase_requests_reviewer').on(table.tenantId, table.reviewerMemberId),
+]);
+
+export const purchaseRequestLines = sqliteTable('purchase_request_lines', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  requestId: text('request_id').notNull().references(() => purchaseRequests.id),
+  purchaseDemandId: text('purchase_demand_id').notNull().references(() => purchaseDemands.id),
+  skuId: text('sku_id').notNull().references(() => skus.id),
+  requestedQuantity: integer('requested_quantity').notNull(),
+  sourceRequiredQuantity: integer('source_required_quantity').notNull(),
+  sourceUpdatedAt: text('source_updated_at').notNull(),
+  active: integer('active', { mode: 'boolean' }).notNull().default(true),
+  createdAt: text('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_purchase_request_lines_request_demand').on(table.requestId, table.purchaseDemandId),
+  uniqueIndex('uq_purchase_request_lines_active_demand')
+    .on(table.tenantId, table.purchaseDemandId)
+    .where(sql`${table.active} = 1`),
+  index('idx_purchase_request_lines_request').on(table.tenantId, table.requestId),
+  index('idx_purchase_request_lines_demand').on(table.tenantId, table.purchaseDemandId),
+  check('ck_purchase_request_lines_quantity_positive', sql`${table.requestedQuantity} > 0`),
+]);
+
 export const platformRefunds = sqliteTable('platform_refunds', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),
