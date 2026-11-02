@@ -2,6 +2,28 @@ export const DIRECT_PURCHASE_REQUEST_DISABLED_CODE = 'DIRECT_PURCHASE_REQUEST_DI
 export const DIRECT_PURCHASE_REQUEST_DISABLED_MESSAGE =
   '订单需求明细仅供查看；请从“今日采购建议”按最新库存、在途和数据时效生成采购申请';
 
+export function assignmentActionAllowed(assigned: boolean, developmentOpenAccess: boolean) {
+  return developmentOpenAccess || assigned;
+}
+
+export function purchaseOrderCompletion(order: {
+  deliveryWarehouse: { id: string } | null;
+  expectedDeliveryAt: string | null;
+  currency: string | null;
+  lines: Array<{ unitCostMinor: number | null; currency: string | null }>;
+}) {
+  const missing: string[] = [];
+  if (!order.deliveryWarehouse?.id) missing.push('收货仓库');
+  if (!order.expectedDeliveryAt?.trim()) missing.push('预计交期');
+  if (!order.currency || !/^[A-Z]{3}$/u.test(order.currency)) missing.push('币种');
+  if (!order.lines.length || order.lines.some((line) => (
+    !Number.isSafeInteger(line.unitCostMinor)
+    || Number(line.unitCostMinor) < 0
+    || line.currency !== order.currency
+  ))) missing.push('全部明细单价');
+  return { ready: missing.length === 0, missing };
+}
+
 export function activePurchaseRequestIds(
   purchaseOrders: Array<{ purchaseRequestId: string; status: string }>,
 ) {

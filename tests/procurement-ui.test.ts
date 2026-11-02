@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   activePurchaseRequestIds,
+  assignmentActionAllowed,
   normalizedReceiptQuantities,
+  purchaseOrderCompletion,
   receiptCorrectionAvailability,
   validateReceiptCorrectionDraft,
 } from '../lib/procurement-ui';
@@ -29,6 +31,33 @@ describe('采购工作台展示规则', () => {
     ]);
 
     expect([...ids]).toEqual(['draft', 'issued', 'partial', 'received', 'closed-short']);
+  });
+
+  it('开发开放模式允许换账号继续已分配流程，正式模式仍限指定成员', () => {
+    expect(assignmentActionAllowed(false, true)).toBe(true);
+    expect(assignmentActionAllowed(true, false)).toBe(true);
+    expect(assignmentActionAllowed(false, false)).toBe(false);
+  });
+
+  it('正式下单只在收货仓、交期、币种和全部单价完整时就绪', () => {
+    const complete = purchaseOrderCompletion({
+      deliveryWarehouse: { id: 'warehouse-main' },
+      expectedDeliveryAt: '2026-11-30',
+      currency: 'CNY',
+      lines: [{ unitCostMinor: 1299, currency: 'CNY' }],
+    });
+    expect(complete).toEqual({ ready: true, missing: [] });
+
+    const incomplete = purchaseOrderCompletion({
+      deliveryWarehouse: null,
+      expectedDeliveryAt: null,
+      currency: null,
+      lines: [{ unitCostMinor: null, currency: null }],
+    });
+    expect(incomplete).toEqual({
+      ready: false,
+      missing: ['收货仓库', '预计交期', '币种', '全部明细单价'],
+    });
   });
 
   it('按历史冲正逐行计算剩余可冲正数量，不修改原收货数量', () => {
