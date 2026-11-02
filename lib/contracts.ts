@@ -68,6 +68,11 @@ export const createSupplierSchema = z.object({
   note: z.string().trim().max(500).optional(),
 });
 
+export const createWarehouseSchema = z.object({
+  code: z.string().trim().min(1).max(40).transform((value) => value.toUpperCase()),
+  name: z.string().trim().min(1).max(120),
+});
+
 const purchaseOrderLineCostSchema = z.object({
   purchaseRequestLineId: z.string().trim().min(1),
   unitCostMinor: z.number().int().min(0).max(10_000_000_000),
@@ -117,6 +122,7 @@ export type ShopifyWebhookProcessInput = z.infer<typeof shopifyWebhookProcessSch
 export type CreatePurchaseRequestInput = z.infer<typeof createPurchaseRequestSchema>;
 export type PurchaseRequestActionInput = z.infer<typeof purchaseRequestActionSchema>;
 export type CreateSupplierInput = z.infer<typeof createSupplierSchema>;
+export type CreateWarehouseInput = z.infer<typeof createWarehouseSchema>;
 export type CreatePurchaseOrderInput = z.infer<typeof createPurchaseOrderSchema>;
 export type PurchaseOrderActionInput = z.infer<typeof purchaseOrderActionSchema>;
 export type CreatePurchaseReceiptInput = z.infer<typeof createPurchaseReceiptSchema>;

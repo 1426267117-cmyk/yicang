@@ -13,6 +13,7 @@ import {
   createPurchaseOrder,
   createPurchaseReceipt,
   createSupplier,
+  createWarehouse,
   executePurchaseOrderAction,
   getProcurementWorkspaceData,
 } from '../lib/purchase-order-service';
@@ -58,6 +59,60 @@ describe('正式采购单与到货入库闭环', () => {
   });
 
   afterEach(async () => { await mf.dispose(); });
+
+  it('仓库可幂等创建、编码冲突受控且租户数据隔离', async () => {
+    const created = await createWarehouse(db, user, {
+      code: ' aux ', name: '采购到货辅仓',
+    }, 'warehouse-create-0001');
+    expect(created.replayed).toBe(false);
+    expect(created.warehouse).toEqual(expect.objectContaining({
+      code: 'AUX', name: '采购到货辅仓',
+    }));
+
+    const replay = await createWarehouse(db, user, {
+      code: 'AUX', name: '采购到货辅仓',
+    }, 'warehouse-create-0001');
+    expect(replay.replayed).toBe(true);
+    expect(replay.warehouse.id).toBe(created.warehouse.id);
+
+    await expect(createWarehouse(db, user, {
+      code: 'AUX-CHANGED', name: '不同参数',
+    }, 'warehouse-create-0001')).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(createWarehouse(db, user, {
+      code: 'AUX', name: '重复仓库编码',
+    }, 'warehouse-create-0002')).rejects.toMatchObject({ code: 'WAREHOUSE_CODE_EXISTS' });
+
+    const otherTenantUser: UserContext = {
+      ...user,
+      id: 'auth-other-warehouse',
+      email: 'other-warehouse@example.invalid',
+      tenantId: 'tenant-other',
+      tenantName: '其他租户',
+    };
+    const other = await createWarehouse(db, otherTenantUser, {
+      code: 'AUX', name: '其他租户同编码仓库',
+    }, 'warehouse-create-other-0001');
+    expect(other.warehouse.id).not.toBe(created.warehouse.id);
+
+    const workspace = await getProcurementWorkspaceData(db, user);
+    expect(workspace.warehouses.map((warehouse) => warehouse.code).sort()).toEqual(['AUX', 'MAIN']);
+    expect(workspace.warehouses.map((warehouse) => warehouse.id)).not.toContain(other.warehouse.id);
+
+    const viewer: UserContext = {
+      ...user,
+      role: 'viewer',
+      permissions: ROLE_PERMISSIONS.viewer,
+    };
+    await expect(createWarehouse(db, viewer, {
+      code: 'VIEWER', name: '只读账号仓库',
+    }, 'warehouse-create-viewer-0001')).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+
+    const audit = await db.prepare(`
+      SELECT COUNT(*) AS count FROM audit_logs
+      WHERE tenant_id = ? AND action = 'CREATE_WAREHOUSE'
+    `).bind(tenantId).first<{ count: number }>();
+    expect(Number(audit?.count)).toBe(1);
+  });
 
   it('供应商和采购单幂等创建，且同一批准申请不能重复转单', async () => {
     const supplier = await createSupplier(db, user, {

@@ -2,6 +2,7 @@ import type {
   CreatePurchaseOrderInput,
   CreatePurchaseReceiptInput,
   CreateSupplierInput,
+  CreateWarehouseInput,
   PurchaseOrderActionInput,
 } from './contracts';
 import { HttpError, requirePermission, type UserContext } from './db';
@@ -19,6 +20,13 @@ type SupplierRow = {
   request_hash?: string;
   created_at: string;
   updated_at: string;
+};
+
+type WarehouseRow = {
+  id: string;
+  code: string;
+  name: string;
+  created_at: string;
 };
 
 type PurchaseOrderRow = {
@@ -180,6 +188,62 @@ export async function getProcurementWorkspaceData(db: D1Database, user: UserCont
       receivedQuantity: purchaseReceipts.reduce((total, receipt) => total + receipt.totalQuantity, 0),
     },
   };
+}
+
+export async function createWarehouse(
+  db: D1Database,
+  user: UserContext,
+  input: CreateWarehouseInput,
+  idempotencyKey: string,
+) {
+  requirePermission(user, 'warehouse:manage');
+  validateIdempotencyKey(idempotencyKey);
+  const normalized = {
+    code: input.code.trim().toUpperCase(),
+    name: input.name.trim(),
+  };
+  const requestHash = await hashPayload(normalized);
+  const replay = await readWarehouseReplay(db, user.tenantId, requestHash, idempotencyKey);
+  if (replay) {
+    return { warehouse: await getWarehouse(db, user.tenantId, replay.warehouseId), replayed: true };
+  }
+
+  const warehouseId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  try {
+    await db.batch([
+      db.prepare(`
+        INSERT INTO warehouses (id, tenant_id, code, name, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(warehouseId, user.tenantId, normalized.code, normalized.name, now),
+      auditStatement(db, user, {
+        action: 'CREATE_WAREHOUSE',
+        entityType: 'warehouse',
+        entityId: warehouseId,
+        beforeJson: null,
+        afterJson: stableJson({
+          requestHash,
+          warehouseId,
+          code: normalized.code,
+          name: normalized.name,
+        }),
+        idempotencyKey,
+        now,
+      }),
+    ]);
+  } catch (error) {
+    const concurrent = await readWarehouseReplay(db, user.tenantId, requestHash, idempotencyKey);
+    if (concurrent) {
+      return { warehouse: await getWarehouse(db, user.tenantId, concurrent.warehouseId), replayed: true };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('uq_warehouses_tenant_code')
+      || message.includes('warehouses.tenant_id, warehouses.code')) {
+      throw new HttpError(409, '仓库编码已存在', 'WAREHOUSE_CODE_EXISTS');
+    }
+    throw error;
+  }
+  return { warehouse: await getWarehouse(db, user.tenantId, warehouseId), replayed: false };
 }
 
 export async function createSupplier(
@@ -669,6 +733,22 @@ export async function getSupplier(db: D1Database, tenantId: string, supplierId: 
   return mapSupplier(row);
 }
 
+export async function getWarehouse(db: D1Database, tenantId: string, warehouseId: string) {
+  const row = await db.prepare(`
+    SELECT id, code, name, created_at
+    FROM warehouses
+    WHERE tenant_id = ? AND id = ?
+    LIMIT 1
+  `).bind(tenantId, warehouseId).first<WarehouseRow>();
+  if (!row) throw new HttpError(404, '仓库不存在或不在当前数据范围内', 'WAREHOUSE_NOT_FOUND');
+  return {
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    createdAt: row.created_at,
+  };
+}
+
 export async function getPurchaseOrder(db: D1Database, tenantId: string, purchaseOrderId: string) {
   const row = await db.prepare(`${PURCHASE_ORDER_SELECT}
     WHERE po.tenant_id = ? AND po.id = ?
@@ -941,6 +1021,34 @@ async function readActionReplay(
     throw new HttpError(409, '同一幂等键不能用于不同的采购单操作', 'IDEMPOTENCY_CONFLICT');
   }
   return true;
+}
+
+async function readWarehouseReplay(
+  db: D1Database,
+  tenantId: string,
+  requestHash: string,
+  idempotencyKey: string,
+) {
+  const row = await db.prepare(`
+    SELECT action, entity_type, entity_id, after_json
+    FROM audit_logs
+    WHERE tenant_id = ? AND idempotency_key = ?
+    LIMIT 1
+  `).bind(tenantId, idempotencyKey).first<{
+    action: string;
+    entity_type: string;
+    entity_id: string;
+    after_json: string | null;
+  }>();
+  if (!row) return null;
+  if (row.action !== 'CREATE_WAREHOUSE' || row.entity_type !== 'warehouse') {
+    throw new HttpError(409, '该幂等键已用于另一项业务操作', 'IDEMPOTENCY_CONFLICT');
+  }
+  const payload = parseJson(row.after_json);
+  if (payload.requestHash !== requestHash || payload.warehouseId !== row.entity_id) {
+    throw new HttpError(409, '同一幂等键不能用于不同的仓库参数', 'IDEMPOTENCY_CONFLICT');
+  }
+  return { warehouseId: row.entity_id };
 }
 
 function auditStatement(
