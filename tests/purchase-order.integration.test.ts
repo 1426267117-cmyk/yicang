@@ -9,6 +9,7 @@ import type { ShopifyCredentialConfig } from '../lib/connectors/shopify/config';
 import type { ShopifyShopContext } from '../lib/connectors/shopify/connector';
 import type { UserContext } from '../lib/db';
 import { ROLE_PERMISSIONS } from '../lib/domain';
+import { loadPurchaseOrderDocument } from '../lib/purchase-order-document';
 import {
   createPurchaseOrder,
   createPurchaseReceipt,
@@ -178,6 +179,46 @@ describe('正式采购单与到货入库闭环', () => {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
     }, 'purchase-order-create-0002')).rejects.toMatchObject({ code: 'PURCHASE_ORDER_ALREADY_EXISTS' });
+  });
+
+  it('采购单文档允许只读角色按当前租户读取，并拒绝跨租户标识', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-DOC', name: '采购单文档供应商',
+    }, 'supplier-create-document-0001');
+    const created = await createPurchaseOrder(db, user, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      currency: 'CNY',
+      lineCosts: [{
+        purchaseRequestLineId: await requestLineId(db, approvedRequestId),
+        unitCostMinor: 1250,
+      }],
+    }, 'purchase-order-create-document-0001');
+    const viewer: UserContext = {
+      ...user,
+      id: 'auth-document-viewer',
+      email: 'document-viewer@example.invalid',
+      role: 'viewer',
+      permissions: ROLE_PERMISSIONS.viewer,
+    };
+
+    const document = await loadPurchaseOrderDocument(db, viewer, created.purchaseOrder.id);
+    expect(document).toEqual(expect.objectContaining({
+      id: created.purchaseOrder.id,
+      costComplete: true,
+      totalAmountMinor: 6250,
+    }));
+
+    const otherTenantViewer: UserContext = {
+      ...viewer,
+      tenantId: 'tenant-other',
+      tenantName: '其他租户',
+    };
+    await expect(loadPurchaseOrderDocument(
+      db,
+      otherTenantViewer,
+      created.purchaseOrder.id,
+    )).rejects.toMatchObject({ code: 'PURCHASE_ORDER_NOT_FOUND' });
   });
 
   it('确认下单后支持分批收货，幂等重放不重复增加库存', async () => {
