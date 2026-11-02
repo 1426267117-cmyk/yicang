@@ -131,6 +131,100 @@ type ShopifyStatus = {
   }>;
 };
 
+type InventorySourceTab = 'erp' | 'muku' | 'risk';
+type MukuFilters = { sku: string; warehouse: string };
+type MukuSyncStatus = 'unconfigured' | 'idle' | 'running' | 'succeeded' | 'failed' | 'stale' | 'unknown';
+type MukuDatasetState = {
+  dataset: string;
+  status: string;
+  apiVersion: string | null;
+  generatedAt: string | null;
+  recordCount: number | null;
+  lastSuccessAt: string | null;
+  lastErrorCode: string | null;
+  updatedAt: string | null;
+};
+type MukuStatus = {
+  ok: true;
+  configured: boolean;
+  connected: boolean;
+  readOnly: true;
+  apiVersion: string | null;
+  datasetCount: number;
+  status: MukuSyncStatus;
+  errorCode: string | null;
+  lastSuccessAt: string | null;
+  sourceGeneratedAt: string | null;
+  syncedAt: string | null;
+  datasets: MukuDatasetState[];
+  sourceStatusCount: number;
+};
+type MukuRun = {
+  id: string;
+  dataset: string;
+  status: string;
+  recordCount: number | null;
+  pageCount: number | null;
+  errorCode: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  replayed: boolean | null;
+};
+type MukuRunsPayload = { records: MukuRun[]; pagination: MukuPagination };
+type MukuPagination = { page: number; pageSize: number; total: number; totalPages: number; hasNext: boolean };
+type MukuInventoryRow = {
+  id: string;
+  recordKey: string | null;
+  sku: string | null;
+  normalizedSku: string | null;
+  productName: string | null;
+  warehouseCode: string | null;
+  warehouseName: string | null;
+  available: number | null;
+  locked: number | null;
+  onHand: number | null;
+  inTransit: number | null;
+  ageDays: number | null;
+  sourceUpdatedAt: string | null;
+  ingestedAt: string | null;
+};
+type MukuRiskRow = {
+  id: string;
+  sku: string | null;
+  normalizedSku: string | null;
+  slowMoving: boolean | null;
+  overAge: boolean | null;
+  activeLowStock: boolean | null;
+  reasons: string[];
+  available: number | null;
+  locked: number | null;
+  onHand: number | null;
+  sales30d: number | null;
+  ageDays: number | null;
+  sourceUpdatedAt: string | null;
+};
+type MukuInventoryPayload = {
+  ok: true;
+  stale: boolean;
+  snapshotId: string | null;
+  generatedAt: string | null;
+  sourceUpdatedAt: string | null;
+  syncedAt: string | null;
+  errorCode: string | null;
+  pagination: MukuPagination;
+  records: MukuInventoryRow[];
+};
+type MukuRiskPayload = {
+  ok: true;
+  stale: boolean;
+  generatedAt: string | null;
+  sourceUpdatedAt: string | null;
+  syncedAt: string | null;
+  errorCode: string | null;
+  pagination: MukuPagination;
+  records: MukuRiskRow[];
+};
+
 type OAuthFailureNotice = { message: string; retryUrl: string };
 
 const shopifyOAuthFailureMessages: Record<string, string> = {
@@ -245,6 +339,16 @@ export default function ErpClient() {
   const [submitting, setSubmitting] = useState(false);
   const [actionBusy, setActionBusy] = useState('');
   const [syncBusy, setSyncBusy] = useState('');
+  const [inventorySource, setInventorySource] = useState<InventorySourceTab>('erp');
+  const [mukuStatus, setMukuStatus] = useState<MukuStatus | null>(null);
+  const [mukuRuns, setMukuRuns] = useState<MukuRunsPayload | null>(null);
+  const [mukuInventory, setMukuInventory] = useState<MukuInventoryPayload | null>(null);
+  const [mukuRisk, setMukuRisk] = useState<MukuRiskPayload | null>(null);
+  const [mukuPage, setMukuPage] = useState(1);
+  const [mukuFilters, setMukuFilters] = useState<MukuFilters>({ sku: '', warehouse: '' });
+  const [mukuBusy, setMukuBusy] = useState('');
+  const [mukuError, setMukuError] = useState('');
+  const [mukuRefreshKey, setMukuRefreshKey] = useState(0);
   const [purchaseTab, setPurchaseTab] = useState<PurchaseTab>('pending');
   const [selectedDemandIds, setSelectedDemandIds] = useState<Set<string>>(new Set());
   const [mappingDemand, setMappingDemand] = useState<PurchaseDemand | null>(null);
@@ -277,6 +381,14 @@ export default function ErpClient() {
       ))));
       const connectorResponse = await fetch('/api/connectors/shopify/status', { cache: 'no-store' });
       if (connectorResponse.ok) setShopifyStatus(await connectorResponse.json() as ShopifyStatus);
+      if (body.user.permissions.includes('connectors:read')) {
+        const mukuStatusResponse = await fetch('/api/connectors/muku/status', { cache: 'no-store' });
+        if (mukuStatusResponse.ok) {
+          setMukuStatus(normalizeMukuStatus(await mukuStatusResponse.json()));
+        }
+        const mukuRunsResponse = await fetch('/api/connectors/muku/runs?page=1&pageSize=8', { cache: 'no-store' });
+        if (mukuRunsResponse.ok) setMukuRuns(normalizeMukuRuns(await mukuRunsResponse.json()));
+      }
       setAuthRequired(false);
       setError('');
     } catch (cause) {
@@ -324,6 +436,36 @@ export default function ErpClient() {
     return undefined;
   }, []);
 
+  useEffect(() => {
+    if (active !== 'inventory' || inventorySource === 'erp' || !payload?.user.permissions.includes('connectors:read')) return undefined;
+    let cancelled = false;
+    const parameters = new URLSearchParams({ page: String(mukuPage), pageSize: '100' });
+    if (mukuFilters.sku) parameters.set('sku', mukuFilters.sku);
+    if (inventorySource === 'muku' && mukuFilters.warehouse) parameters.set('warehouse', mukuFilters.warehouse);
+    const endpoint = inventorySource === 'muku'
+      ? `/api/connectors/muku/inventory?${parameters}`
+      : `/api/connectors/muku/risk?${parameters}`;
+    const busyKey = inventorySource === 'muku' ? 'inventory' : 'risk';
+    const load = async () => {
+      setMukuBusy(busyKey);
+      setMukuError('');
+      try {
+        const response = await fetch(endpoint, { cache: 'no-store' });
+        const body = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(readApiMessage(body, 'MUKU 只读快照加载失败'));
+        if (cancelled) return;
+        if (inventorySource === 'muku') setMukuInventory(normalizeMukuInventory(body));
+        else setMukuRisk(normalizeMukuRisk(body));
+      } catch (cause) {
+        if (!cancelled) setMukuError(cause instanceof Error ? cause.message : 'MUKU 只读快照加载失败');
+      } finally {
+        if (!cancelled) setMukuBusy('');
+      }
+    };
+    void load();
+    return () => { cancelled = true; };
+  }, [active, inventorySource, mukuFilters, mukuPage, mukuRefreshKey, payload]);
+
   const can = useCallback((permission: Permission) => payload?.user.permissions.includes(permission) ?? false, [payload]);
   const filteredOrders = useMemo(() => {
     const term = query.trim().toLowerCase();
@@ -335,6 +477,23 @@ export default function ErpClient() {
     if (!term) return payload?.inventory ?? [];
     return (payload?.inventory ?? []).filter((item) => [item.skuCode, item.skuName, item.warehouseName].some((value) => value.toLowerCase().includes(term)));
   }, [payload, query]);
+  const filteredMukuInventory = useMemo(() => {
+    const records = mukuInventory?.records ?? [];
+    const term = query.trim().toLowerCase();
+    if (!term) return records;
+    return records.filter((item) => [
+      item.sku ?? '', item.normalizedSku ?? '', item.productName ?? '',
+      item.warehouseCode ?? '', item.warehouseName ?? '', item.recordKey ?? '',
+    ].some((value) => value.toLowerCase().includes(term)));
+  }, [mukuInventory, query]);
+  const filteredMukuRisk = useMemo(() => {
+    const records = mukuRisk?.records ?? [];
+    const term = query.trim().toLowerCase();
+    if (!term) return records;
+    return records.filter((item) => [
+      item.sku ?? '', item.normalizedSku ?? '', ...item.reasons,
+    ].some((value) => value.toLowerCase().includes(term)));
+  }, [mukuRisk, query]);
   const filteredPlatformOrders = useMemo(() => {
     const term = query.trim().toLowerCase();
     if (!term) return payload?.platformOrders ?? [];
@@ -477,6 +636,66 @@ export default function ErpClient() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Shopify 同步失败');
     } finally { setSyncBusy(''); }
+  }
+
+  async function refreshMukuDiagnostics() {
+    const statusResponse = await fetch('/api/connectors/muku/status', { cache: 'no-store' }).catch(() => null);
+    const runsResponse = await fetch('/api/connectors/muku/runs?page=1&pageSize=8', { cache: 'no-store' }).catch(() => null);
+    if (runsResponse?.ok) setMukuRuns(normalizeMukuRuns(await runsResponse.json()));
+    return statusResponse?.ok ? normalizeMukuStatus(await statusResponse.json()) : null;
+  }
+
+  async function testMukuConnection() {
+    if (mukuBusy) return;
+    setMukuBusy('test'); setMukuError('');
+    try {
+      const response = await fetch('/api/connectors/muku/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: '{}',
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok || asObject(body).ok !== true) throw new Error(readApiMessage(body, 'MUKU 连接测试失败'));
+      const actionStatus = normalizeMukuStatus(body);
+      const refreshedStatus = await refreshMukuDiagnostics() ?? actionStatus;
+      setMukuStatus(refreshedStatus.configured ? refreshedStatus : actionStatus);
+      flash('MUKU 只读连接正常；测试未修改看板或 ERP 库存');
+    } catch (cause) {
+      setMukuError(cause instanceof Error ? cause.message : 'MUKU 连接测试失败');
+    } finally { setMukuBusy(''); }
+  }
+
+  async function syncMukuReadOnly() {
+    if (mukuBusy) return;
+    setMukuBusy('sync'); setMukuError('');
+    try {
+      const response = await fetch('/api/connectors/muku/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({ datasets: ['source-status', 'inventory', 'inventory-details', 'inventory-risk'] }),
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok || asObject(body).ok !== true) throw new Error(readApiMessage(body, 'MUKU 只读同步失败；已保留上次有效快照'));
+      const refreshedStatus = await refreshMukuDiagnostics() ?? normalizeMukuStatus(body);
+      setMukuStatus((current) => refreshedStatus.configured ? refreshedStatus : current ?? refreshedStatus);
+      setMukuRefreshKey((current) => current + 1);
+      flash('MUKU 只读快照同步完成；ERP 库存账本未被覆盖');
+    } catch (cause) {
+      setMukuError(cause instanceof Error ? cause.message : 'MUKU 只读同步失败');
+      const refreshedStatus = await refreshMukuDiagnostics();
+      if (refreshedStatus) setMukuStatus(refreshedStatus);
+    } finally { setMukuBusy(''); }
+  }
+
+  function switchInventorySource(source: InventorySourceTab) {
+    setInventorySource(source);
+    setMukuPage(1);
+    setMukuError('');
+  }
+
+  function applyMukuFilters(filters: MukuFilters) {
+    setMukuFilters({ sku: filters.sku.trim(), warehouse: filters.warehouse.trim() });
+    setMukuPage(1);
   }
 
   function togglePurchaseDemand(id: string) {
@@ -754,7 +973,7 @@ export default function ErpClient() {
             {active === 'dashboard' && <Dashboard payload={payload} openOrder={() => setShowOrder(true)} go={switchModule} />}
             {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}
             {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
-            {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} />}
+            {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} source={inventorySource} setSource={switchInventorySource} mukuStatus={mukuStatus} mukuRuns={mukuRuns} mukuInventory={mukuInventory} mukuRisk={mukuRisk} mukuInventoryRows={filteredMukuInventory} mukuRiskRows={filteredMukuRisk} mukuPage={mukuPage} setMukuPage={setMukuPage} mukuFilters={mukuFilters} applyMukuFilters={applyMukuFilters} mukuBusy={mukuBusy} mukuError={mukuError} canRead={can('connectors:read')} canSync={can('connectors:sync')} testConnection={testMukuConnection} syncReadOnly={syncMukuReadOnly} />}
             {active === 'purchase' && <PurchaseWorkspaceView demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={setReceivingOrder} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
             {!['dashboard','platform','orders','inventory','purchase'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
           </>
@@ -822,14 +1041,95 @@ function OrderTable({ orders, compact = false, emptyMessage = '数据库中暂�
   return <div className="table-wrap module-table"><table><thead><tr><th>订单号</th><th>渠道 / 目的地</th><th>商品</th><th>仓库</th><th>数量</th><th>原币金额</th><th>状态</th>{!compact && <th>受控操作</th>}</tr></thead><tbody>{orders.length ? orders.map((order) => <tr key={order.id}><td><strong>{order.orderNo}</strong><small className="cell-sub">{order.customerName}</small></td><td>{order.channel}<small className="cell-sub">{order.destination}</small></td><td>{order.skuCode}<small className="cell-sub">{order.skuName}</small></td><td>{order.warehouseName}</td><td>{order.quantity}</td><td>{formatMoney(order.amountMinor, order.currency)}</td><td><Status status={order.status} /></td>{!compact && <td><div className="row-actions">{order.status === 'pending_review' && can?.('orders:approve') && <button disabled={Boolean(busy)} onClick={() => runAction?.(order, 'approve')}>{busy === `${order.id}:approve` ? '处理中…' : '审核预占'}</button>}{order.status === 'reserved' && can?.('orders:ship') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction?.(order, 'ship')}>{busy === `${order.id}:ship` ? '处理中…' : '确认发货'}</button>}{['pending_review','reserved'].includes(order.status) && can?.('orders:cancel') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction?.(order, 'cancel')}>取消</button>}{['shipped','cancelled'].includes(order.status) && <span className="terminal-label">终态已锁定</span>}</div></td>}</tr>) : <tr><td className="empty-cell" colSpan={compact ? 7 : 8}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
-function InventoryView({ inventory, summary, hasInventoryData, hasQuery }: { inventory: Inventory[]; summary: ErpPayload['summary']; hasInventoryData: boolean; hasQuery: boolean }) {
+function InventoryView({ inventory, summary, hasInventoryData, hasQuery, source, setSource, mukuStatus, mukuRuns, mukuInventory, mukuRisk, mukuInventoryRows, mukuRiskRows, mukuPage, setMukuPage, mukuFilters, applyMukuFilters, mukuBusy, mukuError, canRead, canSync, testConnection, syncReadOnly }: {
+  inventory: Inventory[];
+  summary: ErpPayload['summary'];
+  hasInventoryData: boolean;
+  hasQuery: boolean;
+  source: InventorySourceTab;
+  setSource: (source: InventorySourceTab) => void;
+  mukuStatus: MukuStatus | null;
+  mukuRuns: MukuRunsPayload | null;
+  mukuInventory: MukuInventoryPayload | null;
+  mukuRisk: MukuRiskPayload | null;
+  mukuInventoryRows: MukuInventoryRow[];
+  mukuRiskRows: MukuRiskRow[];
+  mukuPage: number;
+  setMukuPage: (page: number) => void;
+  mukuFilters: MukuFilters;
+  applyMukuFilters: (filters: MukuFilters) => void;
+  mukuBusy: string;
+  mukuError: string;
+  canRead: boolean;
+  canSync: boolean;
+  testConnection: () => void;
+  syncReadOnly: () => void;
+}) {
+  const [filterDraft, setFilterDraft] = useState<MukuFilters>(mukuFilters);
   const totalOnHand = inventory.reduce((sum, item) => sum + item.onHandQty, 0);
   const totalReserved = inventory.reduce((sum, item) => sum + item.reservedQty, 0);
-  const stats = [['库存记录', String(inventory.length), 'SKU × 仓库'],['现存数量', String(totalOnHand), '不可由页面直接修改'],['预占数量', String(totalReserved), '由订单状态机维护'],['可售数量', String(summary.totalAvailable), '现存－预占']];
-  return <div className="content module-content"><div className="module-head"><div><p>可信业务闭环 / 库存</p><h1>商品库存</h1><span>余额由不可变流水和订单动作驱动，页面不提供直接改数入口</span></div><div className="ledger-chip">库存账本已启用</div></div><StatCards stats={stats} />
-    {!hasInventoryData && <DataSourceNotice compact />}
-    <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active">全部库存</button><button>库存预警</button></div><span>可售量 = 现存 − 预占</span></div><div className="table-wrap module-table"><table><thead><tr><th>SKU</th><th>商品名称</th><th>仓库</th><th>现存</th><th>预占</th><th>可售</th><th>库存状态</th><th>版本</th></tr></thead><tbody>{inventory.length ? inventory.map((item) => <tr key={item.id}><td><strong>{item.skuCode}</strong></td><td>{item.skuName}</td><td>{item.warehouseName}</td><td>{item.onHandQty}</td><td>{item.reservedQty}</td><td><strong>{item.availableQty}</strong></td><td><InventoryStatus available={item.availableQty} /></td><td>v{item.version}</td></tr>) : <tr><td className="empty-cell" colSpan={8}>{hasQuery ? '没有符合当前搜索条件的库存记录' : '尚未接入真实 SKU、仓库和库存记录'}</td></tr>}</tbody></table></div><div className="pagination"><span>订单审核、取消和发货后自动更新</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div></article>
+  const mukuKnownAvailable = mukuInventoryRows.reduce((sum, item) => sum + (item.available ?? 0), 0);
+  const mukuKnownTransit = mukuInventoryRows.reduce((sum, item) => sum + (item.inTransit ?? 0), 0);
+  const mukuAvailableSummary = !mukuInventory ? '未知' : !mukuInventoryRows.length ? '0' : mukuInventoryRows.some((item) => item.available !== null) ? String(mukuKnownAvailable) : '未知';
+  const mukuTransitSummary = !mukuInventory ? '未知' : !mukuInventoryRows.length ? '0' : mukuInventoryRows.some((item) => item.inTransit !== null) ? String(mukuKnownTransit) : '未知';
+  const mukuUnknownRows = mukuInventoryRows.filter((item) => item.sku === null || item.warehouseName === null || item.available === null).length;
+  const slowMoving = mukuRiskRows.filter((item) => item.slowMoving === true).length;
+  const overAge = mukuRiskRows.filter((item) => item.overAge === true).length;
+  const lowStock = mukuRiskRows.filter((item) => item.activeLowStock === true).length;
+  const stats = source === 'erp'
+    ? [['库存记录', String(inventory.length), 'SKU × 仓库'], ['现存数量', String(totalOnHand), '不可由页面直接修改'], ['预占数量', String(totalReserved), '由订单状态机维护'], ['可售数量', String(summary.totalAvailable), '现存－预占']]
+    : source === 'muku'
+      ? [['快照记录', mukuInventory ? String(mukuInventory.pagination.total) : '未知', '外部 SKU × 仓库'], ['本页已知可用', mukuAvailableSummary, '未知值不按 0 计'], ['本页已知在途', mukuTransitSummary, '只读参考值'], ['本页字段未知', String(mukuUnknownRows), '保持未知，不补零']]
+      : [['风险记录', mukuRisk ? String(mukuRisk.pagination.total) : '未知', '外部规则结果'], ['慢动销', String(slowMoving), '本页明确命中'], ['超龄', String(overAge), '本页明确命中'], ['活跃低库存', String(lowStock), '本页明确命中']];
+  const external = source !== 'erp';
+  const inventoryLoading = mukuBusy === 'inventory' && !mukuInventory;
+  const riskLoading = mukuBusy === 'risk' && !mukuRisk;
+  const pagination = source === 'muku' ? mukuInventory?.pagination : mukuRisk?.pagination;
+  const hasMukuFilters = Boolean(mukuFilters.sku || (source === 'muku' && mukuFilters.warehouse));
+
+  return <div className="content module-content">
+    <div className="module-head">
+      <div><p>可信业务闭环 / 库存</p><h1>商品库存</h1><span>{external ? 'MUKU 数据仅作为外部只读参考，与 ERP 自有库存账本严格分开' : '余额由不可变流水和订单动作驱动，页面不提供直接改数入口'}</span></div>
+      <div className={external ? 'source-chip external' : 'ledger-chip'}>{external ? 'MUKU 只读快照' : '库存账本已启用'}</div>
+    </div>
+    {external && <MukuConnectorCard status={mukuStatus} runs={mukuRuns} busy={mukuBusy} error={mukuError} canSync={canSync} testConnection={testConnection} syncReadOnly={syncReadOnly} />}
+    <StatCards stats={stats} />
+    {source === 'erp' && !hasInventoryData && <DataSourceNotice compact />}
+    {external && <div className="muku-readonly-notice" role="note"><strong>外部只读快照</strong><span>不参与 ERP 预占、出库或采购入库；同步不会覆盖本地库存。</span></div>}
+    {external && mukuError && <div className="muku-readonly-notice warning" role="alert"><strong>本次读取失败</strong><span>{mukuError}{(mukuInventory || mukuRisk) ? '；页面继续显示上次有效快照。' : ''}</span></div>}
+    <article className="card data-card">
+      <div className="data-toolbar inventory-source-toolbar"><div><button className={source === 'erp' ? 'tab-active' : ''} onClick={() => setSource('erp')}>ERP 库存账本</button>{canRead && <button className={source === 'muku' ? 'tab-active' : ''} onClick={() => setSource('muku')}>MUKU 只读库存</button>}{canRead && <button className={source === 'risk' ? 'tab-active' : ''} onClick={() => setSource('risk')}>库存风险</button>}</div><span>{source === 'erp' ? '可售量 = 现存 − 预占' : '顶部搜索筛选当前页；下方条件查询整个只读快照'}</span></div>
+      {external && <form className="muku-filter-bar" onSubmit={(event) => { event.preventDefault(); applyMukuFilters(filterDraft); }}><label><span>SKU 精确查询</span><input value={filterDraft.sku} onChange={(event) => setFilterDraft((current) => ({ ...current, sku: event.target.value }))} placeholder="输入 SKU，可留空" /></label>{source === 'muku' && <label><span>仓库查询</span><input value={filterDraft.warehouse} onChange={(event) => setFilterDraft((current) => ({ ...current, warehouse: event.target.value }))} placeholder="仓库编码或完整名称" /></label>}<div><button className="secondary-button" type="button" disabled={Boolean(mukuBusy) || (!mukuFilters.sku && !mukuFilters.warehouse)} onClick={() => { const empty = { sku: '', warehouse: '' }; setFilterDraft(empty); applyMukuFilters(empty); }}>清除</button><button className="primary-button" type="submit" disabled={Boolean(mukuBusy)}>查询快照</button></div></form>}
+      {source === 'erp' && <><div className="table-wrap module-table"><table><thead><tr><th>SKU</th><th>商品名称</th><th>仓库</th><th>现存</th><th>预占</th><th>可售</th><th>库存状态</th><th>版本</th></tr></thead><tbody>{inventory.length ? inventory.map((item) => <tr key={item.id}><td><strong>{item.skuCode}</strong></td><td>{item.skuName}</td><td>{item.warehouseName}</td><td>{item.onHandQty}</td><td>{item.reservedQty}</td><td><strong>{item.availableQty}</strong></td><td><InventoryStatus available={item.availableQty} /></td><td>v{item.version}</td></tr>) : <tr><td className="empty-cell" colSpan={8}>{hasQuery ? '没有符合当前搜索条件的库存记录' : '尚未接入真实 SKU、仓库和库存记录'}</td></tr>}</tbody></table></div><div className="pagination"><span>订单审核、取消和发货后自动更新</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div></>}
+      {source === 'muku' && <><div className="table-wrap module-table muku-source-table"><table><thead><tr><th>SKU / 商品</th><th>仓库</th><th>可用</th><th>锁定</th><th>在手</th><th>在途</th><th>库龄</th><th>源更新时间</th></tr></thead><tbody>{inventoryLoading ? <tr><td className="empty-cell" colSpan={8}>正在读取 MUKU 只读库存快照…</td></tr> : mukuInventoryRows.length ? mukuInventoryRows.map((item) => <tr key={item.id}><td><strong>{formatNullableValue(item.sku)}</strong><small className="cell-sub">{item.productName ?? item.normalizedSku ?? '商品信息未知'}</small></td><td>{item.warehouseName ?? '未知'}<small className="cell-sub">{item.warehouseCode ?? '仓库编码未知'}</small></td><td><strong className={item.available === null ? 'null-value' : ''}>{formatNullableValue(item.available)}</strong></td><td className={item.locked === null ? 'null-value' : ''}>{formatNullableValue(item.locked)}</td><td className={item.onHand === null ? 'null-value' : ''}>{formatNullableValue(item.onHand)}</td><td className={item.inTransit === null ? 'null-value' : ''}>{formatNullableValue(item.inTransit)}</td><td className={item.ageDays === null ? 'null-value' : ''}>{formatNullableValue(item.ageDays, ' 天')}</td><td>{formatOptionalTime(item.sourceUpdatedAt)}<small className="cell-sub">ERP 获取：{formatOptionalTime(item.ingestedAt)}</small></td></tr>) : <tr><td className="empty-cell" colSpan={8}>{(hasQuery || hasMukuFilters) && mukuInventory ? '没有符合当前查询条件的外部库存' : '尚未取得 MUKU 库存快照；不会用模拟值填充'}</td></tr>}</tbody></table></div><MukuPaginationView pagination={pagination} currentPage={mukuPage} setPage={setMukuPage} busy={Boolean(mukuBusy)} fallbackText={mukuInventory?.stale ? '数据已过时，显示最后有效快照' : `源生成：${formatOptionalTime(mukuInventory?.generatedAt ?? null)}`} /></>}
+      {source === 'risk' && <><div className="table-wrap module-table muku-source-table"><table><thead><tr><th>SKU</th><th>命中风险</th><th>可用 / 在手</th><th>30 天销量</th><th>最大库龄</th><th>源更新时间</th></tr></thead><tbody>{riskLoading ? <tr><td className="empty-cell" colSpan={6}>正在读取 MUKU 库存风险快照…</td></tr> : mukuRiskRows.length ? mukuRiskRows.map((item) => { const labels = mukuRiskLabels(item); return <tr key={item.id}><td><strong>{formatNullableValue(item.sku)}</strong><small className="cell-sub">{item.normalizedSku ?? '标准化 SKU 未知'}</small></td><td><div className="risk-tags">{labels.map((label) => <span className={label === '判定未知' ? 'risk-pill unknown' : label === '未命中已知规则' ? 'risk-pill clear' : 'risk-pill'} key={label}>{label}</span>)}</div></td><td>{formatNullableValue(item.available)} / {formatNullableValue(item.onHand)}<small className="cell-sub">锁定：{formatNullableValue(item.locked)}</small></td><td className={item.sales30d === null ? 'null-value' : ''}>{formatNullableValue(item.sales30d)}</td><td className={item.ageDays === null ? 'null-value' : ''}>{formatNullableValue(item.ageDays, ' 天')}</td><td>{formatOptionalTime(item.sourceUpdatedAt)}</td></tr>; }) : <tr><td className="empty-cell" colSpan={6}>{(hasQuery || hasMukuFilters) && mukuRisk ? '没有符合当前查询条件的风险记录' : '尚未取得 MUKU 风险快照；未知不会显示为无风险'}</td></tr>}</tbody></table></div><MukuPaginationView pagination={pagination} currentPage={mukuPage} setPage={setMukuPage} busy={Boolean(mukuBusy)} fallbackText={mukuRisk?.stale ? '数据已过时，显示最后有效快照' : `源生成：${formatOptionalTime(mukuRisk?.generatedAt ?? null)}`} /></>}
+    </article>
   </div>;
+}
+
+function MukuConnectorCard({ status, runs, busy, error, canSync, testConnection, syncReadOnly }: {
+  status: MukuStatus | null;
+  runs: MukuRunsPayload | null;
+  busy: string;
+  error: string;
+  canSync: boolean;
+  testConnection: () => void;
+  syncReadOnly: () => void;
+}) {
+  const state = mukuStatusPresentation(status);
+  return <section className="muku-connector-grid" aria-label="MUKU 连接状态"><article className="card muku-connector-card"><div className="muku-connector-summary"><div><p>MUKU DATA COMMAND</p><h3>看板只读数据源</h3><span>ERP 后端代理读取；浏览器不会直连 MUKU，也不提供密钥输入。</span></div><span className={`connector-state ${state.className}`}>{state.label}</span></div><dl><div><dt>已配置</dt><dd>{status ? (status.configured ? '是' : '否') : '未知'}</dd></div><div><dt>API 版本</dt><dd>{status?.apiVersion ?? '未知'}</dd></div><div><dt>数据集数量</dt><dd>{status ? status.datasetCount : '未知'}</dd></div><div><dt>最近成功</dt><dd>{formatOptionalTime(status?.lastSuccessAt ?? null)}</dd></div><div><dt>源生成时间</dt><dd>{formatOptionalTime(status?.sourceGeneratedAt ?? null)}</dd></div><div><dt>ERP 同步时间</dt><dd>{formatOptionalTime(status?.syncedAt ?? null)}</dd></div><div><dt>错误代码</dt><dd className={status?.errorCode ? 'muku-error-code' : ''}>{status?.errorCode ?? '无'}</dd></div></dl><div className="muku-operations"><div><h4>数据集新鲜度</h4>{status?.datasets.length ? <ul>{status.datasets.slice(0, 4).map((dataset) => <li key={dataset.dataset}><span><strong>{mukuDatasetLabel(dataset.dataset)}</strong><small>{dataset.recordCount === null ? '记录数未知' : `${dataset.recordCount} 条`} · {formatOptionalTime(dataset.generatedAt)}</small></span><b className={`muku-run-${dataset.status}`}>{mukuRunStatusLabel(dataset.status)}</b></li>)}</ul> : <p>尚无已同步数据集；先测试连接，再执行只读同步。</p>}</div><div><h4>最近同步运行</h4>{runs?.records.length ? <ul>{runs.records.slice(0, 4).map((run) => <li key={run.id}><span><strong>{mukuDatasetLabel(run.dataset)}</strong><small>{formatOptionalTime(run.startedAt)} · {run.recordCount === null ? '记录数未知' : `${run.recordCount} 条`}{run.replayed ? ' · 幂等重放' : ''}</small></span><b className={`muku-run-${run.status}`}>{mukuRunStatusLabel(run.status)}</b></li>)}</ul> : <p>暂无同步运行记录。</p>}</div></div>{error && <p className="muku-card-error">{error}</p>}{canSync ? <div className="muku-connector-actions"><button className="secondary-button" onClick={testConnection} disabled={Boolean(busy)}>{busy === 'test' ? '测试中…' : '测试连接'}</button><button className="primary-button" onClick={syncReadOnly} disabled={Boolean(busy) || !status?.configured}>{busy === 'sync' ? '同步中…' : '只读同步'}</button></div> : <p className="muku-permission-note">当前账号可查看只读快照，无连接测试或同步权限。</p>}</article></section>;
+}
+
+function MukuPaginationView({ pagination, currentPage, setPage, busy, fallbackText }: {
+  pagination: MukuPagination | undefined;
+  currentPage: number;
+  setPage: (page: number) => void;
+  busy: boolean;
+  fallbackText: string;
+}) {
+  const page = pagination?.page ?? currentPage;
+  const totalPages = pagination?.totalPages ?? Math.max(1, page);
+  return <div className="pagination muku-pagination"><span>{fallbackText}</span><div><button aria-label="上一页" disabled={busy || page <= 1} onClick={() => setPage(Math.max(1, page - 1))}>‹</button><button className="current" disabled>{page} / {totalPages}</button><button aria-label="下一页" disabled={busy || !(pagination?.hasNext ?? false)} onClick={() => setPage(page + 1)}>›</button></div></div>;
 }
 
 function PurchaseWorkspaceView({ demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedDemandIds, toggleDemand, openMapping, openRequest, openSupplier, openWarehouse, openPurchaseOrder, openReceipt, can, busy, runAction, runOrderAction, hasQuery }: {
@@ -1016,6 +1316,278 @@ function AuthRequired() {
 
 function LoadingState({ message = '正在建立安全业务上下文…' }: { message?: string }) {
   return <div className="content loading-state"><span className="loader" /><p>{message}</p></div>;
+}
+
+function asObject(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function readApiMessage(value: unknown, fallback: string) {
+  const root = asObject(value);
+  const error = asObject(root.error);
+  const failedRun = readArray(root.results).map(asObject).find((result) => readString(result.status) === 'failed');
+  return readString(root.message, error.message, root.errorCode, error.code, failedRun?.errorCode) ?? fallback;
+}
+
+function readString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function readNumber(...values: unknown[]): number | null {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return null;
+}
+
+function readBoolean(...values: unknown[]): boolean | null {
+  for (const value of values) {
+    if (typeof value === 'boolean') return value;
+    if (value === 1 || value === '1' || value === 'true') return true;
+    if (value === 0 || value === '0' || value === 'false') return false;
+  }
+  return null;
+}
+
+function readStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => readString(item)).filter((item): item is string => item !== null);
+  const single = readString(value);
+  return single ? [single] : [];
+}
+
+function readArray(...values: unknown[]): unknown[] {
+  for (const value of values) if (Array.isArray(value)) return value;
+  return [];
+}
+
+function normalizePagination(value: unknown, recordCount: number): MukuPagination {
+  const raw = asObject(value);
+  const page = Math.max(1, Math.trunc(readNumber(raw.page, raw.currentPage, raw.current_page) ?? 1));
+  const pageSize = Math.max(1, Math.trunc(readNumber(raw.pageSize, raw.page_size, raw.limit) ?? Math.max(recordCount, 1)));
+  const total = Math.max(0, Math.trunc(readNumber(raw.total, raw.totalCount, raw.total_count) ?? recordCount));
+  const totalPages = Math.max(1, Math.trunc(readNumber(raw.totalPages, raw.total_pages) ?? Math.ceil(total / pageSize)));
+  return { page, pageSize, total, totalPages, hasNext: readBoolean(raw.hasNext, raw.has_next) ?? page < totalPages };
+}
+
+function latestTimestamp(values: unknown[]) {
+  const timestamps = values.map((value) => readString(value)).filter((value): value is string => value !== null);
+  const valid = timestamps.filter((value) => !Number.isNaN(Date.parse(value))).sort((left, right) => Date.parse(right) - Date.parse(left));
+  return valid[0] ?? timestamps[0] ?? null;
+}
+
+function normalizeMukuStatus(value: unknown): MukuStatus {
+  const root = asObject(value);
+  const data = asObject(root.data);
+  const statusObject = asObject(root.status);
+  const connector = asObject(root.connection ?? root.connector ?? data.connection ?? data.connector);
+  const run = asObject(root.sync ?? root.lastRun ?? root.run ?? data.sync ?? data.lastRun);
+  const rawDatasets = readArray(root.datasets, data.datasets, connector.datasets);
+  const datasetRows = rawDatasets.map(asObject).filter((row) => Object.keys(row).length > 0);
+  const datasetStatuses = datasetRows.map((row) => readString(row.status)).filter((status): status is string => status !== null);
+  const datasets = datasetRows.map((row, index): MukuDatasetState => ({
+    dataset: readString(row.dataset) ?? `dataset-${index + 1}`,
+    status: readString(row.status) ?? 'unknown',
+    apiVersion: readString(row.apiVersion),
+    generatedAt: readString(row.generatedAt),
+    recordCount: readNumber(row.recordCount),
+    lastSuccessAt: readString(row.lastSuccessAt),
+    lastErrorCode: readString(row.lastErrorCode),
+    updatedAt: readString(row.updatedAt),
+  }));
+  const aggregateStatus = datasetStatuses.some((status) => status === 'running')
+    ? 'running'
+    : datasetStatuses.some((status) => status === 'failed')
+      ? 'failed'
+      : datasetStatuses.length && datasetStatuses.every((status) => status === 'succeeded' || status === 'unchanged')
+        ? 'succeeded'
+        : null;
+  const rawStatus = (readString(run.status, statusObject.status, connector.status, typeof root.status === 'string' ? root.status : null, data.status, aggregateStatus) ?? 'unknown').toLowerCase();
+  const status: MukuSyncStatus = rawStatus.includes('run') || rawStatus.includes('progress')
+    ? 'running'
+    : rawStatus.includes('success') || rawStatus.includes('complete') || rawStatus === 'ok'
+      ? 'succeeded'
+      : rawStatus.includes('fail') || rawStatus.includes('error')
+        ? 'failed'
+        : rawStatus.includes('stale')
+          ? 'stale'
+          : rawStatus.includes('idle') || rawStatus.includes('ready')
+            ? 'idle'
+            : rawStatus.includes('unconfig')
+              ? 'unconfigured'
+              : 'unknown';
+  const configured = readBoolean(root.configured, data.configured, statusObject.configured, connector.configured) ?? rawDatasets.length > 0;
+  const latestError = datasetRows.find((row) => readString(row.lastErrorCode, row.errorCode));
+  return {
+    ok: true,
+    configured,
+    connected: readBoolean(root.connected, data.connected, statusObject.connected, connector.connected) ?? (configured && status !== 'failed'),
+    readOnly: true,
+    apiVersion: readString(root.apiVersion, root.api_version, data.apiVersion, statusObject.apiVersion, connector.apiVersion, ...datasetRows.map((row) => row.apiVersion)),
+    datasetCount: Math.max(0, Math.trunc(readNumber(root.datasetCount, root.dataset_count, data.datasetCount, statusObject.datasetCount, connector.datasetCount) ?? rawDatasets.length)),
+    status: configured ? status : 'unconfigured',
+    errorCode: readString(root.errorCode, root.error_code, data.errorCode, statusObject.errorCode, connector.errorCode, run.errorCode, latestError?.lastErrorCode, latestError?.errorCode),
+    lastSuccessAt: latestTimestamp([root.lastSuccessAt, root.last_success_at, data.lastSuccessAt, statusObject.lastSuccessAt, connector.lastSuccessAt, run.lastSuccessAt, run.completedAt, ...datasetRows.map((row) => row.lastSuccessAt)]),
+    sourceGeneratedAt: latestTimestamp([root.sourceGeneratedAt, root.source_generated_at, data.sourceGeneratedAt, statusObject.sourceGeneratedAt, connector.sourceGeneratedAt, root.generatedAt, ...datasetRows.map((row) => row.generatedAt)]),
+    syncedAt: latestTimestamp([root.syncedAt, root.synced_at, data.syncedAt, statusObject.syncedAt, connector.syncedAt, run.syncedAt, ...datasetRows.flatMap((row) => [row.updatedAt, row.lastSuccessAt])]),
+    datasets,
+    sourceStatusCount: readArray(root.sourceStatuses, data.sourceStatuses).length,
+  };
+}
+
+function normalizeMukuInventory(value: unknown): MukuInventoryPayload {
+  const root = asObject(value);
+  const data = asObject(root.data);
+  const snapshot = asObject(root.snapshot ?? data.snapshot);
+  const state = asObject(root.state ?? data.state);
+  const rawRecords = readArray(root.records, root.items, root.inventory, root.data, data.records, data.items, data.inventory);
+  const records = rawRecords.map((value, index): MukuInventoryRow => {
+    const row = asObject(value);
+    const sku = readString(row.sku, row.skuCode, row.sku_code, row.originalSku, row.itemSku);
+    const warehouseCode = readString(row.warehouseCode, row.warehouse_code, row.warehouseId, row.warehouse_id);
+    const recordKey = readString(row.recordKey, row.record_key, row.stableKey, row.stable_key, row.sourceRecordKey, row.source_record_key);
+    return {
+      id: readString(row.id, recordKey) ?? `${sku ?? 'unknown-sku'}:${warehouseCode ?? 'unknown-warehouse'}:${index}`,
+      recordKey,
+      sku,
+      normalizedSku: readString(row.normalizedSku, row.normalized_sku, row.canonicalSku, row.canonical_sku),
+      productName: readString(row.productName, row.product_name, row.skuName, row.sku_name, row.name, row.title),
+      warehouseCode,
+      warehouseName: readString(row.warehouseName, row.warehouse_name, row.warehouse),
+      available: readNumber(row.available, row.availableQty, row.available_qty, row.availableQuantity, row.available_quantity),
+      locked: readNumber(row.locked, row.lockedQty, row.locked_qty, row.reserved, row.reservedQty, row.reserved_qty),
+      onHand: readNumber(row.onHand, row.on_hand, row.onHandQty, row.on_hand_qty, row.quantity, row.stock),
+      inTransit: readNumber(row.inTransit, row.in_transit, row.inTransitQty, row.in_transit_qty, row.inboundQty, row.inbound_qty),
+      ageDays: readNumber(row.ageDays, row.age_days, row.maxAgeDays, row.max_age_days, row.inventoryAgeDays),
+      sourceUpdatedAt: readString(row.sourceUpdatedAt, row.source_updated_at, row.updatedAt, row.updated_at),
+      ingestedAt: readString(row.ingestedAt, row.ingested_at, row.syncedAt, row.synced_at, row.snapshotAt, row.snapshot_at),
+    };
+  });
+  const pagination = normalizePagination(root.pagination ?? data.pagination ?? root.meta ?? data.meta, records.length);
+  return {
+    ok: true,
+    stale: readBoolean(root.stale, data.stale, snapshot.stale) ?? readString(state.status) === 'failed',
+    snapshotId: readString(root.snapshotId, root.snapshot_id, data.snapshotId, snapshot.id, snapshot.snapshotId, state.activeSnapshotId),
+    generatedAt: readString(root.generatedAt, root.generated_at, data.generatedAt, snapshot.generatedAt, snapshot.generated_at, state.generatedAt),
+    sourceUpdatedAt: readString(root.sourceUpdatedAt, root.source_updated_at, data.sourceUpdatedAt, snapshot.sourceUpdatedAt, state.sourceUpdatedAt),
+    syncedAt: readString(root.syncedAt, root.synced_at, data.syncedAt, snapshot.syncedAt, snapshot.ingestedAt, state.lastSuccessAt, state.updatedAt),
+    errorCode: readString(root.errorCode, root.error_code, data.errorCode, snapshot.errorCode, state.lastErrorCode),
+    pagination,
+    records,
+  };
+}
+
+function normalizeMukuRisk(value: unknown): MukuRiskPayload {
+  const root = asObject(value);
+  const data = asObject(root.data);
+  const snapshot = asObject(root.snapshot ?? data.snapshot);
+  const state = asObject(root.state ?? data.state);
+  const rawRecords = readArray(root.records, root.items, root.risks, root.data, data.records, data.items, data.risks);
+  const records = rawRecords.map((value, index): MukuRiskRow => {
+    const row = asObject(value);
+    const sku = readString(row.sku, row.skuCode, row.sku_code, row.originalSku, row.itemSku);
+    const reasons = readStringArray(row.reasons ?? row.riskReasons ?? row.risk_reasons ?? row.matchedBy ?? row.matched_by);
+    return {
+      id: readString(row.id, row.recordKey, row.record_key, row.stableKey, row.stable_key) ?? `${sku ?? 'unknown-sku'}:${index}`,
+      sku,
+      normalizedSku: readString(row.normalizedSku, row.normalized_sku, row.canonicalSku, row.canonical_sku),
+      slowMoving: readBoolean(row.slowMoving, row.slow_moving, row.isSlowMoving, row.is_slow_moving),
+      overAge: readBoolean(row.overAge, row.over_age, row.isOverAge, row.is_over_age),
+      activeLowStock: readBoolean(row.activeLowStock, row.active_low_stock, row.isActiveLowStock, row.is_active_low_stock),
+      reasons,
+      available: readNumber(row.available, row.availableQty, row.available_qty),
+      locked: readNumber(row.locked, row.lockedQty, row.locked_qty, row.reserved),
+      onHand: readNumber(row.onHand, row.on_hand, row.onHandQty, row.on_hand_qty, row.quantity),
+      sales30d: readNumber(row.sales30d, row.sales_30d, row.units30d, row.units_30d),
+      ageDays: readNumber(row.ageDays, row.age_days, row.maxAgeDays, row.max_age_days),
+      sourceUpdatedAt: readString(row.sourceUpdatedAt, row.source_updated_at, row.updatedAt, row.updated_at),
+    };
+  });
+  return {
+    ok: true,
+    stale: readBoolean(root.stale, data.stale, snapshot.stale) ?? readString(state.status) === 'failed',
+    generatedAt: readString(root.generatedAt, root.generated_at, data.generatedAt, snapshot.generatedAt, snapshot.generated_at, state.generatedAt),
+    sourceUpdatedAt: readString(root.sourceUpdatedAt, root.source_updated_at, data.sourceUpdatedAt, snapshot.sourceUpdatedAt, state.sourceUpdatedAt),
+    syncedAt: readString(root.syncedAt, root.synced_at, data.syncedAt, snapshot.syncedAt, snapshot.ingestedAt, state.lastSuccessAt, state.updatedAt),
+    errorCode: readString(root.errorCode, root.error_code, data.errorCode, snapshot.errorCode, state.lastErrorCode),
+    pagination: normalizePagination(root.pagination ?? data.pagination ?? root.meta ?? data.meta, records.length),
+    records,
+  };
+}
+
+function normalizeMukuRuns(value: unknown): MukuRunsPayload {
+  const root = asObject(value);
+  const dataObject = asObject(root.data);
+  const rawRecords = readArray(root.records, root.runs, root.data, dataObject.records, dataObject.runs);
+  const records = rawRecords.map((value, index): MukuRun => {
+    const row = asObject(value);
+    return {
+      id: readString(row.id) ?? `run-${index}`,
+      dataset: readString(row.dataset) ?? 'unknown',
+      status: readString(row.status) ?? 'unknown',
+      recordCount: readNumber(row.recordCount),
+      pageCount: readNumber(row.pageCount),
+      errorCode: readString(row.errorCode),
+      startedAt: readString(row.startedAt),
+      finishedAt: readString(row.finishedAt),
+      replayed: readBoolean(row.replayed),
+    };
+  });
+  return { records, pagination: normalizePagination(root.pagination ?? dataObject.pagination, records.length) };
+}
+
+function mukuStatusPresentation(status: MukuStatus | null) {
+  if (!status) return { label: '等待读取状态', className: '' };
+  if (!status.configured || status.status === 'unconfigured') return { label: '未配置', className: '' };
+  if (status.status === 'running') return { label: '同步中', className: 'pending' };
+  if (status.status === 'failed') return { label: '最近同步失败', className: 'error' };
+  if (status.status === 'stale') return { label: '快照已过时', className: 'pending' };
+  if (status.connected || status.status === 'succeeded' || status.status === 'idle') return { label: '只读连接正常', className: 'ready' };
+  return { label: '状态未知', className: 'pending' };
+}
+
+function mukuRiskLabels(item: MukuRiskRow) {
+  if (item.reasons.length) return item.reasons;
+  const labels = [item.slowMoving === true ? '慢动销' : null, item.overAge === true ? '超龄' : null, item.activeLowStock === true ? '活跃低库存' : null].filter((label): label is string => label !== null);
+  if (labels.length) return labels;
+  if ([item.slowMoving, item.overAge, item.activeLowStock].every((value) => value === null)) return ['判定未知'];
+  return ['未命中已知规则'];
+}
+
+function mukuDatasetLabel(dataset: string) {
+  const labels: Record<string, string> = {
+    inventory: '库存汇总',
+    'inventory-details': '库存明细',
+    'inventory-risk': '库存风险',
+    'source-status': '来源状态',
+  };
+  return labels[dataset] ?? dataset;
+}
+
+function mukuRunStatusLabel(status: string) {
+  if (status === 'succeeded') return '成功';
+  if (status === 'unchanged') return '无变化';
+  if (status === 'running') return '进行中';
+  if (status === 'failed') return '失败';
+  return '未知';
+}
+
+function formatNullableValue(value: string | number | null, suffix = '') {
+  return value === null ? '未知' : `${value}${suffix}`;
+}
+
+function formatOptionalTime(value: string | null) {
+  if (!value) return '未知';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '未知' : formatTime(value);
 }
 
 function normalizePurchaseWorkspace(body: PurchaseWorkspacePayload | PurchaseDemandsPayload): PurchaseWorkspacePayload {
