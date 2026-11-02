@@ -145,6 +145,9 @@ const statusLabel: Record<OrderStatus, string> = {
 
 const actionLabel: Record<string, string> = {
   CREATE_ORDER: '创建订单', APPROVE_ORDER: '审核并预占', SHIP_ORDER: '确认发货', CANCEL_ORDER: '取消订单',
+  MAP_PURCHASE_SKU: '映射采购 SKU', CREATE_PURCHASE_REQUEST: '创建采购申请',
+  SUBMIT_PURCHASE_REQUEST: '提交采购复审', APPROVE_PURCHASE_REQUEST: '批准采购申请',
+  REJECT_PURCHASE_REQUEST: '驳回采购申请', CANCEL_PURCHASE_REQUEST: '取消采购申请',
 };
 
 const purchaseDemandStatusLabel: Record<PurchaseDemandStatus, string> = {
@@ -620,6 +623,9 @@ function PurchaseWorkspaceView({ demands, requests, workspace, tab, setTab, sele
 }) {
   const summary = workspace?.summary ?? emptyPurchaseSummary;
   const requestSummary = workspace?.requestSummary ?? emptyPurchaseRequestSummary;
+  const pendingDemandCount = (workspace?.demands ?? demands).filter(
+    (demand) => demand.status === 'open' && demandAvailableQuantity(demand) > 0,
+  ).length;
   const availableQuantity = summary.availableQuantity ?? demands.filter((demand) => demand.status === 'open').reduce((sum, demand) => sum + demandAvailableQuantity(demand), 0);
   const stats = [
     ['待采购数量', String(availableQuantity), '可选需求的剩余件数'],
@@ -636,7 +642,7 @@ function PurchaseWorkspaceView({ demands, requests, workspace, tab, setTab, sele
   const selectedDemands = (workspace?.demands ?? []).filter((demand) => selectedDemandIds.has(demand.id));
   const selectedQuantity = selectedDemands.reduce((sum, demand) => sum + demandAvailableQuantity(demand), 0);
   const tabs: Array<[PurchaseTab, string, number]> = [
-    ['pending', '待处理需求', summary.open],
+    ['pending', '待处理需求', pendingDemandCount],
     ['mapping', '待 SKU 映射', summary.needsMapping],
     ['requests', '采购申请', requestSummary.draft + requestSummary.pendingReview],
     ['history', '历史记录', requestSummary.approved + requestSummary.rejected + requestSummary.cancelled],
