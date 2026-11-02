@@ -179,6 +179,64 @@ describe('正式采购单与到货入库闭环', () => {
     expect(workspace.purchaseReceipts).toHaveLength(2);
   });
 
+  it('取消草稿保留历史并允许重新转单，且其他租户无法操作', async () => {
+    const supplier = await createSupplier(db, user, {
+      code: 'SUP-04', name: '取消与隔离测试供应商',
+    }, 'supplier-create-3001');
+    const first = await createPurchaseOrder(db, user, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+    }, 'purchase-order-create-3001');
+
+    const cancelled = await executePurchaseOrderAction(db, user, first.purchaseOrder.id, {
+      action: 'cancel', note: '供应商暂时无法交货',
+    }, 'purchase-order-cancel-3001');
+    expect(cancelled.purchaseOrder.status).toBe('cancelled');
+    await expect(executePurchaseOrderAction(db, user, first.purchaseOrder.id, {
+      action: 'issue',
+    }, 'purchase-order-issue-3001')).rejects.toMatchObject({
+      code: 'INVALID_PURCHASE_ORDER_TRANSITION',
+    });
+
+    const replacement = await createPurchaseOrder(db, user, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.supplier.id,
+      note: '原单取消后重新下单',
+    }, 'purchase-order-create-3002');
+    expect(replacement.purchaseOrder.status).toBe('draft');
+    expect(replacement.purchaseOrder.id).not.toBe(first.purchaseOrder.id);
+
+    const history = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = ?) AS orders,
+        (SELECT COUNT(*) FROM purchase_order_lines WHERE tenant_id = ?) AS lines,
+        (SELECT COUNT(*) FROM audit_logs
+          WHERE tenant_id = ? AND action IN (
+            'CREATE_SUPPLIER', 'CREATE_PURCHASE_ORDER', 'CANCEL_PURCHASE_ORDER'
+          )) AS audits
+    `).bind(tenantId, tenantId, tenantId).first<{ orders: number; lines: number; audits: number }>();
+    expect(Number(history?.orders)).toBe(2);
+    expect(Number(history?.lines)).toBe(2);
+    expect(Number(history?.audits)).toBe(4);
+
+    const otherTenantUser: UserContext = {
+      ...user,
+      id: 'auth-other',
+      email: 'other@example.invalid',
+      tenantId: 'tenant-other',
+      tenantName: '其他租户',
+    };
+    const otherWorkspace = await getProcurementWorkspaceData(db, otherTenantUser);
+    expect(otherWorkspace.suppliers).toHaveLength(0);
+    expect(otherWorkspace.purchaseOrders).toHaveLength(0);
+    expect(otherWorkspace.purchaseReceipts).toHaveLength(0);
+    await expect(executePurchaseOrderAction(db, otherTenantUser, replacement.purchaseOrder.id, {
+      action: 'issue',
+    }, 'purchase-order-other-tenant-3001')).rejects.toMatchObject({
+      code: 'PURCHASE_ORDER_NOT_FOUND',
+    });
+  });
+
   it('来源需求变化、错误仓库和未下单收货都会被拒绝且不留下业务记录', async () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-03', name: '约束测试供应商',
