@@ -5,7 +5,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 type ModuleKey = 'dashboard' | 'platform' | 'orders' | 'inventory' | 'purchase' | 'warehouse' | 'logistics' | 'finance' | 'reports';
 type OrderStatus = 'pending_review' | 'reserved' | 'shipped' | 'cancelled';
 type OrderAction = 'approve' | 'ship' | 'cancel';
-type Permission = 'orders:read' | 'orders:create' | 'orders:approve' | 'orders:ship' | 'orders:cancel' | 'audit:read' | 'connectors:read' | 'connectors:sync' | 'purchase:read' | 'purchase:mapping' | 'purchase:create' | 'purchase:submit' | 'purchase:review';
+type Permission = 'orders:read' | 'orders:create' | 'orders:approve' | 'orders:ship' | 'orders:cancel' | 'audit:read' | 'connectors:read' | 'connectors:sync' | 'purchase:read' | 'purchase:mapping' | 'purchase:create' | 'purchase:submit' | 'purchase:review' | 'purchase:supplier:create' | 'purchase:order:create' | 'purchase:order:issue' | 'inventory:receive';
 
 type ErpOrder = {
   id: string; orderNo: string; channel: string; destination: string; customerName: string;
@@ -59,6 +59,38 @@ type PurchaseRequest = {
   needsAttention: boolean; createdAt: string; updatedAt: string; lines: PurchaseRequestLine[];
 };
 
+type PurchaseSupplier = {
+  id: string; code: string; name: string; note: string | null; active: boolean;
+  version: number; createdAt: string; updatedAt: string;
+};
+type PurchaseWarehouse = { id: string; code: string; name: string };
+type PurchaseOrderStatus = 'draft' | 'issued' | 'partially_received' | 'received' | 'cancelled';
+type PurchaseOrderLine = {
+  id: string; purchaseRequestLineId: string; skuId: string; skuCode: string; skuName: string;
+  orderedQuantity: number; receivedQuantity: number; remainingQuantity: number;
+  unitCostMinor: number | null; currency: string | null;
+};
+type PurchaseOrder = {
+  id: string; orderNo: string; purchaseRequestId: string; purchaseRequestNo: string;
+  supplier: Pick<PurchaseSupplier, 'id' | 'code' | 'name'>; status: PurchaseOrderStatus;
+  currency: string | null; note: string | null; version: number; lineCount: number;
+  orderedQuantity: number; receivedQuantity: number; issuedAt: string | null; cancelledAt: string | null;
+  createdAt: string; updatedAt: string; lines: PurchaseOrderLine[];
+};
+type PurchaseReceiptLine = {
+  id: string; purchaseOrderLineId: string; skuId: string; skuCode: string; skuName: string;
+  warehouseId: string; quantity: number;
+};
+type PurchaseReceipt = {
+  id: string; receiptNo: string; purchaseOrderId: string; purchaseOrderNo: string;
+  warehouse: PurchaseWarehouse; status: 'posted'; note: string | null; receivedAt: string;
+  createdAt: string; lineCount: number; totalQuantity: number; lines: PurchaseReceiptLine[];
+};
+type ProcurementSummary = {
+  suppliers: number; draftOrders: number; issuedOrders: number; partiallyReceivedOrders: number;
+  receivedOrders: number; pendingReceiptQuantity: number; receiptCount: number; receivedQuantity: number;
+};
+
 type PurchaseDemandSummary = {
   total: number; open: number; needsMapping: number; notRequired: number;
   openQuantity: number; needsMappingQuantity: number; availableQuantity?: number;
@@ -80,6 +112,8 @@ type PurchaseWorkspacePayload = {
   requests: PurchaseRequest[];
   requestSummary?: PurchaseRequestSummary;
   members: PurchaseMember[]; skuOptions: PurchaseSkuOption[];
+  suppliers: PurchaseSupplier[]; warehouses: PurchaseWarehouse[]; purchaseOrders: PurchaseOrder[];
+  purchaseReceipts: PurchaseReceipt[]; procurementSummary: ProcurementSummary;
 };
 
 type ShopifyStatus = {
@@ -148,6 +182,9 @@ const actionLabel: Record<string, string> = {
   MAP_PURCHASE_SKU: '映射采购 SKU', CREATE_PURCHASE_REQUEST: '创建采购申请',
   SUBMIT_PURCHASE_REQUEST: '提交采购复审', APPROVE_PURCHASE_REQUEST: '批准采购申请',
   REJECT_PURCHASE_REQUEST: '驳回采购申请', CANCEL_PURCHASE_REQUEST: '取消采购申请',
+  CREATE_SUPPLIER: '新增供应商', CREATE_PURCHASE_ORDER: '生成正式采购单',
+  ISSUE_PURCHASE_ORDER: '确认采购下单', CANCEL_PURCHASE_ORDER: '取消采购单',
+  POST_PURCHASE_RECEIPT: '采购到货入库',
 };
 
 const purchaseDemandStatusLabel: Record<PurchaseDemandStatus, string> = {
@@ -164,7 +201,11 @@ const purchaseRequestStatusLabel: Record<PurchaseRequestStatus, string> = {
   draft: '草稿', pending_review: '待复审', approved: '已批准', rejected: '已驳回', cancelled: '已取消',
 };
 
-type PurchaseTab = 'pending' | 'mapping' | 'requests' | 'history';
+const purchaseOrderStatusLabel: Record<PurchaseOrderStatus, string> = {
+  draft: '草稿', issued: '已下单', partially_received: '部分到货', received: '全部到货', cancelled: '已取消',
+};
+
+type PurchaseTab = 'pending' | 'mapping' | 'requests' | 'approved' | 'orders' | 'received' | 'history';
 
 const plannedModules: Record<Exclude<ModuleKey, 'dashboard' | 'platform' | 'orders' | 'inventory'>, {
   title: string; desc: string; source: string;
@@ -182,6 +223,11 @@ const emptyPurchaseSummary: PurchaseDemandSummary = {
 
 const emptyPurchaseRequestSummary: PurchaseRequestSummary = {
   total: 0, draft: 0, pendingReview: 0, approved: 0, rejected: 0, cancelled: 0,
+};
+
+const emptyProcurementSummary: ProcurementSummary = {
+  suppliers: 0, draftOrders: 0, issuedOrders: 0, partiallyReceivedOrders: 0,
+  receivedOrders: 0, pendingReceiptQuantity: 0, receiptCount: 0, receivedQuantity: 0,
 };
 
 export default function ErpClient() {
@@ -203,6 +249,9 @@ export default function ErpClient() {
   const [selectedDemandIds, setSelectedDemandIds] = useState<Set<string>>(new Set());
   const [mappingDemand, setMappingDemand] = useState<PurchaseDemand | null>(null);
   const [showPurchaseRequest, setShowPurchaseRequest] = useState(false);
+  const [showSupplier, setShowSupplier] = useState(false);
+  const [purchaseOrderRequest, setPurchaseOrderRequest] = useState<PurchaseRequest | null>(null);
+  const [receivingOrder, setReceivingOrder] = useState<PurchaseOrder | null>(null);
   const [purchaseBusy, setPurchaseBusy] = useState('');
 
   const loadData = useCallback(async () => {
@@ -322,6 +371,32 @@ export default function ErpClient() {
       purchaseRequestStatusLabel[request.status],
       request.note ?? '',
       ...request.lines.flatMap((line) => [line.skuCode ?? '', line.skuName ?? '', line.rawSku ?? '']),
+    ].some((value) => value.toLowerCase().includes(term)));
+  }, [purchasePayload, query]);
+  const filteredPurchaseOrders = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    if (!term) return purchasePayload?.purchaseOrders ?? [];
+    return (purchasePayload?.purchaseOrders ?? []).filter((order) => [
+      order.orderNo,
+      order.purchaseRequestNo,
+      order.supplier.code,
+      order.supplier.name,
+      purchaseOrderStatusLabel[order.status],
+      order.currency ?? '',
+      order.note ?? '',
+      ...order.lines.flatMap((line) => [line.skuCode, line.skuName]),
+    ].some((value) => value.toLowerCase().includes(term)));
+  }, [purchasePayload, query]);
+  const filteredPurchaseReceipts = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    if (!term) return purchasePayload?.purchaseReceipts ?? [];
+    return (purchasePayload?.purchaseReceipts ?? []).filter((receipt) => [
+      receipt.receiptNo,
+      receipt.purchaseOrderNo,
+      receipt.warehouse.code,
+      receipt.warehouse.name,
+      receipt.note ?? '',
+      ...receipt.lines.flatMap((line) => [line.skuCode, line.skuName]),
     ].some((value) => value.toLowerCase().includes(term)));
   }, [purchasePayload, query]);
 
@@ -508,6 +583,122 @@ export default function ErpClient() {
     } finally { setPurchaseBusy(''); }
   }
 
+  async function submitSupplier(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    setPurchaseBusy('create-supplier'); setError('');
+    try {
+      const response = await fetch('/api/purchase/suppliers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          code: String(data.get('code') ?? '').trim(),
+          name: String(data.get('name') ?? '').trim(),
+          note: String(data.get('note') ?? '').trim() || undefined,
+        }),
+      });
+      const body = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(body.message ?? '供应商创建失败');
+      form.reset(); setShowSupplier(false); await loadData();
+      flash('供应商已保存，可以用于正式采购单');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '供应商创建失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
+  async function submitPurchaseOrder(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!purchaseOrderRequest) return;
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const lineCosts = purchaseOrderRequest.lines.flatMap((line) => {
+      const rawValue = String(data.get(`unitCost:${line.id}`) ?? '').trim();
+      return rawValue ? [{
+        purchaseRequestLineId: line.id,
+        unitCostMinor: Math.round(Number(rawValue) * 100),
+      }] : [];
+    });
+    if (lineCosts.some((line) => !Number.isSafeInteger(line.unitCostMinor) || line.unitCostMinor < 0)) {
+      setError('请填写有效的采购单价');
+      return;
+    }
+    setPurchaseBusy(`create-order:${purchaseOrderRequest.id}`); setError('');
+    try {
+      const response = await fetch('/api/purchase/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          purchaseRequestId: purchaseOrderRequest.id,
+          supplierId: String(data.get('supplierId') ?? ''),
+          currency: String(data.get('currency') ?? 'CNY'),
+          note: String(data.get('note') ?? '').trim() || undefined,
+          lineCosts: lineCosts.length ? lineCosts : undefined,
+        }),
+      });
+      const body = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(body.message ?? '正式采购单生成失败');
+      setPurchaseOrderRequest(null); await loadData(); setPurchaseTab('orders');
+      flash('正式采购单已生成，确认下单后可登记到货');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '正式采购单生成失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
+  async function runPurchaseOrderAction(order: PurchaseOrder, action: 'issue' | 'cancel') {
+    const message = action === 'issue'
+      ? `确认将 ${order.orderNo} 标记为已向 ${order.supplier.name} 下单？`
+      : `确认取消 ${order.orderNo}？采购单和操作历史会保留。`;
+    if (!window.confirm(message)) return;
+    setPurchaseBusy(`${order.id}:${action}`); setError('');
+    try {
+      const response = await fetch(`/api/purchase/orders/${order.id}/actions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({ action }),
+      });
+      const body = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(body.message ?? '采购单操作失败');
+      await loadData();
+      flash(action === 'issue' ? '采购单已确认下单，等待到货' : '采购单已取消，历史仍然保留');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '采购单操作失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
+  async function submitPurchaseReceipt(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!receivingOrder) return;
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const lines = receivingOrder.lines.map((line) => ({
+      purchaseOrderLineId: line.id,
+      quantity: Number(data.get(`quantity:${line.id}`) ?? 0),
+    })).filter((line) => Number.isInteger(line.quantity) && line.quantity > 0);
+    if (!lines.length) { setError('请至少填写一项本次实际到货数量'); return; }
+    const receivedAtValue = String(data.get('receivedAt') ?? '').trim();
+    const receivedAt = receivedAtValue ? new Date(receivedAtValue).toISOString() : undefined;
+    setPurchaseBusy(`receive:${receivingOrder.id}`); setError('');
+    try {
+      const response = await fetch(`/api/purchase/orders/${receivingOrder.id}/receipts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          warehouseId: String(data.get('warehouseId') ?? ''),
+          receivedAt,
+          note: String(data.get('note') ?? '').trim() || undefined,
+          lines,
+        }),
+      });
+      const body = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(body.message ?? '到货入库失败');
+      setReceivingOrder(null); await loadData(); setPurchaseTab('orders');
+      flash('本次到货已登记，ERP 现存库存和入库流水已更新');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '到货入库失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
   const activeLabel = nav.find((item) => item.key === active)?.label ?? '工作台';
   const displayName = payload?.user.displayName || '未登录';
   const initials = displayName.slice(0, 2).toUpperCase();
@@ -540,7 +731,7 @@ export default function ErpClient() {
             {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}
             {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
             {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} />}
-            {active === 'purchase' && <PurchaseWorkspaceView demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} hasQuery={Boolean(query.trim())} />}
+            {active === 'purchase' && <PurchaseWorkspaceView demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openRequest={() => setShowPurchaseRequest(true)} openSupplier={() => setShowSupplier(true)} openPurchaseOrder={setPurchaseOrderRequest} openReceipt={setReceivingOrder} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
             {!['dashboard','platform','orders','inventory','purchase'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
           </>
         ) : <LoadingState message={error || '暂时无法加载业务数据'} />}
@@ -549,6 +740,9 @@ export default function ErpClient() {
       {showOrder && payload && <OrderModal inventory={payload.inventory} submitting={submitting} error={error} onClose={() => { if (!submitting) { setShowOrder(false); setError(''); } }} onSubmit={submitOrder} />}
       {mappingDemand && purchasePayload && <SkuMappingModal demand={mappingDemand} skuOptions={purchasePayload.skuOptions} busy={purchaseBusy.startsWith('mapping:')} error={error} onClose={() => { if (!purchaseBusy) { setMappingDemand(null); setError(''); } }} onSubmit={submitSkuMapping} />}
       {showPurchaseRequest && purchasePayload && <PurchaseRequestModal demands={purchasePayload.demands.filter((demand) => selectedDemandIds.has(demand.id))} members={purchasePayload.members} busy={purchaseBusy === 'create-request'} error={error} onClose={() => { if (!purchaseBusy) { setShowPurchaseRequest(false); setError(''); } }} onSubmit={submitPurchaseRequest} />}
+      {showSupplier && <SupplierModal busy={purchaseBusy === 'create-supplier'} error={error} onClose={() => { if (!purchaseBusy) { setShowSupplier(false); setError(''); } }} onSubmit={submitSupplier} />}
+      {purchaseOrderRequest && purchasePayload && <PurchaseOrderModal request={purchaseOrderRequest} suppliers={purchasePayload.suppliers} busy={purchaseBusy.startsWith('create-order:')} error={error} openSupplier={() => setShowSupplier(true)} onClose={() => { if (!purchaseBusy) { setPurchaseOrderRequest(null); setError(''); } }} onSubmit={submitPurchaseOrder} />}
+      {receivingOrder && purchasePayload && <PurchaseReceiptModal order={receivingOrder} warehouses={purchasePayload.warehouses} busy={purchaseBusy.startsWith('receive:')} error={error} onClose={() => { if (!purchaseBusy) { setReceivingOrder(null); setError(''); } }} onSubmit={submitPurchaseReceipt} />}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
     </main>
   );
@@ -613,47 +807,66 @@ function InventoryView({ inventory, summary, hasInventoryData, hasQuery }: { inv
   </div>;
 }
 
-function PurchaseWorkspaceView({ demands, requests, workspace, tab, setTab, selectedDemandIds, toggleDemand, openMapping, openRequest, can, busy, runAction, hasQuery }: {
-  demands: PurchaseDemand[]; requests: PurchaseRequest[]; workspace: PurchaseWorkspacePayload | null;
-  tab: PurchaseTab; setTab: (tab: PurchaseTab) => void; selectedDemandIds: Set<string>;
-  toggleDemand: (id: string) => void; openMapping: (demand: PurchaseDemand) => void; openRequest: () => void;
+function PurchaseWorkspaceView({ demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedDemandIds, toggleDemand, openMapping, openRequest, openSupplier, openPurchaseOrder, openReceipt, can, busy, runAction, runOrderAction, hasQuery }: {
+  demands: PurchaseDemand[]; requests: PurchaseRequest[]; purchaseOrders: PurchaseOrder[]; purchaseReceipts: PurchaseReceipt[];
+  workspace: PurchaseWorkspacePayload | null; tab: PurchaseTab; setTab: (tab: PurchaseTab) => void;
+  selectedDemandIds: Set<string>; toggleDemand: (id: string) => void;
+  openMapping: (demand: PurchaseDemand) => void; openRequest: () => void; openSupplier: () => void;
+  openPurchaseOrder: (request: PurchaseRequest) => void; openReceipt: (order: PurchaseOrder) => void;
   can: (permission: Permission) => boolean; busy: string;
   runAction: (request: PurchaseRequest, action: 'submit' | 'approve' | 'reject' | 'cancel') => void;
-  hasQuery: boolean;
+  runOrderAction: (order: PurchaseOrder, action: 'issue' | 'cancel') => void; hasQuery: boolean;
 }) {
   const summary = workspace?.summary ?? emptyPurchaseSummary;
   const requestSummary = workspace?.requestSummary ?? emptyPurchaseRequestSummary;
+  const procurementSummary = workspace?.procurementSummary ?? emptyProcurementSummary;
+  const allOrders = workspace?.purchaseOrders ?? purchaseOrders;
+  const activeRequestIds = new Set(allOrders.filter((order) => order.status !== 'cancelled').map((order) => order.purchaseRequestId));
+  const approvedRequests = requests.filter((request) => request.status === 'approved' && !activeRequestIds.has(request.id));
+  const activeOrders = purchaseOrders.filter((order) => ['draft', 'issued', 'partially_received'].includes(order.status));
+  const closedOrders = purchaseOrders.filter((order) => ['received', 'cancelled'].includes(order.status));
+  const historyRequests = requests.filter((request) => ['rejected', 'cancelled'].includes(request.status));
   const pendingDemandCount = (workspace?.demands ?? demands).filter(
     (demand) => demand.status === 'open' && demandAvailableQuantity(demand) > 0,
   ).length;
   const availableQuantity = summary.availableQuantity ?? demands.filter((demand) => demand.status === 'open').reduce((sum, demand) => sum + demandAvailableQuantity(demand), 0);
   const stats = [
-    ['待采购数量', String(availableQuantity), '可选需求的剩余件数'],
-    ['待 SKU 映射', String(summary.needsMapping), `涉及 ${summary.needsMappingQuantity} 件`],
-    ['待复审申请', String(requestSummary.pendingReview), '已提交，等待复审'],
-    ['已批准申请', String(requestSummary.approved), '已锁定，避免重复采购'],
+    ['待采购数量', String(availableQuantity), '真实订单尚待处理'],
+    ['待复审申请', String(requestSummary.pendingReview), '审批后才能正式下单'],
+    ['待转采购单', String(approvedRequests.length), '已批准、尚未向供应商下单'],
+    ['待到货数量', String(procurementSummary.pendingReceiptQuantity), '已下单未完成入库'],
   ];
   const visibleDemands = tab === 'pending'
     ? demands.filter((demand) => demand.status === 'open' && demandAvailableQuantity(demand) > 0)
     : tab === 'mapping' ? demands.filter((demand) => demand.status === 'needs_mapping') : [];
-  const visibleRequests = tab === 'requests'
-    ? requests.filter((request) => request.status === 'draft' || request.status === 'pending_review')
-    : requests.filter((request) => ['approved', 'rejected', 'cancelled'].includes(request.status));
+  const visibleRequests = requests.filter((request) => request.status === 'draft' || request.status === 'pending_review');
   const selectedDemands = (workspace?.demands ?? []).filter((demand) => selectedDemandIds.has(demand.id));
   const selectedQuantity = selectedDemands.reduce((sum, demand) => sum + demandAvailableQuantity(demand), 0);
   const tabs: Array<[PurchaseTab, string, number]> = [
     ['pending', '待处理需求', pendingDemandCount],
-    ['mapping', '待 SKU 映射', summary.needsMapping],
-    ['requests', '采购申请', requestSummary.draft + requestSummary.pendingReview],
-    ['history', '历史记录', requestSummary.approved + requestSummary.rejected + requestSummary.cancelled],
+    ['mapping', 'SKU 映射', summary.needsMapping],
+    ['requests', '申请与复审', requestSummary.draft + requestSummary.pendingReview],
+    ['approved', '待转采购单', approvedRequests.length],
+    ['orders', '采购单 / 待到货', activeOrders.length],
+    ['received', '到货记录', purchaseReceipts.length],
+    ['history', '历史', historyRequests.length + closedOrders.length],
   ];
-  return <div className="content module-content"><div className="module-head"><div><p>真实订单 / 采购执行</p><h1>采购工作台</h1><span>真实订单自动形成采购需求；完成 SKU 映射后，可生成采购申请并进入复审。系统不会向 Shopify 写入。</span></div><div className="ledger-chip">需求防重复 · 历史不删除</div></div><StatCards stats={stats} />
-    <article className="card data-card purchase-workspace-card"><div className="data-toolbar purchase-toolbar"><div>{tabs.map(([key, label, count]) => <button key={key} className={tab === key ? 'tab-active' : ''} onClick={() => setTab(key)}>{label}<b>{count}</b></button>)}</div><span>{tab === 'pending' ? `可采购 ${availableQuantity} 件` : tab === 'mapping' ? '映射后自动进入待处理' : `共 ${requests.length} 张申请`}</span></div>
+  const toolbarText = tab === 'pending' ? `可采购 ${availableQuantity} 件`
+    : tab === 'mapping' ? '映射后自动进入待处理'
+      : tab === 'orders' ? `待到货 ${procurementSummary.pendingReceiptQuantity} 件`
+        : tab === 'received' ? `累计入库 ${procurementSummary.receivedQuantity} 件`
+          : `供应商 ${procurementSummary.suppliers} 家`;
+  return <div className="content module-content"><div className="module-head"><div><p>真实订单 / 采购执行</p><h1>采购工作台</h1><span>真实订单形成采购需求，经过申请、复审、供应商下单和到货登记后更新 ERP 库存；不会向 Shopify 写入。</span></div><div className="purchase-head-actions"><div className="ledger-chip">需求防重复 · 入库有流水 · 历史不删除</div>{can('purchase:supplier:create') && <button className="primary-button" onClick={openSupplier} disabled={Boolean(busy)}><span>＋</span>供应商</button>}</div></div><StatCards stats={stats} />
+    <article className="card data-card purchase-workspace-card"><div className="data-toolbar purchase-toolbar"><div>{tabs.map(([key, label, count]) => <button key={key} className={tab === key ? 'tab-active' : ''} onClick={() => setTab(key)}>{label}<b>{count}</b></button>)}</div><span>{toolbarText}</span></div>
       {tab === 'pending' || tab === 'mapping' ? <>
         {tab === 'pending' && <div className="purchase-selection"><div><strong>已选 {selectedDemandIds.size} 行 / {selectedQuantity} 件</strong><span>每条需求只能进入一张有效采购申请</span></div><button className="primary-button" disabled={!selectedDemandIds.size || !can('purchase:create') || Boolean(busy)} onClick={openRequest}><span>＋</span>生成采购申请</button></div>}
         <PurchaseDemandTable demands={visibleDemands} selectable={tab === 'pending'} selectedDemandIds={selectedDemandIds} toggleDemand={toggleDemand} openMapping={openMapping} canMap={can('purchase:mapping')} busy={busy} emptyMessage={hasQuery ? '没有符合当前搜索条件的需求' : tab === 'pending' ? '暂无可采购需求；待映射 SKU 完成后会出现在这里' : '暂无待映射的真实订单行'} />
-      </> : <PurchaseRequestTable requests={visibleRequests} can={can} busy={busy} runAction={runAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购申请' : tab === 'requests' ? '暂无草稿或待复审申请，可从待处理需求生成' : '暂无已结束的采购申请'} />}
-      <div className="pagination"><span>订单取消、退款或履约变化会重新校验需求；所有申请和复审记录永久保留</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div>
+      </> : tab === 'requests' ? <PurchaseRequestTable requests={visibleRequests} can={can} busy={busy} runAction={runAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购申请' : '暂无草稿或待复审申请，可从待处理需求生成'} />
+        : tab === 'approved' ? <PurchaseRequestTable requests={approvedRequests} can={can} busy={busy} runAction={runAction} openPurchaseOrder={openPurchaseOrder} emptyMessage={hasQuery ? '没有符合当前搜索条件的已批准申请' : '暂无待转采购单；采购申请批准后会出现在这里'} />
+          : tab === 'orders' ? <PurchaseOrderTable orders={activeOrders} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购单' : '暂无待下单或待到货采购单'} />
+            : tab === 'received' ? <PurchaseReceiptTable receipts={purchaseReceipts} emptyMessage={hasQuery ? '没有符合当前搜索条件的到货记录' : '暂无到货记录；确认采购单下单后可分批登记到货'} />
+              : <div className="purchase-history-sections"><div><h3>已结束的申请</h3><PurchaseRequestTable requests={historyRequests} can={can} busy={busy} runAction={runAction} emptyMessage="暂无驳回或取消的采购申请" /></div><div><h3>已结束的采购单</h3><PurchaseOrderTable orders={closedOrders} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage="暂无完成或取消的正式采购单" /></div></div>}
+      <div className="pagination"><span>取消、退款、到货和库存变化均保留原始记录；系统不物理删除采购历史</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div>
     </article>
   </div>;
 }
@@ -668,11 +881,29 @@ function PurchaseDemandTable({ demands, selectable, selectedDemandIds, toggleDem
   }) : <tr><td className="empty-cell" colSpan={selectable ? 8 : 7}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
-function PurchaseRequestTable({ requests, can, busy, runAction, emptyMessage }: {
+function PurchaseRequestTable({ requests, can, busy, runAction, openPurchaseOrder, emptyMessage }: {
   requests: PurchaseRequest[]; can: (permission: Permission) => boolean; busy: string;
   runAction: (request: PurchaseRequest, action: 'submit' | 'approve' | 'reject' | 'cancel') => void; emptyMessage: string;
+  openPurchaseOrder?: (request: PurchaseRequest) => void;
 }) {
-  return <div className="table-wrap module-table"><table className="purchase-request-table"><thead><tr><th>申请单</th><th>采购负责人</th><th>复审人</th><th>明细 / 件数</th><th>状态</th><th>备注</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{requests.length ? requests.map((request) => <tr key={request.id}><td><strong>{request.requestNo}</strong><small className="cell-sub">创建：{request.creator?.displayName ?? '系统成员'}</small></td><td>{request.buyer?.displayName ?? '待指定'}</td><td>{request.reviewer?.displayName ?? '待指定'}</td><td>{request.lineCount} 行 / {request.totalQuantity} 件</td><td><span className={`status-pill purchase-status-${request.status}`}>{purchaseRequestStatusLabel[request.status]}</span>{request.needsAttention && <small className="cell-sub attention-text">源订单已变化，需复核</small>}</td><td>{request.reviewNote ?? request.note ?? '—'}</td><td>{formatTime(request.updatedAt)}</td><td><div className="row-actions">{request.status === 'draft' && can('purchase:submit') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'submit')}>{busy === `${request.id}:submit` ? '提交中…' : '提交复审'}</button>}{request.status === 'draft' && can('purchase:submit') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'cancel')}>取消</button>}{request.status === 'pending_review' && can('purchase:review') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'approve')}>{busy === `${request.id}:approve` ? '复审中…' : '批准'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'reject')}>驳回</button></>}{['approved','rejected','cancelled'].includes(request.status) && <span className="terminal-label">历史已保留</span>}</div></td></tr>) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
+  return <div className="table-wrap module-table"><table className="purchase-request-table"><thead><tr><th>申请单</th><th>采购负责人</th><th>复审人</th><th>明细 / 件数</th><th>状态</th><th>备注</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{requests.length ? requests.map((request) => <tr key={request.id}><td><strong>{request.requestNo}</strong><small className="cell-sub">创建：{request.creator?.displayName ?? '系统成员'}</small></td><td>{request.buyer?.displayName ?? '待指定'}</td><td>{request.reviewer?.displayName ?? '待指定'}</td><td>{request.lineCount} 行 / {request.totalQuantity} 件</td><td><span className={`status-pill purchase-status-${request.status}`}>{purchaseRequestStatusLabel[request.status]}</span>{request.needsAttention && <small className="cell-sub attention-text">源订单已变化，需复核</small>}</td><td>{request.reviewNote ?? request.note ?? '—'}</td><td>{formatTime(request.updatedAt)}</td><td><div className="row-actions">{request.status === 'draft' && can('purchase:submit') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'submit')}>{busy === `${request.id}:submit` ? '提交中…' : '提交复审'}</button>}{request.status === 'draft' && can('purchase:submit') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'cancel')}>取消</button>}{request.status === 'pending_review' && can('purchase:review') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'approve')}>{busy === `${request.id}:approve` ? '复审中…' : '批准'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'reject')}>驳回</button></>}{request.status === 'approved' && openPurchaseOrder && can('purchase:order:create') && !request.needsAttention && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openPurchaseOrder(request)}>生成正式采购单</button>}{request.status === 'approved' && request.needsAttention && <span className="terminal-label">源订单变化，暂不能转单</span>}{(['rejected','cancelled'].includes(request.status) || (request.status === 'approved' && !openPurchaseOrder)) && <span className="terminal-label">历史已保留</span>}</div></td></tr>) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
+}
+
+function PurchaseOrderTable({ orders, can, busy, openReceipt, runAction, emptyMessage }: {
+  orders: PurchaseOrder[]; can: (permission: Permission) => boolean; busy: string;
+  openReceipt: (order: PurchaseOrder) => void;
+  runAction: (order: PurchaseOrder, action: 'issue' | 'cancel') => void; emptyMessage: string;
+}) {
+  return <div className="table-wrap module-table"><table className="purchase-order-table"><thead><tr><th>正式采购单</th><th>供应商</th><th>申请单</th><th>采购 / 已到 / 未到</th><th>金额信息</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{orders.length ? orders.map((order) => {
+    const remaining = Math.max(0, order.orderedQuantity - order.receivedQuantity);
+    const totalMinor = order.lines.reduce((sum, line) => sum + (line.unitCostMinor ?? 0) * line.orderedQuantity, 0);
+    const hasCost = order.lines.some((line) => line.unitCostMinor !== null);
+    return <tr key={order.id}><td><strong>{order.orderNo}</strong><small className="cell-sub">{order.lineCount} 行 · v{order.version}</small></td><td><strong>{order.supplier.name}</strong><small className="cell-sub">{order.supplier.code}</small></td><td>{order.purchaseRequestNo}</td><td><strong>{order.orderedQuantity} / {order.receivedQuantity} / {remaining}</strong><small className="cell-sub">采购 / 已到 / 未到</small></td><td>{hasCost && order.currency ? formatMoney(totalMinor, order.currency) : '未填写单价'}<small className="cell-sub">{order.currency ?? '币种未指定'}</small></td><td><span className={`status-pill purchase-order-status-${order.status}`}>{purchaseOrderStatusLabel[order.status]}</span></td><td>{formatTime(order.updatedAt)}</td><td><div className="row-actions">{order.status === 'draft' && can('purchase:order:issue') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(order, 'issue')}>{busy === `${order.id}:issue` ? '处理中…' : '确认下单'}</button>}{order.status === 'draft' && can('purchase:order:issue') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(order, 'cancel')}>取消采购单</button>}{['issued','partially_received'].includes(order.status) && can('inventory:receive') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openReceipt(order)}>登记到货</button>}{['received','cancelled'].includes(order.status) && <span className="terminal-label">历史已保留</span>}</div></td></tr>;
+  }) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
+}
+
+function PurchaseReceiptTable({ receipts, emptyMessage }: { receipts: PurchaseReceipt[]; emptyMessage: string }) {
+  return <div className="table-wrap module-table"><table className="purchase-receipt-table"><thead><tr><th>到货单</th><th>采购单</th><th>入库仓</th><th>明细 / 件数</th><th>SKU</th><th>到货时间</th><th>状态</th></tr></thead><tbody>{receipts.length ? receipts.map((receipt) => <tr key={receipt.id}><td><strong>{receipt.receiptNo}</strong><small className="cell-sub">{receipt.note ?? '不可变入库记录'}</small></td><td>{receipt.purchaseOrderNo}</td><td><strong>{receipt.warehouse.name}</strong><small className="cell-sub">{receipt.warehouse.code}</small></td><td>{receipt.lineCount} 行 / {receipt.totalQuantity} 件</td><td>{receipt.lines.slice(0, 2).map((line) => line.skuCode).join('、')}{receipt.lines.length > 2 ? ` 等 ${receipt.lines.length} 项` : ''}</td><td>{formatTime(receipt.receivedAt)}</td><td><span className="status-pill success">已入库</span></td></tr>) : <tr><td className="empty-cell" colSpan={7}>{emptyMessage}</td></tr>}</tbody></table></div>;
 }
 
 function PlannedModule({ module }: { module: (typeof plannedModules)[keyof typeof plannedModules] }) {
@@ -709,6 +940,32 @@ function PurchaseRequestModal({ demands, members, busy, error, onClose, onSubmit
   const defaultBuyer = members[0]?.id ?? '';
   const defaultReviewer = members[1]?.id ?? defaultBuyer;
   return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal purchase-request-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>生成采购申请</h2><p>已选 {demands.length} 行，共 {totalQuantity} 件</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="purchase-selected-list">{demands.slice(0, 5).map((demand) => <div key={demand.id}><strong>{demand.mappedSkuCode ?? demand.rawSku ?? '未识别 SKU'}</strong><span>{demand.title ?? demand.name ?? demand.sourceOrderLineId}</span><b>{demandAvailableQuantity(demand)} 件</b></div>)}{demands.length > 5 && <small>另有 {demands.length - 5} 行已选需求</small>}</div><div className="form-grid"><label>采购负责人<select name="purchaserMemberId" defaultValue={defaultBuyer} required>{members.map((member) => <option key={member.id} value={member.id}>{member.displayName}</option>)}</select></label><label>复审人<select name="reviewerMemberId" defaultValue={defaultReviewer} required>{members.map((member) => <option key={member.id} value={member.id}>{member.displayName}</option>)}</select></label><label className="full">采购备注<textarea name="note" rows={3} maxLength={500} placeholder="可填写交期、供应商沟通或特殊要求" /></label>{!members.length && <div className="form-error full">当前没有可分配成员，请先让业务人员登录一次 ERP。</div>}{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>开发阶段</span>当前允许负责人和复审人为同一人；上线前可启用岗位分离。重复需求不会生成第二张有效申请。</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button type="submit" value="draft" disabled={busy || !members.length}>{busy ? '处理中…' : '保存草稿'}</button><button className="primary-button" type="submit" value="submit" disabled={busy || !members.length}>{busy ? '处理中…' : '创建并提交复审'}</button></div></form></div>;
+}
+
+function SupplierModal({ busy, error, onClose, onSubmit }: {
+  busy: boolean; error: string; onClose: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return <div className="modal-backdrop modal-layer-top" onMouseDown={onClose}><form className="modal purchase-modal supplier-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>新增供应商</h2><p>供应商会用于正式采购单，历史采购单保留名称快照</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>供应商编码<input name="code" required minLength={1} maxLength={40} placeholder="例如 SUP-001" autoComplete="off" /></label><label>供应商名称<input name="name" required minLength={1} maxLength={120} placeholder="请输入公司或工厂名称" autoComplete="off" /></label><label className="full">备注<textarea name="note" rows={3} maxLength={500} placeholder="可填写主营品类或内部说明；不要填写账号密码" /></label>{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>主数据规则</span>编码在当前 ERP 内唯一 · 不物理删除 · 所有新增操作自动审计</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy}>{busy ? '正在保存…' : '保存供应商'}</button></div></form></div>;
+}
+
+function PurchaseOrderModal({ request, suppliers, busy, error, openSupplier, onClose, onSubmit }: {
+  request: PurchaseRequest; suppliers: PurchaseSupplier[]; busy: boolean; error: string;
+  openSupplier: () => void; onClose: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const activeSuppliers = suppliers.filter((supplier) => supplier.active);
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal procurement-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>生成正式采购单</h2><p>{request.requestNo} · {request.lineCount} 行 / {request.totalQuantity} 件</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label className="full">供应商<div className="select-with-action"><select name="supplierId" required defaultValue={activeSuppliers[0]?.id ?? ''}><option value="" disabled>请选择供应商</option>{activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.code} · {supplier.name}</option>)}</select><button type="button" onClick={openSupplier} disabled={busy}>＋ 新增</button></div></label><label>采购币种<select name="currency" defaultValue="CNY"><option value="CNY">CNY 人民币</option><option value="USD">USD 美元</option><option value="EUR">EUR 欧元</option><option value="GBP">GBP 英镑</option></select></label><label>当前状态<input value="草稿（确认下单前不入库）" readOnly /></label><label className="full">采购备注<textarea name="note" rows={2} maxLength={500} placeholder="可填写议价、交期或包装要求" /></label></div><div className="purchase-order-lines"><div className="purchase-order-lines-head"><strong>采购明细</strong><span>单价可暂不填写，金额按所选币种保存</span></div>{request.lines.map((line) => <div className="purchase-order-line" key={line.id}><div><strong>{line.skuCode ?? line.rawSku ?? '未识别 SKU'}</strong><span>{line.skuName ?? '采购申请明细'}</span></div><b>{line.requestedQuantity} 件</b><label>含税单价<input name={`unitCost:${line.id}`} type="number" min="0" step="0.01" placeholder="可选" inputMode="decimal" /></label></div>)}</div>{!activeSuppliers.length && <div className="form-error">请先新增一个可用供应商，再生成正式采购单。</div>}{error && <div className="form-error">{error}</div>}<div className="modal-safety"><span>生成规则</span>一张已批准申请只能生成一张有效采购单 · 取消后历史仍保留 · 不会向 Shopify 写入</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || !activeSuppliers.length}>{busy ? '正在生成…' : '生成采购单草稿'}</button></div></form></div>;
+}
+
+function PurchaseReceiptModal({ order, warehouses, busy, error, onClose, onSubmit }: {
+  order: PurchaseOrder; warehouses: PurchaseWarehouse[]; busy: boolean; error: string;
+  onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const receivableLines = order.lines.filter((line) => line.remainingQuantity > 0);
+  const now = new Date();
+  const localDateTime = new Date(now.getTime() - now.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal procurement-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>登记采购到货</h2><p>{order.orderNo} · {order.supplier.name}</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>本次入库仓<select name="warehouseId" required defaultValue={warehouses[0]?.id ?? ''}><option value="" disabled>请选择仓库</option>{warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.code} · {warehouse.name}</option>)}</select></label><label>实际到货时间<input name="receivedAt" type="datetime-local" defaultValue={localDateTime} required /></label><label className="full">到货备注<textarea name="note" rows={2} maxLength={500} placeholder="可填写送货单号、批次或异常说明" /></label></div><div className="purchase-order-lines"><div className="purchase-order-lines-head"><strong>本次实际到货</strong><span>可以分批登记，累计数量不能超过采购数量</span></div>{receivableLines.map((line) => <div className="purchase-order-line receipt-line" key={line.id}><div><strong>{line.skuCode}</strong><span>{line.skuName}</span></div><b>已到 {line.receivedQuantity} / 未到 {line.remainingQuantity}</b><label>本次到货<input name={`quantity:${line.id}`} type="number" min="0" max={line.remainingQuantity} step="1" defaultValue={line.remainingQuantity} inputMode="numeric" /></label></div>)}</div>{!warehouses.length && <div className="form-error">当前没有可用仓库，无法登记入库。</div>}{error && <div className="form-error">{error}</div>}<div className="modal-safety"><span>库存规则</span>提交后自动增加 ERP 现存库存并写入不可变入库流水 · 重复提交不会重复加库存</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || !warehouses.length || !receivableLines.length}>{busy ? '正在入库…' : '确认本次到货并入库'}</button></div></form></div>;
 }
 
 function Status({ status }: { status: OrderStatus }) {
@@ -756,6 +1013,18 @@ function normalizePurchaseWorkspace(body: PurchaseWorkspacePayload | PurchaseDem
       reviewNote: request.reviewNote ?? null,
       needsAttention: Boolean(request.needsAttention),
     })) : [];
+    const purchaseOrders = Array.isArray(body.purchaseOrders) ? body.purchaseOrders.map((order) => ({
+      ...order,
+      lines: Array.isArray(order.lines) ? order.lines.map((line) => ({
+        ...line,
+        remainingQuantity: Math.max(0, line.remainingQuantity ?? line.orderedQuantity - line.receivedQuantity),
+        currency: line.currency ?? order.currency ?? null,
+      })) : [],
+      lineCount: order.lineCount ?? order.lines?.length ?? 0,
+      orderedQuantity: order.orderedQuantity ?? order.lines?.reduce((sum, line) => sum + line.orderedQuantity, 0) ?? 0,
+      receivedQuantity: order.receivedQuantity ?? order.lines?.reduce((sum, line) => sum + line.receivedQuantity, 0) ?? 0,
+      currency: order.currency ?? null,
+    })) : [];
     return {
       ...body,
       demands,
@@ -764,6 +1033,11 @@ function normalizePurchaseWorkspace(body: PurchaseWorkspacePayload | PurchaseDem
       requestSummary: body.requestSummary ?? summarizePurchaseRequests(requests),
       members: Array.isArray(body.members) ? body.members : [],
       skuOptions: Array.isArray(body.skuOptions) ? body.skuOptions : [],
+      suppliers: Array.isArray(body.suppliers) ? body.suppliers : [],
+      warehouses: Array.isArray(body.warehouses) ? body.warehouses : [],
+      purchaseOrders,
+      purchaseReceipts: Array.isArray(body.purchaseReceipts) ? body.purchaseReceipts : [],
+      procurementSummary: body.procurementSummary ?? summarizeProcurement(purchaseOrders, body.purchaseReceipts ?? [], body.suppliers ?? []),
     };
   }
   return {
@@ -775,6 +1049,11 @@ function normalizePurchaseWorkspace(body: PurchaseWorkspacePayload | PurchaseDem
     requestSummary: emptyPurchaseRequestSummary,
     members: [],
     skuOptions: [],
+    suppliers: [],
+    warehouses: [],
+    purchaseOrders: [],
+    purchaseReceipts: [],
+    procurementSummary: emptyProcurementSummary,
   };
 }
 
@@ -785,6 +1064,19 @@ function summarizePurchaseRequests(requests: PurchaseRequest[]) {
     else summary[request.status] += 1;
     return summary;
   }, { ...emptyPurchaseRequestSummary });
+}
+
+function summarizeProcurement(orders: PurchaseOrder[], receipts: PurchaseReceipt[], suppliers: PurchaseSupplier[]) {
+  return {
+    suppliers: suppliers.filter((supplier) => supplier.active).length,
+    draftOrders: orders.filter((order) => order.status === 'draft').length,
+    issuedOrders: orders.filter((order) => order.status === 'issued').length,
+    partiallyReceivedOrders: orders.filter((order) => order.status === 'partially_received').length,
+    receivedOrders: orders.filter((order) => order.status === 'received').length,
+    pendingReceiptQuantity: orders.filter((order) => ['issued', 'partially_received'].includes(order.status)).reduce((sum, order) => sum + Math.max(0, order.orderedQuantity - order.receivedQuantity), 0),
+    receiptCount: receipts.length,
+    receivedQuantity: receipts.reduce((sum, receipt) => sum + receipt.totalQuantity, 0),
+  };
 }
 
 function demandAvailableQuantity(demand: PurchaseDemand) {
