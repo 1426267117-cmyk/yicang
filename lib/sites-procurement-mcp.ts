@@ -10,10 +10,12 @@ import {
   refreshMukuIfDue,
   type MukuFreshnessReport,
 } from './muku-freshness-service';
+import { evaluateOrderSourceReadiness } from './order-source-readiness';
 
 export const SITE_MCP_VERSION = '2026-07-28';
 export const SITE_MCP_TENANT_LIMIT = 20;
 const SHOPIFY_RECONCILE_MAX_PAGES = 20;
+const SHOPIFY_FRESHNESS_STORE_LIMIT = 100;
 const DEFAULT_ORDER_FRESHNESS_MAX_AGE_MINUTES = 30;
 
 const GET_FRESHNESS_TOOL = 'get_procurement_freshness';
@@ -28,11 +30,25 @@ type SafeShopifyFreshness = {
   status: 'fresh' | 'stale' | 'missing';
   readyForProcurement: boolean;
   maxAgeMinutes: number;
+  storesDiscovered: number;
   storesConfigured: number;
+  excludedLocalStores: number;
+  verifiedOfficialStores: number;
   freshStores: number;
   staleStores: number;
   failedStores: number;
   latestSuccessfulSyncAt: string | null;
+  sourceLimitReached: boolean;
+  blockerCodes: Record<string, number>;
+};
+
+type ShopifyFreshnessRow = {
+  connector_key: string;
+  credential_ref: string;
+  identity_verified_at: string | null;
+  last_successful_sync_at: string | null;
+  sync_status: string | null;
+  sync_last_success_at: string | null;
 };
 
 type SafeTenantFreshness = {
@@ -375,9 +391,13 @@ async function readTenantFreshness(input: {
   tenant: TenantRow;
   runtimeEnv: RuntimeEnv;
 }): Promise<SafeTenantFreshness> {
+  const checkedAt = new Date();
   const [muku, shopify] = await Promise.all([
-    evaluateMukuFreshness(input.db, input.tenant.id, { runtimeEnv: input.runtimeEnv }),
-    readShopifyFreshness(input.db, input.tenant.id, input.runtimeEnv),
+    evaluateMukuFreshness(input.db, input.tenant.id, {
+      runtimeEnv: input.runtimeEnv,
+      now: checkedAt,
+    }),
+    readShopifyFreshness(input.db, input.tenant.id, input.runtimeEnv, checkedAt.toISOString()),
   ]);
   return {
     tenantName: safeTenantName(input.tenant.name),
@@ -391,6 +411,7 @@ async function readShopifyFreshness(
   db: D1Database,
   tenantId: string,
   runtimeEnv: RuntimeEnv,
+  checkedAt: string,
 ): Promise<SafeShopifyFreshness> {
   const maxAgeMinutes = boundedEnvInteger(
     runtimeEnv.ERP_ORDER_SYNC_MAX_AGE_MINUTES,
@@ -398,16 +419,10 @@ async function readShopifyFreshness(
     5,
     24 * 60,
   );
-  const threshold = new Date(Date.now() - maxAgeMinutes * 60_000).toISOString();
-  const row = await db.prepare(`
-    SELECT COUNT(*) AS stores_configured,
-           SUM(CASE
-             WHEN COALESCE(state.status, 'idle') != 'failed'
-              AND COALESCE(state.last_success_at, store.last_successful_sync_at) >= ?
-             THEN 1 ELSE 0
-           END) AS fresh_stores,
-           SUM(CASE WHEN state.status = 'failed' THEN 1 ELSE 0 END) AS failed_stores,
-           MAX(COALESCE(state.last_success_at, store.last_successful_sync_at)) AS latest_success_at
+  const rows = await db.prepare(`
+    SELECT store.connector_key, store.credential_ref, store.identity_verified_at,
+           store.last_successful_sync_at, state.status AS sync_status,
+           state.last_success_at AS sync_last_success_at
     FROM platform_stores store
     LEFT JOIN connector_sync_state state
       ON state.platform_store_id = store.id
@@ -415,26 +430,58 @@ async function readShopifyFreshness(
      AND state.connector = 'shopify'
      AND state.resource = 'orders'
     WHERE store.tenant_id = ? AND store.platform = 'shopify' AND store.active = 1
-  `).bind(threshold, tenantId).first<{
-    stores_configured: number | null;
-    fresh_stores: number | null;
-    failed_stores: number | null;
-    latest_success_at: string | null;
-  }>();
-  const storesConfigured = Number(row?.stores_configured ?? 0);
-  const freshStores = Number(row?.fresh_stores ?? 0);
-  const failedStores = Number(row?.failed_stores ?? 0);
-  const staleStores = Math.max(0, storesConfigured - freshStores);
-  const readyForProcurement = storesConfigured > 0 && staleStores === 0 && failedStores === 0;
+    ORDER BY store.id
+    LIMIT ?
+  `).bind(tenantId, SHOPIFY_FRESHNESS_STORE_LIMIT + 1).all<ShopifyFreshnessRow>();
+  const sourceLimitReached = rows.results.length > SHOPIFY_FRESHNESS_STORE_LIMIT;
+  return summarizeShopifyOrderSources(
+    rows.results.slice(0, SHOPIFY_FRESHNESS_STORE_LIMIT),
+    checkedAt,
+    maxAgeMinutes,
+    sourceLimitReached,
+  );
+}
+
+export function summarizeShopifyOrderSources(
+  rows: ShopifyFreshnessRow[],
+  checkedAt: string,
+  maxAgeMinutes: number,
+  sourceLimitReached = false,
+): SafeShopifyFreshness {
+  const evaluated = rows.map((row) => ({
+    row,
+    readiness: evaluateOrderSourceReadiness({
+      credentialRef: row.credential_ref,
+      connectorKey: row.connector_key,
+      identityVerifiedAt: row.identity_verified_at,
+      lastSuccessfulSyncAt: row.last_successful_sync_at,
+      syncLastSuccessAt: row.sync_last_success_at,
+      syncStatus: row.sync_status,
+    }, { checkedAt, maxAgeMinutes }),
+  }));
+  const official = evaluated.filter((source) => source.readiness.official);
+  const freshStores = official.filter((source) => source.readiness.ready).length;
+  const staleStores = official.length - freshStores;
+  const blockerCodes = countCodes(official.flatMap((source) => source.readiness.reasons));
+  if (official.length === 0) blockerCodes.no_official_order_source = 1;
+  if (sourceLimitReached) blockerCodes.order_source_limit_exceeded = 1;
+  const readyForProcurement = official.length > 0 && staleStores === 0 && !sourceLimitReached;
   return {
-    status: storesConfigured === 0 ? 'missing' : readyForProcurement ? 'fresh' : 'stale',
+    status: official.length === 0 ? 'missing' : readyForProcurement ? 'fresh' : 'stale',
     readyForProcurement,
     maxAgeMinutes,
-    storesConfigured,
+    storesDiscovered: rows.length,
+    storesConfigured: official.length,
+    excludedLocalStores: evaluated.length - official.length,
+    verifiedOfficialStores: official.filter((source) => source.readiness.identityVerified).length,
     freshStores,
     staleStores,
-    failedStores,
-    latestSuccessfulSyncAt: row?.latest_success_at ?? null,
+    failedStores: official.filter((source) => source.row.sync_status === 'failed').length,
+    latestSuccessfulSyncAt: latestIsoTimestamp(
+      official.map((source) => source.readiness.lastSuccessAt),
+    ),
+    sourceLimitReached,
+    blockerCodes,
   };
 }
 
@@ -586,6 +633,14 @@ function countCodes(codes: string[]) {
   const counts: Record<string, number> = {};
   for (const code of codes) counts[code] = (counts[code] ?? 0) + 1;
   return counts;
+}
+
+function latestIsoTimestamp(values: Array<string | null>) {
+  const timestamps = values
+    .filter((value): value is string => value !== null)
+    .map((value) => Date.parse(value))
+    .filter((value) => Number.isFinite(value));
+  return timestamps.length ? new Date(Math.max(...timestamps)).toISOString() : null;
 }
 
 class JsonRpcRequestError extends Error {

@@ -8,6 +8,7 @@ import type {
 import { developmentOpenAccessEnabled } from './access-policy';
 import { HttpError, requirePermission, type UserContext } from './db';
 import { evaluateMukuFreshness } from './muku-freshness-service';
+import { evaluateOrderSourceReadiness } from './order-source-readiness';
 import { buildProcurementOperationsStatus } from './procurement-operations';
 import {
   createPurchaseRequestFromAllocations,
@@ -389,34 +390,31 @@ export async function getPurchasePlanning(
       };
     });
   const orderSources = orderSourceResult.results.map((source) => {
-    const official = !source.credential_ref.toLowerCase().startsWith('local:')
-      && !source.connector_key.toLowerCase().startsWith('local_');
-    const lastSuccessAt = latestTimestamp([
-      source.last_successful_sync_at,
-      source.sync_last_success_at,
-    ]);
-    const ageMinutes = timestampAgeMinutes(lastSuccessAt, freshness.checkedAt);
-    const reasons: string[] = [];
-    if (!official) reasons.push('local_qa_excluded');
-    if (official && lastSuccessAt === null) reasons.push('order_sync_time_unknown');
-    if (official && ageMinutes !== null && (ageMinutes < -5 || ageMinutes > orderSyncMaxAgeMinutes)) {
-      reasons.push('order_sync_stale');
-    }
-    if (official && source.sync_status === 'failed') reasons.push('order_sync_failed');
+    const sourceReadiness = evaluateOrderSourceReadiness({
+      credentialRef: source.credential_ref,
+      connectorKey: source.connector_key,
+      identityVerifiedAt: source.identity_verified_at,
+      lastSuccessfulSyncAt: source.last_successful_sync_at,
+      syncLastSuccessAt: source.sync_last_success_at,
+      syncStatus: source.sync_status,
+    }, {
+      checkedAt: freshness.checkedAt,
+      maxAgeMinutes: orderSyncMaxAgeMinutes,
+    });
     return {
       storeId: source.id,
       platform: source.platform,
       storeKey: source.connector_key,
       storeName: source.display_name,
       identityVerifiedAt: source.identity_verified_at,
-      official,
-      ready: official && reasons.length === 0,
-      lastSuccessAt,
-      ageMinutes,
+      official: sourceReadiness.official,
+      ready: sourceReadiness.ready,
+      lastSuccessAt: sourceReadiness.lastSuccessAt,
+      ageMinutes: sourceReadiness.ageMinutes,
       syncStatus: source.sync_status ?? 'not_started',
       lastErrorCode: source.sync_last_error_code,
       lastErrorAt: source.sync_last_error_at,
-      reasons,
+      reasons: sourceReadiness.reasons,
     };
   });
   const officialOrderSources = orderSources.filter((source) => source.official);

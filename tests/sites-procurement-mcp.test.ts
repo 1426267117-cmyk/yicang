@@ -7,6 +7,7 @@ import {
   parseAutomationAllowedEmails,
   SITE_MCP_TENANT_LIMIT,
   SITE_MCP_VERSION,
+  summarizeShopifyOrderSources,
 } from '../lib/sites-procurement-mcp';
 
 describe('Sites procurement MCP JSON-RPC', () => {
@@ -128,6 +129,66 @@ describe('Sites procurement MCP automation authorization', () => {
 });
 
 describe('Sites procurement MCP tool behavior', () => {
+  it('excludes LOCAL QA stores without letting them drag down or fake official readiness', () => {
+    const checkedAt = '2026-11-02T10:00:00.000Z';
+    const officialAndLocal = summarizeShopifyOrderSources([
+      shopifySource({ connector_key: 'bizfurniz', credential_ref: 'd1:shopify:bizfurniz' }),
+      shopifySource({
+        connector_key: 'local_qa',
+        credential_ref: 'local:qa',
+        identity_verified_at: 'invalid',
+        last_successful_sync_at: '2099-01-01T00:00:00.000Z',
+        sync_status: 'failed',
+      }),
+    ], checkedAt, 30);
+    expect(officialAndLocal).toMatchObject({
+      status: 'fresh',
+      readyForProcurement: true,
+      storesDiscovered: 2,
+      storesConfigured: 1,
+      excludedLocalStores: 1,
+      freshStores: 1,
+      staleStores: 0,
+      failedStores: 0,
+      blockerCodes: {},
+    });
+
+    const onlyLocal = summarizeShopifyOrderSources([
+      shopifySource({ connector_key: 'local_qa', credential_ref: 'local:qa' }),
+    ], checkedAt, 30);
+    expect(onlyLocal).toMatchObject({
+      status: 'missing',
+      readyForProcurement: false,
+      storesConfigured: 0,
+      excludedLocalStores: 1,
+      blockerCodes: { no_official_order_source: 1 },
+    });
+  });
+
+  it('blocks and reports official stores with a future success time or invalid identity proof', () => {
+    const checkedAt = '2026-11-02T10:00:00.000Z';
+    const future = summarizeShopifyOrderSources([
+      shopifySource({ last_successful_sync_at: '2026-11-02T10:00:01.000Z' }),
+    ], checkedAt, 30);
+    expect(future).toMatchObject({
+      status: 'stale',
+      readyForProcurement: false,
+      storesConfigured: 1,
+      freshStores: 0,
+      staleStores: 1,
+      blockerCodes: { order_sync_time_in_future: 1 },
+    });
+
+    const invalidIdentity = summarizeShopifyOrderSources([
+      shopifySource({ identity_verified_at: 'not-a-time' }),
+    ], checkedAt, 30);
+    expect(invalidIdentity).toMatchObject({
+      readyForProcurement: false,
+      verifiedOfficialStores: 0,
+      blockerCodes: { identity_verification_invalid: 1 },
+    });
+  });
+
   it('reads freshness without returning tenant IDs, credentials or order data', async () => {
     const dependencies = {
       ensureDatabase: vi.fn(async () => {}),
@@ -291,12 +352,36 @@ function safeFreshness(tenantName: string) {
       status: 'fresh',
       readyForProcurement: true,
       maxAgeMinutes: 30,
+      storesDiscovered: 1,
       storesConfigured: 1,
+      excludedLocalStores: 0,
+      verifiedOfficialStores: 1,
       freshStores: 1,
       staleStores: 0,
       failedStores: 0,
       latestSuccessfulSyncAt: '2026-11-02T10:00:00.000Z',
+      sourceLimitReached: false,
+      blockerCodes: {},
     },
+  };
+}
+
+function shopifySource(overrides: Partial<{
+  connector_key: string;
+  credential_ref: string;
+  identity_verified_at: string | null;
+  last_successful_sync_at: string | null;
+  sync_status: string | null;
+  sync_last_success_at: string | null;
+}> = {}) {
+  return {
+    connector_key: 'bizfurniz',
+    credential_ref: 'd1:shopify:bizfurniz',
+    identity_verified_at: '2026-11-02T09:00:00.000Z',
+    last_successful_sync_at: '2026-11-02T09:50:00.000Z',
+    sync_status: 'idle',
+    sync_last_success_at: null,
+    ...overrides,
   };
 }
 
