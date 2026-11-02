@@ -81,12 +81,14 @@ export async function requestContext(request: Request) {
     let role: Role = 'admin';
     if (!developmentOpenAccess) {
       const bootstrapOwnerEmail = accessPolicy.bootstrapOwnerEmail;
-      const admins = await db.prepare(`
-        SELECT email FROM members
-        WHERE tenant_id = ? AND role = 'admin'
-      `).bind(TENANT_ID).all<{ email: string }>();
-      const hasFormalAdmin = admins.results.some((admin) => identityAllowed(admin.email, accessPolicy));
-      const needsOwnerBootstrap = !hasFormalAdmin;
+      const ownerAdmin = bootstrapOwnerEmail
+        ? await db.prepare(`
+            SELECT 1 AS present FROM members
+            WHERE tenant_id = ? AND role = 'admin' AND lower(email) = ?
+            LIMIT 1
+          `).bind(TENANT_ID, bootstrapOwnerEmail).first<{ present: number }>()
+        : null;
+      const needsOwnerBootstrap = !ownerAdmin;
       const isBootstrapOwner = bootstrapOwnerEmail === identity.email.trim().toLowerCase();
       if (needsOwnerBootstrap && !isBootstrapOwner) {
         throw new HttpError(

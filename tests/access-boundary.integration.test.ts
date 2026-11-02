@@ -120,6 +120,7 @@ describe('ERP 请求访问边界', () => {
   });
 
   it('允许公司域账号加入已有工作区并默认成为操作员', async () => {
+    runtimeEnv.ERP_ALLOWED_EMAILS = 'owner@muku.example';
     runtimeEnv.ERP_ALLOWED_EMAIL_DOMAINS = '@muku.example';
     await seedMember('owner-id', 'owner@muku.example', 'admin');
 
@@ -138,6 +139,26 @@ describe('ERP 请求访问边界', () => {
       code: 'ERP_ACCESS_NOT_ALLOWED',
     });
     expect(await memberCount()).toBe(0);
+  });
+
+  it('开发阶段已有域名账号 admin 时仍由首位精确 owner 初始化正式管理员', async () => {
+    runtimeEnv.ERP_DEV_OPEN_ACCESS = 'true';
+    await requestContext(erpRequest('domain-dev-id', 'staff@allowed.example'));
+    expect(await storedRole('domain-dev-id')).toBe('admin');
+
+    runtimeEnv.ERP_DEV_OPEN_ACCESS = 'false';
+    runtimeEnv.ERP_ALLOWED_EMAILS = 'owner@example.com';
+    runtimeEnv.ERP_ALLOWED_EMAIL_DOMAINS = 'allowed.example';
+
+    const owner = await requestContext(erpRequest('owner-id', 'owner@example.com'));
+    expect(owner.user.role).toBe('admin');
+    expect(await storedRole('owner-id')).toBe('admin');
+
+    const existingDomainMember = await requestContext(
+      erpRequest('domain-dev-id', 'staff@allowed.example'),
+    );
+    expect(existingDomainMember.user.role).toBe('admin');
+    expect(await memberCount()).toBe(2);
   });
 
   it('正式模式使用数据库中已有成员角色', async () => {
