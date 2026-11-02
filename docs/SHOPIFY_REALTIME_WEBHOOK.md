@@ -59,6 +59,7 @@ mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $subscription: Webhook
 6. 接收成功后通过 Worker `waitUntil` 即时处理最多一个订单，先快速向 Shopify 返回安全响应；积压和延迟重试交给补偿任务。
 7. `POST /api/connectors/shopify/webhooks/process` 是独立内部批处理入口，请求体可传 `{ "maxEvents": 10 }`。它不使用普通用户登录或 `connectors:sync` 权限，即使 `ERP_DEV_OPEN_ACCESS=true` 也必须携带 `Authorization: Bearer <ERP_INTERNAL_JOB_TOKEN>`。
 8. `ERP_INTERNAL_JOB_TOKEN` 必须以至少 32 个随机字符配置为服务端 Secret；不得写入前端、仓库、日志或本文档。未配置返回 503，无或错误 Token 返回 401。
+9. 部署新版本后可调用 `POST /api/connectors/shopify/webhooks/register`，使用 ERP D1 中已经保存的 Shopify 授权幂等注册四个订阅，无需重新走 OAuth。此入口同样只接受 `ERP_INTERNAL_JOB_TOKEN`，开放开发模式不能绕过；它会先核对店铺官方 Shop ID、域名和唯一租户归属，且响应不包含访问令牌或客户数据。
 9. 消费者用租约条件抢占事件，再调用现有完整订单读取与幂等落库逻辑；失败按 1 分钟、5 分钟、15 分钟、1 小时退避，最多五次，最终失败记录保留。
 10. 应定期调用内部批处理入口，确保低流量店铺的退避事件和过期租约能继续推进；不要创建公开的订阅注册接口。
 11. 保留周期性增量同步作为漏单补偿，Webhook 不能取代对账重扫。
