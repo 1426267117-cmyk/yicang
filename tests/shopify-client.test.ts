@@ -23,9 +23,9 @@ describe('ShopifyAdminClient', () => {
   });
 
   it('调用 fetch 时不绑定 ShopifyAdminClient 作为 receiver', async () => {
-    let receiver: unknown = 'not-called';
+    const receiver = { value: 'not-called' as unknown };
     const receiverAwareFetch = async function (this: unknown) {
-      receiver = this;
+      receiver.value = this;
       return new Response(JSON.stringify({ data: { shop: { id: 'gid://shopify/Shop/1' } } }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -35,13 +35,13 @@ describe('ShopifyAdminClient', () => {
     const client = new ShopifyAdminClient(config, receiverAwareFetch);
     await client.graphql('query ReceiverTest { shop { id } }');
 
-    expect(receiver).toBeUndefined();
+    expect(receiver.value).toBeUndefined();
   });
 
   it('默认请求通过 globalThis fetch 边界调用', async () => {
-    let receiver: unknown = 'not-called';
+    const receiver = { value: 'not-called' as unknown };
     vi.stubGlobal('fetch', async function (this: unknown) {
-      receiver = this;
+      receiver.value = this;
       return new Response(JSON.stringify({ data: { shop: { id: 'gid://shopify/Shop/1' } } }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -51,7 +51,7 @@ describe('ShopifyAdminClient', () => {
     const client = new ShopifyAdminClient(config);
     await client.graphql('query ReceiverTest { shop { id } }');
 
-    expect(receiver).toBe(globalThis);
+    expect(receiver.value).toBe(globalThis);
   });
 
   it('不跟随 API 重定向，避免把访问令牌发送到其他地址', async () => {
