@@ -95,6 +95,47 @@ describe('采购数据自动化运维状态', () => {
     expect(status.shopify.configurationBlockers.join('；')).not.toContain('OAuth 授权');
   });
 
+  it('只有坏域名的环境 Token 时不误报入口就绪', () => {
+    const status = buildProcurementOperationsStatus({
+      freshness: freshMukuReport(),
+      orderSources: [],
+      orderSyncMaxAgeMinutes: 30,
+      runtimeEnv: {
+        ERP_INTERNAL_JOB_TOKEN: internalToken,
+        SHOPIFY_ZIMASYA_ADMIN_ACCESS_TOKEN: 'test-bad-store-token',
+        SHOPIFY_ZIMASYA_SHOP_DOMAIN: 'not-a-shopify-domain.example',
+      },
+    });
+
+    expect(status.shopify).toEqual(expect.objectContaining({
+      sourceConfigured: false,
+      endpointReady: false,
+      automationReady: false,
+    }));
+    expect(status.shopify.configurationBlockers.join('；')).toContain('尚未发现 Shopify OAuth 授权');
+  });
+
+  it('坏域名环境店不影响其他有效环境店的入口就绪判断', () => {
+    const status = buildProcurementOperationsStatus({
+      freshness: freshMukuReport(),
+      orderSources: [],
+      orderSyncMaxAgeMinutes: 30,
+      runtimeEnv: {
+        ERP_INTERNAL_JOB_TOKEN: internalToken,
+        SHOPIFY_ZIMASYA_ADMIN_ACCESS_TOKEN: 'test-bad-store-token',
+        SHOPIFY_ZIMASYA_SHOP_DOMAIN: 'not-a-shopify-domain.example',
+        SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'test-good-store-token',
+      },
+    });
+
+    expect(status.shopify).toEqual(expect.objectContaining({
+      sourceConfigured: true,
+      endpointReady: true,
+      automationReady: false,
+    }));
+    expect(status.shopify.configurationBlockers.join('；')).not.toContain('OAuth 授权');
+  });
+
   it('尚未生成平台店铺时也能从 D1 OAuth 授权口径判断入口就绪', () => {
     const status = buildProcurementOperationsStatus({
       freshness: freshMukuReport(),

@@ -99,6 +99,18 @@ export function configuredShopifyEnvironmentStoreKeys(
     .map((candidate) => candidate.key);
 }
 
+export function readyShopifyEnvironmentStoreKeys(
+  runtimeEnv: Record<string, unknown>,
+): ShopifyStoreKey[] {
+  return configuredShopifyEnvironmentStoreKeys(runtimeEnv).filter((storeKey) => {
+    try {
+      return hasShopifyCredentials(resolveShopifyStoreConfig(runtimeEnv, storeKey));
+    } catch {
+      return false;
+    }
+  });
+}
+
 export function hasShopifyAppCredentials(config: ShopifyCredentialConfig) {
   return Boolean(config.clientId && config.clientSecret);
 }

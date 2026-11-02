@@ -1,8 +1,8 @@
 import type { MukuFreshnessReport } from './muku-freshness-service';
 import { resolveMukuConfig } from './connectors/muku/config';
 import {
-  configuredShopifyEnvironmentStoreKeys,
   isShopifyStoreKey,
+  readyShopifyEnvironmentStoreKeys,
 } from './connectors/shopify/config';
 
 const INTERNAL_JOB_TOKEN_MIN_LENGTH = 32;
@@ -45,7 +45,7 @@ export function buildProcurementOperationsStatus(input: {
     source.official && source.platform.toLowerCase() === 'shopify'
   ));
   const configuredShopifyStoreKeys = new Set([
-    ...configuredShopifyEnvironmentStoreKeys(input.runtimeEnv),
+    ...readyShopifyEnvironmentStoreKeys(input.runtimeEnv),
     ...(input.shopifyAuthorizedStoreKeys ?? []).filter(isShopifyStoreKey),
   ]);
   const shopifySourceConfigured = configuredShopifyStoreKeys.size > 0;
