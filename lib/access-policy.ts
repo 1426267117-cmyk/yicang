@@ -4,6 +4,12 @@ export type ProductionAccessPolicy = {
   configured: boolean;
 };
 
+export function developmentOpenAccessEnabled(runtimeEnv: Record<string, unknown>) {
+  const value = runtimeEnv.ERP_DEV_OPEN_ACCESS;
+  return value === true
+    || (typeof value === 'string' && value.trim().toLowerCase() === 'true');
+}
+
 export function readProductionAccessPolicy(runtimeEnv: Record<string, unknown>): ProductionAccessPolicy {
   const emails = new Set(splitEnvList(runtimeEnv.ERP_ALLOWED_EMAILS).map((value) => value.toLowerCase()));
   const domains = new Set(

@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:workers';
 import { ensureDatabase } from '../db/initialize';
 import {
+  developmentOpenAccessEnabled,
   readProductionAccessPolicy,
 } from './access-policy';
 import { ROLE_PERMISSIONS, type Permission, type Role } from './domain';
@@ -12,7 +13,14 @@ type RuntimeEnv = {
   DB?: D1Database;
   ERP_ALLOWED_EMAILS?: string;
   ERP_ALLOWED_EMAIL_DOMAINS?: string;
+  ERP_DEV_OPEN_ACCESS?: string;
 };
+
+const DEVELOPMENT_IDENTITY = {
+  id: 'erp-development-open-access',
+  email: 'development-open-access@local.invalid',
+  displayName: '开放开发模式',
+} as const;
 
 export class HttpError extends Error {
   constructor(public status: number, message: string, public code = 'REQUEST_FAILED') {
@@ -36,7 +44,10 @@ export async function requestContext(request: Request) {
   if (!db) throw new HttpError(503, '数据库尚未绑定，请稍后重试', 'DATABASE_UNAVAILABLE');
 
   await ensureDatabase(db);
-  const identity = readIdentity(request.headers);
+  const identity = readIdentity(request.headers)
+    ?? (developmentOpenAccessEnabled(runtimeEnv as Record<string, unknown>)
+      ? DEVELOPMENT_IDENTITY
+      : null);
   if (!identity) throw new HttpError(401, '请先登录后再访问易仓 ERP', 'AUTH_REQUIRED');
 
   await db.prepare(`

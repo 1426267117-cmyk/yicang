@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  developmentOpenAccessEnabled,
   identityAllowed,
   identityExplicitlyListed,
   readProductionAccessPolicy,
@@ -27,5 +28,14 @@ describe('ERP 生产访问名单', () => {
       ERP_ALLOWED_EMAIL_DOMAINS: '',
     });
     expect(policy.configured).toBe(false);
+  });
+
+  it('开放开发模式只接受明确的 true 开关', () => {
+    expect(developmentOpenAccessEnabled({ ERP_DEV_OPEN_ACCESS: 'true' })).toBe(true);
+    expect(developmentOpenAccessEnabled({ ERP_DEV_OPEN_ACCESS: ' TRUE ' })).toBe(true);
+    expect(developmentOpenAccessEnabled({ ERP_DEV_OPEN_ACCESS: true })).toBe(true);
+    expect(developmentOpenAccessEnabled({ ERP_DEV_OPEN_ACCESS: 'false' })).toBe(false);
+    expect(developmentOpenAccessEnabled({ ERP_DEV_OPEN_ACCESS: '1' })).toBe(false);
+    expect(developmentOpenAccessEnabled({})).toBe(false);
   });
 });
