@@ -8,7 +8,7 @@
 - 接入模式：Admin GraphQL 只读
 - Shopify 写操作：未启用
 - 同步状态：成功，当前无错误
-- 生产发布：Sites `v17`，schema readiness `procurement-0016`
+- 生产发布：Sites 当前生产版本，schema readiness `procurement-0016`
 - Webhook：订单创建、更新、取消和退款 4 个主题已注册
 - 托管刷新：Sites 每小时任务已保存，订单与库存时效阈值为 75 分钟；`2026-11-03 09:20` 首轮计划运行已更新同步水位并通过验收
 
