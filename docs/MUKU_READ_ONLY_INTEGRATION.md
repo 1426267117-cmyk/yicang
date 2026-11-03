@@ -48,9 +48,11 @@ MUKU 清单中其余数据集已识别，后续按业务阶段接入：履约单
 
 部署平台可使用已有 `ERP_INTERNAL_JOB_TOKEN`，以 `Authorization: Bearer <token>` 调用 `POST /api/connectors/muku/refresh`。空请求体按“到期才刷新”执行；仅在人工故障处理时可传 `{"force":true}`。接口和错误响应都使用 `Cache-Control: no-store`，不会返回 MUKU API Key。
 
-当前工程只提供受保护的任务入口，没有声明 Cloudflare Cron、Sites 定时器或 Codex automation 已经配置。生产若需要无人访问页面时仍定时刷新，必须由实际部署环境的调度器调用此接口；建议每 5～10 分钟触发一次，由服务端限频和幂等逻辑决定是否真正拉取。
+生产已发布 Site MCP，并已保存每小时一次的 Sites 托管采购数据刷新任务；该任务同时刷新到期的 MUKU 只读快照并对已授权 Shopify 店铺做增量对账。由于 Sites 当前同一任务最多每小时运行一次，生产 `MUKU_FRESHNESS_MAX_AGE_MINUTES` 和 `ERP_ORDER_SYNC_MAX_AGE_MINUTES` 均按 75 分钟配置，保留 15 分钟调度缓冲。`2026-11-03 09:20`（Asia/Shanghai）首轮计划任务已返回 HTTP 200，MUKU 快照刷新至 `09:19:42`，BizFurniz 同步完成于 `09:20:15`，持续调度已通过首轮验收。
 
-只有外部调度器已经实际配置并验证后，才把服务端变量 `ERP_MUKU_EXTERNAL_SCHEDULE_CONFIGURED` 设为 `true`。此变量只是部署侧的明确声明，不会自行创建定时任务。`GET /api/connectors/muku/status` 会分别返回内部任务密钥是否配置、受保护入口是否就绪、外部调度是否声明配置及下次刷新到期点；不能用“入口代码存在”替代“调度已运行”。
+受保护的 `POST /api/connectors/muku/refresh` 继续作为兼容入口；选择内部任务入口加外部调度器的部署可以按 5～10 分钟触发，由服务端限频和幂等逻辑决定是否真正拉取。Sites MCP 模式不要求任务提示词携带内部任务密钥。
+
+Sites MCP 任务只有在实际保存且至少一次计划运行核验成功后，才把 `ERP_SITES_PROCUREMENT_SCHEDULE_CONFIGURED` 设为 `true`。若改用内部入口加外部调度器，则只有外部调度已经实际配置并验证后，才把 `ERP_MUKU_EXTERNAL_SCHEDULE_CONFIGURED` 设为 `true`。这些变量只是部署侧的明确声明，不会自行创建任务；不能用“入口代码存在”或“计划已保存”替代“调度已运行”。
 
 ## 采购规划闭环
 

@@ -35,7 +35,7 @@ ERP_SITES_PROCUREMENT_SCHEDULE_CONFIGURED=true
 4. 验证成功后，在 Sites 中建立托管计划任务。当前 Sites 平台限制同一任务每小时最多运行一次，因此生产任务按每小时一次执行；任务只需调用 `refresh_procurement_sources`，不要在提示词中附加 URL、租户、凭证或密钥。
 5. 每小时调度时，将 `MUKU_FRESHNESS_MAX_AGE_MINUTES` 和 `ERP_ORDER_SYNC_MAX_AGE_MINUTES` 设置为 75，保留 15 分钟调度缓冲；超过 75 分钟仍须 fail-closed。只有任务已保存且至少一次运行验证成功后，才设置 `ERP_SITES_PROCUREMENT_SCHEDULE_CONFIGURED=true` 并重新部署当前版本。
 
-截至 2026-11-03，Site MCP 已随易仓 ERP 发布，生产已保存启用的每小时采购数据刷新任务。发布和保存任务本身不等于运行成功；仍需用首次运行后的 Shopify 水位、MUKU 快照时间和采购页面状态完成验收。
+截至 2026-11-03，Site MCP 已随易仓 ERP 发布，生产已保存启用的每小时采购数据刷新任务。`09:20`（Asia/Shanghai）首轮任务调用返回 HTTP 200；MUKU 快照刷新至 `09:19:42`，BizFurniz Shopify 同步完成于 `09:20:15`，采购数据源无新鲜度阻断。`ERP_SITES_PROCUREMENT_SCHEDULE_CONFIGURED=true` 已写入生产环境，随 `v17` 重新部署后页面会准确显示自动化闭环。
 
 ## 失败与排查
 

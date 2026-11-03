@@ -6,12 +6,12 @@
 
 | 店铺 | ERP `storeKey` | 官方域名候选 | 当前结果 | 还缺什么 |
 | --- | --- | --- | --- | --- |
-| BizFurniz | `bizfurniz` | 已用官方 Shop ID 核验实际授权域名 | 已授权、身份已核验、同步空闲且无错误；ERP 已保存 9 个真实订单事实 | 上线新版后验证定时增量对账；如需 60 天前订单，另行申请 `read_all_orders` |
+| BizFurniz | `bizfurniz` | 已用官方 Shop ID 核验实际授权域名 | 已授权、身份已核验；生产已上线，4 个订单 Webhook 已注册，ERP 已保存 9 个真实订单事实，Sites 首轮定时刷新已验收 | 如需 60 天前订单，另行申请 `read_all_orders` |
 | ZIMASYA | `zimasya` | `346c85.myshopify.com` | 未配置应用、未授权、未同步 | 该店可安装应用的 Client ID/Secret，以及店主安装授权 |
 | Kaguyasu | `kaguyasu` | `officebaseca.myshopify.com` | 未配置应用、未授权、未同步 | 同上 |
 | Anzhap | `anzhap` | `anzhap.myshopify.com` | 未配置应用、未授权、未同步 | 同上 |
 
-BizFurniz 当前事实统计为 9 个订单、2 个退款对象、10 个履约对象；最新订单源更新时间为 `2026-11-02T08:25:50Z`。这只是核验时快照，不代表持续调度已经上线。
+BizFurniz 当前事实统计为 9 个订单、2 个退款对象、10 个履约对象。`2026-11-03` 已人工完成一次生产增量对账并保持幂等；Sites 每小时采购数据刷新任务已保存，订单与库存时效阈值均为 75 分钟。首轮计划运行已更新 Shopify 同步水位和 MUKU 快照时间，持续调度通过首轮验收。
 
 ## ERP 已完成的四店能力
 
