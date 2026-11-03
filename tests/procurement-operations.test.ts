@@ -72,6 +72,64 @@ describe('采购数据自动化运维状态', () => {
     expect(status.shopify.configurationBlockers).toEqual([]);
   });
 
+  it('Sites MCP 托管任务使用允许邮箱即可闭环，不要求内部任务密钥或旧调度开关', () => {
+    const status = buildProcurementOperationsStatus({
+      freshness: freshMukuReport(),
+      orderSources: [shopifySource()],
+      shopifyAuthorizedStoreKeys: ['bizfurniz'],
+      orderSyncMaxAgeMinutes: 75,
+      runtimeEnv: {
+        MUKU_DASHBOARD_API_KEY: mukuKey,
+        ERP_SITES_PROCUREMENT_SCHEDULE_CONFIGURED: 'true',
+        ERP_AUTOMATION_ALLOWED_EMAILS: 'owner@example.com',
+      },
+    });
+
+    expect(status).toEqual(expect.objectContaining({
+      internalJobAuthConfigured: false,
+      sitesMcpScheduleConfigured: true,
+      automationAllowedEmailsConfigured: true,
+      schedulerMode: 'sites_mcp',
+      automationReady: true,
+    }));
+    expect(status.browserRefresh.note).toContain('Sites 托管任务');
+    expect(status.muku).toEqual(expect.objectContaining({
+      endpointReady: false,
+      externalScheduleConfigured: true,
+      automationReady: true,
+    }));
+    expect(status.shopify).toEqual(expect.objectContaining({
+      endpointReady: false,
+      externalScheduleConfigured: true,
+      automationReady: true,
+      maxAgeMinutes: 75,
+    }));
+    expect(status.muku.configurationBlockers).toEqual([]);
+    expect(status.shopify.configurationBlockers).toEqual([]);
+  });
+
+  it('Sites MCP 托管任务缺少允许邮箱时失败关闭，但不误报内部任务缺失', () => {
+    const status = buildProcurementOperationsStatus({
+      freshness: freshMukuReport(),
+      orderSources: [shopifySource()],
+      shopifyAuthorizedStoreKeys: ['bizfurniz'],
+      orderSyncMaxAgeMinutes: 75,
+      runtimeEnv: {
+        MUKU_DASHBOARD_API_KEY: mukuKey,
+        ERP_SITES_PROCUREMENT_SCHEDULE_CONFIGURED: true,
+      },
+    });
+
+    expect(status.automationReady).toBe(false);
+    expect(status.automationAllowedEmailsConfigured).toBe(false);
+    expect(status.muku.configurationBlockers.join('；')).toContain('自动化允许邮箱');
+    expect(status.shopify.configurationBlockers.join('；')).toContain('自动化允许邮箱');
+    expect(status.muku.configurationBlockers.join('；')).not.toContain('内部任务密钥');
+    expect(status.shopify.configurationBlockers.join('；')).not.toContain('内部任务密钥');
+    expect(status.muku.configurationBlockers.join('；')).not.toContain('外部调度器');
+    expect(status.shopify.configurationBlockers.join('；')).not.toContain('外部调度器');
+  });
+
   it('环境 ADMIN_ACCESS_TOKEN 可使 Shopify 对账入口就绪但不伪造已同步数据源', () => {
     const status = buildProcurementOperationsStatus({
       freshness: freshMukuReport(),

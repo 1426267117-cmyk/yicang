@@ -179,6 +179,9 @@ type PurchasePlanningOperations = {
     note: string;
   };
   internalJobAuthConfigured: boolean;
+  sitesMcpScheduleConfigured: boolean;
+  automationAllowedEmailsConfigured: boolean;
+  schedulerMode: 'sites_mcp' | 'internal_job' | 'none';
   automationReady: boolean;
   muku: {
     protectedEndpoint: string; endpointReady: boolean; sourceConfigured: boolean;
@@ -1909,15 +1912,15 @@ function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanR
       </div>
       <div className="planning-operations-grid">
         <article className={operations.muku.dataReady ? 'ready' : 'blocked'}>
-          <div className="planning-operation-title"><div><strong>MUKU 库存</strong><small>建议每 {operations.muku.recommendedIntervalMinutes} 分钟检查一次到期状态</small></div><span className={`status-pill ${operations.muku.automationReady ? 'success' : ''}`}>{operations.muku.automationReady ? '已调度' : operations.muku.endpointReady ? '仅任务入口' : '入口未就绪'}</span></div>
+          <div className="planning-operation-title"><div><strong>MUKU 库存</strong><small>{operations.sitesMcpScheduleConfigured ? `Sites 托管任务每小时检查，允许时效 ${freshness.maxAgeMinutes} 分钟` : `建议每 ${operations.muku.recommendedIntervalMinutes} 分钟检查一次到期状态`}</small></div><span className={`status-pill ${operations.muku.automationReady ? 'success' : ''}`}>{operations.muku.automationReady ? '已调度' : operations.muku.endpointReady ? '仅任务入口' : '入口未就绪'}</span></div>
           <div className="planning-operation-times"><span>最近成功<b>{formatOptionalTime(operations.muku.lastSuccessAt)}</b></span><span>数据有效至<b>{formatOptionalTime(operations.muku.freshUntil)}</b></span><span>建议刷新点<b>{formatOptionalTime(operations.muku.nextRefreshDueAt)}</b></span></div>
-          <small className="planning-operation-config">受保护入口：{operations.muku.endpointReady ? '已就绪' : '未就绪'} · 外部调度：{operations.muku.externalScheduleConfigured ? '已声明配置' : '未确认'}</small>
+          <small className="planning-operation-config">{operations.sitesMcpScheduleConfigured ? `调度方式：Sites MCP 托管任务 · 允许邮箱：${operations.automationAllowedEmailsConfigured ? '已配置' : '未配置'}` : `受保护入口：${operations.muku.endpointReady ? '已就绪' : '未就绪'} · 外部调度：${operations.muku.externalScheduleConfigured ? '已声明配置' : '未确认'}`}</small>
           {[...operations.muku.configurationBlockers, ...operations.muku.dataBlockers].length > 0 && <p>{[...operations.muku.configurationBlockers, ...operations.muku.dataBlockers].join('；')}</p>}
         </article>
         <article className={operations.shopify.stores.length > 0 && operations.shopify.stores.every((store) => store.ready) ? 'ready' : 'blocked'}>
-          <div className="planning-operation-title"><div><strong>Shopify 订单</strong><small>增量补漏建议每 {operations.shopify.recommendedIntervalMinutes} 分钟运行，允许时效 {operations.shopify.maxAgeMinutes} 分钟</small></div><span className={`status-pill ${operations.shopify.automationReady ? 'success' : ''}`}>{operations.shopify.automationReady ? '已调度' : operations.shopify.endpointReady ? '仅任务入口' : '入口未就绪'}</span></div>
+          <div className="planning-operation-title"><div><strong>Shopify 订单</strong><small>{operations.sitesMcpScheduleConfigured ? `Sites 托管任务每小时增量对账，允许时效 ${operations.shopify.maxAgeMinutes} 分钟` : `增量补漏建议每 ${operations.shopify.recommendedIntervalMinutes} 分钟运行，允许时效 ${operations.shopify.maxAgeMinutes} 分钟`}</small></div><span className={`status-pill ${operations.shopify.automationReady ? 'success' : ''}`}>{operations.shopify.automationReady ? '已调度' : operations.shopify.endpointReady ? '仅任务入口' : '入口未就绪'}</span></div>
           <div className="planning-operation-times"><span>最近成功<b>{formatOptionalTime(operations.shopify.lastSuccessAt)}</b></span><span>最早到期<b>{formatOptionalTime(operations.shopify.nextExpiryAt)}</b></span><span>官方店铺<b>{operations.shopify.stores.length || '无'}</b></span></div>
-          <small className="planning-operation-config">受保护入口：{operations.shopify.endpointReady ? '已就绪' : '未就绪'} · 外部调度：{operations.shopify.externalScheduleConfigured ? '已声明配置' : '未确认'}</small>
+          <small className="planning-operation-config">{operations.sitesMcpScheduleConfigured ? `调度方式：Sites MCP 托管任务 · 允许邮箱：${operations.automationAllowedEmailsConfigured ? '已配置' : '未配置'}` : `受保护入口：${operations.shopify.endpointReady ? '已就绪' : '未就绪'} · 外部调度：${operations.shopify.externalScheduleConfigured ? '已声明配置' : '未确认'}`}</small>
           {operations.shopify.stores.length > 0 && <div className="planning-store-syncs">{operations.shopify.stores.map((store) => <span key={store.storeId}><b>{store.storeName}</b>{formatOptionalTime(store.lastSuccessAt)} → {formatOptionalTime(store.freshUntil)}{store.reasons.length ? ` · ${store.reasons.map(planningReasonLabel).join('、')}` : ' · 正常'}</span>)}</div>}
           {operations.shopify.configurationBlockers.length > 0 && <p>{operations.shopify.configurationBlockers.join('；')}</p>}
         </article>

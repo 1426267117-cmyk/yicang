@@ -34,6 +34,10 @@ export function buildProcurementOperationsStatus(input: {
   runtimeEnv: Record<string, unknown>;
 }) {
   const internalJobAuthConfigured = hasSecureInternalJobToken(input.runtimeEnv);
+  const sitesMcpScheduleConfigured = explicitTrue(
+    input.runtimeEnv.ERP_SITES_PROCUREMENT_SCHEDULE_CONFIGURED,
+  );
+  const automationAllowedEmailsConfigured = hasAutomationAllowedEmails(input.runtimeEnv);
   const mukuSourceConfigured = hasMukuSourceConfiguration(input.runtimeEnv);
   const mukuExternalScheduleConfigured = explicitTrue(
     input.runtimeEnv.ERP_MUKU_EXTERNAL_SCHEDULE_CONFIGURED,
@@ -54,15 +58,36 @@ export function buildProcurementOperationsStatus(input: {
   const shopifySourceConfigured = configuredShopifyStoreKeys.size > 0;
   const mukuEndpointReady = internalJobAuthConfigured && mukuSourceConfigured;
   const shopifyEndpointReady = internalJobAuthConfigured && shopifySourceConfigured;
+  const mukuExternalScheduleReady = mukuEndpointReady && mukuExternalScheduleConfigured;
+  const shopifyExternalScheduleReady = shopifyEndpointReady
+    && shopifyExternalScheduleConfigured
+    && shopifyEnvironmentConfigurationValid;
+  const mukuSitesScheduleReady = sitesMcpScheduleConfigured
+    && automationAllowedEmailsConfigured
+    && mukuSourceConfigured;
+  const shopifySitesScheduleReady = sitesMcpScheduleConfigured
+    && automationAllowedEmailsConfigured
+    && shopifySourceConfigured
+    && shopifyEnvironmentConfigurationValid;
+  const mukuAutomationReady = mukuExternalScheduleReady || mukuSitesScheduleReady;
+  const shopifyAutomationReady = shopifyExternalScheduleReady || shopifySitesScheduleReady;
+  const schedulerMode = sitesMcpScheduleConfigured
+    ? 'sites_mcp'
+    : mukuExternalScheduleConfigured || shopifyExternalScheduleConfigured
+      ? 'internal_job'
+      : 'none';
 
   const mukuConfigurationBlockers = [
     !mukuSourceConfigured
       ? 'MUKU 看板只读密钥未配置，受保护刷新任务无法读取数据。'
       : null,
-    !internalJobAuthConfigured
+    !sitesMcpScheduleConfigured && !internalJobAuthConfigured
       ? 'ERP 内部任务密钥未安全配置，调度器不能调用刷新入口。'
       : null,
-    !mukuExternalScheduleConfigured
+    sitesMcpScheduleConfigured && !automationAllowedEmailsConfigured
+      ? 'Sites 托管任务已配置，但采购自动化允许邮箱尚未配置。'
+      : null,
+    !sitesMcpScheduleConfigured && !mukuExternalScheduleConfigured
       ? '尚未确认外部调度器会定期调用 MUKU 刷新入口。'
       : null,
   ].filter((reason): reason is string => reason !== null);
@@ -70,10 +95,13 @@ export function buildProcurementOperationsStatus(input: {
     !shopifySourceConfigured
       ? '尚未发现 Shopify OAuth 授权或服务端 ADMIN_ACCESS_TOKEN。'
       : null,
-    !internalJobAuthConfigured
+    !sitesMcpScheduleConfigured && !internalJobAuthConfigured
       ? 'ERP 内部任务密钥未安全配置，调度器不能调用 Shopify 补漏入口。'
       : null,
-    !shopifyExternalScheduleConfigured
+    sitesMcpScheduleConfigured && !automationAllowedEmailsConfigured
+      ? 'Sites 托管任务已配置，但采购自动化允许邮箱尚未配置。'
+      : null,
+    !sitesMcpScheduleConfigured && !shopifyExternalScheduleConfigured
       ? '尚未确认外部调度器会定期调用 Shopify 增量补漏入口。'
       : null,
     !shopifyEnvironmentConfigurationValid
@@ -100,20 +128,21 @@ export function buildProcurementOperationsStatus(input: {
       guaranteedCollection: false as const,
       shopifySyncTriggered: false as const,
       mukuDueRefreshMayTrigger: mukuSourceConfigured,
-      note: '页面刷新只重新读取当前状态；MUKU 状态到期时可能顺带触发一次后台更新，但这不等于已配置持续采集，Shopify 也不会因刷新页面而同步。',
+      note: sitesMcpScheduleConfigured
+        ? '页面刷新只重新读取当前状态；采购数据由 Sites 托管任务定时刷新，不依赖页面保持打开。'
+        : '页面刷新只重新读取当前状态；MUKU 状态到期时可能顺带触发一次后台更新，但这不等于已配置持续采集，Shopify 也不会因刷新页面而同步。',
     },
     internalJobAuthConfigured,
-    automationReady: mukuEndpointReady
-      && shopifyEndpointReady
-      && shopifyEnvironmentConfigurationValid
-      && mukuExternalScheduleConfigured
-      && shopifyExternalScheduleConfigured,
+    sitesMcpScheduleConfigured,
+    automationAllowedEmailsConfigured,
+    schedulerMode,
+    automationReady: mukuAutomationReady && shopifyAutomationReady,
     muku: {
       protectedEndpoint: MUKU_REFRESH_ENDPOINT,
       endpointReady: mukuEndpointReady,
       sourceConfigured: mukuSourceConfigured,
-      externalScheduleConfigured: mukuExternalScheduleConfigured,
-      automationReady: mukuEndpointReady && mukuExternalScheduleConfigured,
+      externalScheduleConfigured: mukuExternalScheduleConfigured || sitesMcpScheduleConfigured,
+      automationReady: mukuAutomationReady,
       recommendedIntervalMinutes: input.freshness.minRefreshIntervalMinutes,
       dataReady: input.freshness.readyForProcurement,
       sourceGeneratedAt: inventory?.generatedAt ?? null,
@@ -132,10 +161,8 @@ export function buildProcurementOperationsStatus(input: {
       sourceConfigured: shopifySourceConfigured,
       invalidEnvironmentStoreCount: invalidShopifyEnvironmentStores.length,
       invalidEnvironmentStoreKeys: invalidShopifyEnvironmentStores,
-      externalScheduleConfigured: shopifyExternalScheduleConfigured,
-      automationReady: shopifyEndpointReady
-        && shopifyExternalScheduleConfigured
-        && shopifyEnvironmentConfigurationValid,
+      externalScheduleConfigured: shopifyExternalScheduleConfigured || sitesMcpScheduleConfigured,
+      automationReady: shopifyAutomationReady,
       recommendedIntervalMinutes: recommendedShopifyInterval(input.orderSyncMaxAgeMinutes),
       maxAgeMinutes: input.orderSyncMaxAgeMinutes,
       lastSuccessAt: latestTimestamp(shopifyStores.map((store) => store.lastSuccessAt)),
@@ -149,6 +176,15 @@ export function buildProcurementOperationsStatus(input: {
 export function hasSecureInternalJobToken(runtimeEnv: Record<string, unknown>) {
   const value = runtimeEnv.ERP_INTERNAL_JOB_TOKEN;
   return typeof value === 'string' && value.trim().length >= INTERNAL_JOB_TOKEN_MIN_LENGTH;
+}
+
+function hasAutomationAllowedEmails(runtimeEnv: Record<string, unknown>) {
+  const value = runtimeEnv.ERP_AUTOMATION_ALLOWED_EMAILS;
+  if (typeof value !== 'string') return false;
+  return value
+    .split(/[;,\s]+/)
+    .map((email) => email.trim())
+    .some((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
 }
 
 export function externalScheduleConfigured(
