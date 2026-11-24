@@ -39,3 +39,10 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# local migration evidence and databases
+/artifacts/
+*.db
+*.sqlite
+*.sqlite-*
+*.sqlite3
