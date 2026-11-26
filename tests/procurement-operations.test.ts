@@ -137,6 +137,7 @@ describe('采购数据自动化运维状态', () => {
       orderSyncMaxAgeMinutes: 30,
       runtimeEnv: {
         ERP_INTERNAL_JOB_TOKEN: internalToken,
+        SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: 'fixture-bizfurniz-canonical.myshopify.com',
         SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'test-admin-access-token',
       },
     });
@@ -182,6 +183,7 @@ describe('采购数据自动化运维状态', () => {
         ERP_INTERNAL_JOB_TOKEN: internalToken,
         SHOPIFY_ZIMASYA_ADMIN_ACCESS_TOKEN: 'test-bad-store-token',
         SHOPIFY_ZIMASYA_SHOP_DOMAIN: 'not-a-shopify-domain.example',
+        SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: 'fixture-bizfurniz-canonical.myshopify.com',
         SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'test-good-store-token',
       },
     });
@@ -206,6 +208,7 @@ describe('采购数据自动化运维状态', () => {
         ERP_SHOPIFY_RECONCILE_SCHEDULE_CONFIGURED: true,
         SHOPIFY_ZIMASYA_ADMIN_ACCESS_TOKEN: 'test-bad-store-token',
         SHOPIFY_ZIMASYA_SHOP_DOMAIN: 'not-a-shopify-domain.example',
+        SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: 'fixture-bizfurniz-canonical.myshopify.com',
         SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'test-good-store-token',
       },
     });

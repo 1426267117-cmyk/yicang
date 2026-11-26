@@ -1,13 +1,16 @@
-import { describe, expect, it, vi } from 'vitest';
+import { fileURLToPath } from 'node:url';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('cloudflare:workers', () => ({ env: {} }));
 
 import { handleShopifyReconcileRequest } from '../app/api/connectors/shopify/reconcile/route';
+import { openSqliteD1 } from '../lib/aws/sqlite-d1';
 import {
   resolveShopifyStoreConfig,
   type ShopifyCredentialConfig,
   type ShopifyStoreKey,
 } from '../lib/connectors/shopify/config';
+import { saveShopifyOAuthCredential } from '../lib/connectors/shopify/credential-store';
 import { ShopifyConnectorError } from '../lib/connectors/shopify/errors';
 import { reconcileStoredShopifyOrders } from '../lib/connectors/shopify/reconcile';
 
@@ -182,6 +185,7 @@ describe('Shopify 已授权店铺定时对账编排', () => {
     const result = await reconcileStoredShopifyOrders({
       db: {} as D1Database,
       runtimeEnv: {
+        SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: config('bizfurniz').domain,
         SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'secret-environment-access-token',
       },
       requestUrl: 'https://erp.example/api/connectors/shopify/reconcile',
@@ -211,6 +215,7 @@ describe('Shopify 已授权店铺定时对账编排', () => {
     const result = await reconcileStoredShopifyOrders({
       db: {} as D1Database,
       runtimeEnv: {
+        SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: config('bizfurniz').domain,
         SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'secret-environment-access-token',
       },
       requestUrl: 'https://erp.example/api/connectors/shopify/reconcile',
@@ -291,6 +296,7 @@ describe('Shopify 已授权店铺定时对账编排', () => {
     const runtimeEnv = {
       SHOPIFY_ZIMASYA_ADMIN_ACCESS_TOKEN: 'secret-bad-store-token',
       SHOPIFY_ZIMASYA_SHOP_DOMAIN: 'not-a-shopify-domain.example',
+      SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: config('bizfurniz').domain,
       SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'secret-good-store-token',
     };
     const resolveConfig = vi.fn(async (input: { storeKey: ShopifyStoreKey }) => (
@@ -424,6 +430,176 @@ describe('Shopify 已授权店铺定时对账编排', () => {
   });
 });
 
+describe('Shopify 后台首次回补', () => {
+  const tenantId = 'tenant_yicang_primary';
+  const biz = config('bizfurniz');
+  const zimasya = config('zimasya');
+  const firstAt = '2026-11-26T00:03:00.000Z';
+  const firstOrderId = 'gid://shopify/Order/1';
+  const secondOrderId = 'gid://shopify/Order/2';
+  const nextPage = 'checkpoint-from-shopify';
+  const shopId = 'gid://shopify/Shop/7';
+  let connection: ReturnType<typeof openSqliteD1>;
+  let runtimeEnv: Record<string, unknown> & { DB: D1Database };
+
+  beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(firstAt));
+    connection = openSqliteD1(':memory:', fileURLToPath(new URL('../drizzle/', import.meta.url)));
+    const db = connection.db;
+    await db.prepare('INSERT INTO tenants (id, name, created_at) VALUES (?, ?, ?)').bind(tenantId, '测试公司', firstAt).run();
+    runtimeEnv = {
+      DB: db,
+      ERP_INTERNAL_JOB_TOKEN: internalToken,
+      ERP_CONNECTOR_CREDENTIALS_KEY: btoa('x'.repeat(32)),
+      SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: biz.domain,
+      SHOPIFY_ZIMASYA_SHOP_DOMAIN: zimasya.domain,
+    };
+    await saveShopifyOAuthCredential({
+      db, tenantId, runtimeEnv, storeKey: biz.key, shopDomain: biz.domain, officialStoreId: shopId,
+      grantedScopes: 'read_orders', session: { accessToken: 'fixture-token' }, createdBy: 'fixture-operator',
+    });
+  });
+
+  afterEach(() => {
+    connection.close();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function scheduledRun(storeKeys: ShopifyStoreKey[], maxPages = 1) {
+    return handleShopifyReconcileRequest(authorizedRequest({ storeKeys, maxPages }), runtimeEnv, { ensureDatabase: async () => {} });
+  }
+
+  function fixtureShop(domain = biz.domain, id = shopId, scopes = ['read_orders']) {
+    return {
+      shop: { id, myshopifyDomain: domain, name: 'Fixture', ianaTimezone: 'Asia/Shanghai', timezoneOffset: '+0800', currencyCode: 'USD' },
+      currentAppInstallation: { accessScopes: scopes.map((handle) => ({ handle })) },
+    };
+  }
+
+  function syncState() {
+    return connection.db.prepare(`
+      SELECT status, completed_watermark, active_window_start, active_window_end, next_page_cursor
+      FROM connector_sync_state WHERE tenant_id = ? AND connector = 'shopify' AND resource = 'orders'
+    `).bind(tenantId).first();
+  }
+
+  it('按店铺开启、固定七天窗口和断点，完成后按原水位增量去重', async () => {
+    const searches: Array<{ fromAndTo: string; after: string | null }> = [];
+    const fetchMock = vi.fn<typeof fetch>(async (url, init) => {
+      expect(String(url)).toBe(`https://${biz.domain}/admin/api/2026-07/graphql.json`);
+      const operation = JSON.parse(String(init?.body)) as {
+        query: string;
+        variables: { after: string | null; query: string; id: string };
+      };
+      expect(operation.query).toMatch(/^query /);
+      if (operation.query.startsWith('query ErpShopContext')) return Response.json({ data: fixtureShop() });
+      const updatedAt = '2026-11-25T22:00:00.000Z';
+      const pageInfo = { hasNextPage: false, endCursor: null };
+      if (operation.query.startsWith('query ErpOrdersPage')) {
+        searches.push({ fromAndTo: operation.variables.query, after: operation.variables.after });
+        const first = searches.length === 1;
+        const nodes = [{ id: first ? firstOrderId : secondOrderId, updatedAt }];
+        const pagination = first ? { hasNextPage: true, endCursor: nextPage } : pageInfo;
+        return Response.json({ data: { orders: { nodes, pageInfo: pagination } } });
+      }
+      expect(operation.query).toMatch(/^query ErpOrderDetails/);
+      const order = {
+        id: operation.variables.id, name: '#QA', createdAt: updatedAt, updatedAt, currencyCode: 'USD',
+        lineItems: { nodes: [], pageInfo }, refunds: [], fulfillments: [],
+      };
+      return Response.json({ data: { order } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    runtimeEnv.SHOPIFY_ZIMASYA_INITIAL_BACKFILL_ENABLED = 'true';
+    const disabled = await scheduledRun(['bizfurniz']);
+    expect(disabled.status).toBe(207);
+    expect(await disabled.json()).toMatchObject({ failed: [{ storeKey: biz.key, code: 'SHOPIFY_INITIAL_RANGE_REQUIRED' }] });
+    expect(searches).toEqual([]);
+    expect(await syncState()).toBeNull();
+
+    runtimeEnv.SHOPIFY_BIZFURNIZ_INITIAL_BACKFILL_ENABLED = 'true';
+    const partial = await scheduledRun(['bizfurniz']);
+    expect(partial.status).toBe(207);
+    expect(await partial.json()).toMatchObject({ failed: [{ storeKey: biz.key, code: 'SHOPIFY_PAGE_LIMIT_REACHED', retryable: true }] });
+    expect(await syncState()).toEqual({
+      status: 'failed', completed_watermark: null, active_window_start: '2026-11-19T00:03:00.000Z',
+      active_window_end: firstAt, next_page_cursor: nextPage,
+    });
+
+    vi.setSystemTime(new Date('2026-11-26T00:18:00.000Z'));
+    const completed = await scheduledRun(['bizfurniz']);
+    expect(completed.status).toBe(200);
+    expect(await completed.json()).toMatchObject({ synced: [{ storeKey: biz.key, ordersInserted: 1 }] });
+    expect(await syncState()).toEqual({
+      status: 'idle', completed_watermark: firstAt, active_window_start: null, active_window_end: null, next_page_cursor: null,
+    });
+
+    vi.setSystemTime(new Date('2026-11-26T00:33:00.000Z'));
+    const incremental = await scheduledRun(['bizfurniz']);
+    expect(incremental.status).toBe(200);
+    expect(await incremental.json()).toMatchObject({ synced: [{ storeKey: biz.key, ordersInserted: 0, ordersUnchanged: 1 }] });
+    const firstWindow = "updated_at:>='2026-11-19T00:03:00Z' updated_at:<='2026-11-26T00:03:00Z'";
+    expect(searches).toEqual([
+      { fromAndTo: firstWindow, after: null },
+      { fromAndTo: firstWindow, after: nextPage },
+      { fromAndTo: "updated_at:>='2026-11-25T18:03:00Z' updated_at:<='2026-11-26T00:33:00Z'", after: null },
+    ]);
+    const runs = await connection.db.prepare('SELECT mode, status FROM connector_sync_runs ORDER BY started_at').all();
+    expect(runs.results).toEqual([
+      { mode: 'backfill', status: 'failed' }, { mode: 'backfill', status: 'succeeded' }, { mode: 'incremental', status: 'succeeded' },
+    ]);
+    expect(await connection.db.prepare('SELECT COUNT(*) AS total FROM platform_orders').first('total')).toBe(2);
+  });
+
+  it.each([
+    ['gid://shopify/Shop/other', ['read_orders'], 'SHOPIFY_IDENTITY_MISMATCH'],
+    [shopId, ['read_products'], 'SHOPIFY_READ_ORDERS_SCOPE_MISSING'],
+  ] as const)('官方店铺或订单授权不符合时停止首次回补并隔离该店 %s', async (liveShopId, scopes, code) => {
+    runtimeEnv.SHOPIFY_BIZFURNIZ_INITIAL_BACKFILL_ENABLED = 'true';
+    runtimeEnv.SHOPIFY_ZIMASYA_INITIAL_BACKFILL_ENABLED = 'true';
+    await saveShopifyOAuthCredential({
+      db: connection.db, tenantId, runtimeEnv, storeKey: zimasya.key, shopDomain: zimasya.domain,
+      officialStoreId: 'gid://shopify/Shop/8', grantedScopes: 'read_orders',
+      session: { accessToken: 'fixture-second-token' }, createdBy: 'fixture-operator',
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (url, init) => {
+      const { query } = JSON.parse(String(init?.body)) as { query: string };
+      const domain = new URL(String(url)).hostname;
+      if (domain === biz.domain) {
+        expect(query).toMatch(/^query ErpShopContext/);
+        return Response.json({ data: fixtureShop(biz.domain, liveShopId, [...scopes]) });
+      }
+      expect(domain).toBe(zimasya.domain);
+      if (query.startsWith('query ErpShopContext')) return Response.json({ data: fixtureShop(zimasya.domain, 'gid://shopify/Shop/8') });
+      expect(query).toMatch(/^query ErpOrdersPage/);
+      return Response.json({ data: { orders: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await scheduledRun(['bizfurniz', 'zimasya']);
+    expect(result.status).toBe(207);
+    expect(await result.json()).toMatchObject({
+      failed: [{ storeKey: biz.key, code }], synced: [{ storeKey: zimasya.key, ordersInserted: 0 }],
+    });
+    const stores = await connection.db.prepare('SELECT connector_key FROM platform_stores').all();
+    expect(stores.results).toEqual([{ connector_key: zimasya.key }]);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('仅有旧环境令牌时忽略首次回补开关', async () => {
+    runtimeEnv.SHOPIFY_ZIMASYA_ADMIN_ACCESS_TOKEN = 'fixture-legacy-token';
+    runtimeEnv.SHOPIFY_ZIMASYA_INITIAL_BACKFILL_ENABLED = 'true';
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () => Response.json({
+      data: fixtureShop(zimasya.domain, 'gid://shopify/Shop/8'),
+    })));
+    const legacy = await scheduledRun(['zimasya']);
+    expect(legacy.status).toBe(207);
+    expect(await legacy.json()).toMatchObject({ failed: [{ storeKey: zimasya.key, code: 'SHOPIFY_INITIAL_RANGE_REQUIRED' }] });
+    expect(await syncState()).toBeNull();
+  });
+});
+
 function authorizedRequest(body: unknown) {
   return new Request('https://erp.example/api/connectors/shopify/reconcile', {
     method: 'POST',
@@ -437,10 +613,10 @@ function authorizedRequest(body: unknown) {
 
 function config(storeKey: ShopifyStoreKey): ShopifyCredentialConfig {
   const domains: Record<ShopifyStoreKey, string> = {
-    zimasya: '346c85.myshopify.com',
-    kaguyasu: 'officebaseca.myshopify.com',
-    anzhap: 'anzhap.myshopify.com',
-    bizfurniz: 'z6w01w-xs.myshopify.com',
+    zimasya: 'fixture-zimasya.myshopify.com',
+    kaguyasu: 'fixture-kaguyasu.myshopify.com',
+    anzhap: 'fixture-independent-retail-shop.myshopify.com',
+    bizfurniz: 'fixture-bizfurniz-canonical.myshopify.com',
   };
   return {
     key: storeKey,

@@ -39,7 +39,7 @@ type PurchaseDemandSummaryRow = {
 };
 
 export async function getPurchaseDemands(db: D1Database, user: UserContext) {
-  requirePermission(user, 'orders:read');
+  requirePermission(user, 'purchase:read');
   const [rows, summaryRow] = await Promise.all([
     db.prepare(`
       SELECT

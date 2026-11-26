@@ -25,6 +25,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       parsed.data,
       request.headers.get('Idempotency-Key') ?? '',
       {
+        createOrderDraftOnApproval: true,
         developmentOpenAccess: developmentOpenAccessEnabled(
           env as unknown as Record<string, unknown>,
         ),

@@ -1,4 +1,7 @@
+import { isAccessProfile, type AccessProfile } from './domain';
+
 export type ManagedMemberRole = 'admin' | 'operator' | 'viewer';
+export type ManagedMemberSelection = ManagedMemberRole | AccessProfile;
 
 export type ManagedMemberView = {
   id: string;
@@ -7,6 +10,8 @@ export type ManagedMemberView = {
   role: ManagedMemberRole;
   createdAt: string;
   protectedOwner: boolean;
+  accessProfile?: AccessProfile | null;
+  identityProvider?: 'feishu' | 'existing';
 };
 
 export const MEMBER_ROLE_OPTIONS: Array<{
@@ -18,6 +23,31 @@ export const MEMBER_ROLE_OPTIONS: Array<{
   { value: 'operator', label: '操作员', description: '创建和提交申请、维护供应商、下单及登记到货' },
   { value: 'viewer', label: '只读成员', description: '查看订单、库存和采购记录，不执行写入操作' },
 ];
+
+const accessProfileOptions: Array<{ value: AccessProfile; label: string }> = [
+  { value: 'purchase', label: '采购员' },
+  { value: 'finance', label: '财务' },
+  { value: 'amazon', label: '亚马逊运营' },
+  { value: 'wayfair', label: 'Wayfair 运营' },
+  { value: 'shopify', label: '独立站运营' },
+  { value: 'warehouse', label: '仓库' },
+  { value: 'pending', label: '待授权' },
+];
+
+export function memberRoleOptions(member: ManagedMemberView) {
+  const legacy = MEMBER_ROLE_OPTIONS.filter(({ value }) => value === 'admin' || value === memberSelection(member));
+  return [legacy[0], ...accessProfileOptions, ...legacy.slice(1)];
+}
+
+export function memberSelection(member: ManagedMemberView): ManagedMemberSelection {
+  return member.accessProfile ?? member.role;
+}
+
+export function memberRoleLabel(role: ManagedMemberSelection) {
+  return accessProfileOptions.find((option) => option.value === role)?.label
+    ?? MEMBER_ROLE_OPTIONS.find((option) => option.value === role)?.label
+    ?? '待授权';
+}
 
 export function parseManagedMembersResponse(value: unknown): ManagedMemberView[] {
   const root = asRecord(value);
@@ -34,6 +64,8 @@ export function parseManagedMembersResponse(value: unknown): ManagedMemberView[]
       || !isManagedMemberRole(role)
       || typeof member.createdAt !== 'string'
       || typeof member.protectedOwner !== 'boolean'
+      || (member.accessProfile != null && !isAccessProfile(member.accessProfile))
+      || (member.identityProvider !== undefined && member.identityProvider !== 'existing' && member.identityProvider !== 'feishu')
     ) {
       throw new Error('团队成员数据格式无效');
     }
@@ -44,16 +76,18 @@ export function parseManagedMembersResponse(value: unknown): ManagedMemberView[]
       role,
       createdAt: member.createdAt,
       protectedOwner: member.protectedOwner,
+      ...(member.accessProfile !== undefined ? { accessProfile: member.accessProfile as AccessProfile | null } : {}),
+      ...(member.identityProvider ? { identityProvider: member.identityProvider } : {}),
     };
   });
 }
 
 export function memberRoleChangeBlock(
   member: ManagedMemberView,
-  nextRole: ManagedMemberRole,
+  nextRole: ManagedMemberSelection,
   members: ManagedMemberView[],
 ) {
-  if (member.role === nextRole) return null;
+  if (memberSelection(member) === nextRole) return null;
   if (member.protectedOwner && nextRole !== 'admin') {
     return '工作区负责人必须保留管理员角色';
   }

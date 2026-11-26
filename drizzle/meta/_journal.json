@@ -120,6 +120,139 @@
       "when": 1793615923754,
       "tag": "0016_brief_doomsday",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1795505122188,
+      "tag": "0017_manual_purchase_requests",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1795572792143,
+      "tag": "0018_feishu_procurement_previews",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1795573916559,
+      "tag": "0019_feishu_procurement_sync_state",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1795579274465,
+      "tag": "0020_logistics_tracking",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1795579357229,
+      "tag": "0021_purchase_payments",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1795579363667,
+      "tag": "0022_warehouse_stock_counts",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1795579692686,
+      "tag": "0023_warehouse_outbound",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1795579698267,
+      "tag": "0024_purchase_invoices",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1795584818966,
+      "tag": "0025_nine_store_orders",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1795584916804,
+      "tag": "0026_supplier_quotes",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1795584924785,
+      "tag": "0027_purchase_quality",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1795585090459,
+      "tag": "0028_purchase_payment_requests",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1795586812968,
+      "tag": "0029_nine_store_history_and_handoff",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1795591364645,
+      "tag": "0030_purchase_product_details",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1795591437705,
+      "tag": "0031_purchase_product_images",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1795594470808,
+      "tag": "0032_sku_description",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1795596033554,
+      "tag": "0033_member_access_profiles",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1795616967042,
+      "tag": "0034_native_channel_handoff",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "6",
+      "when": 1795622266202,
+      "tag": "0035_shopify_inventory_mirror",
+      "breakpoints": true
     }
   ]
 }

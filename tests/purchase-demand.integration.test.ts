@@ -8,13 +8,13 @@ import { shopifyOrderFixture } from './fixtures/shopify-order';
 
 const tenantId = 'tenant_purchase_test';
 const config: ShopifyCredentialConfig = {
-  key: 'bizfurniz', displayName: 'BizFurniz', domain: 'bizfurniz.myshopify.com',
-  expectedDomain: 'bizfurniz.myshopify.com', environmentPrefix: 'SHOPIFY_BIZFURNIZ',
-  acceptedDomains: ['bizfurniz.myshopify.com'], authMode: 'oauth', credentialRef: 'env:SHOPIFY_BIZFURNIZ',
+  key: 'bizfurniz', displayName: 'BizFurniz', domain: 'fixture-bizfurniz-alias.myshopify.com',
+  expectedDomain: 'fixture-bizfurniz-alias.myshopify.com', environmentPrefix: 'SHOPIFY_BIZFURNIZ',
+  acceptedDomains: ['fixture-bizfurniz-alias.myshopify.com'], authMode: 'oauth', credentialRef: 'env:SHOPIFY_BIZFURNIZ',
   adminAccessToken: null, clientId: null, clientSecret: null,
 };
 const context: ShopifyShopContext = {
-  id: 'gid://shopify/Shop/9001', name: 'BizFurniz', domain: 'bizfurniz.myshopify.com',
+  id: 'gid://shopify/Shop/9001', name: 'BizFurniz', domain: 'fixture-bizfurniz-alias.myshopify.com',
   timezone: 'America/Los_Angeles', timezoneOffset: '-0700', currency: 'USD',
   scopes: new Set(['read_orders', 'read_all_orders']),
 };

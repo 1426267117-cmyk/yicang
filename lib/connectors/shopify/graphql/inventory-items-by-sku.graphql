@@ -1,0 +1,13 @@
+query ErpInventoryItemsBySku($first: Int!, $after: String, $query: String!) {
+  inventoryItems(first: $first, after: $after, query: $query) {
+    nodes {
+      id
+      sku
+      tracked
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}

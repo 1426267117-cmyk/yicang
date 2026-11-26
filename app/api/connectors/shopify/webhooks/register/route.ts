@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:workers';
 import { ensureDatabase } from '../../../../../../db/initialize';
 import { registerStoredShopifyWebhooks } from '../../../../../../lib/connectors/shopify/webhook-maintenance';
+import { shopifyPublicOrigin } from '../../../../../../lib/connectors/shopify/public-origin';
 import { HttpError, jsonError } from '../../../../../../lib/db';
 import {
   InternalJobAuthError,
@@ -19,7 +20,7 @@ export async function POST(request: Request) {
     const result = await registerStoredShopifyWebhooks({
       db,
       runtimeEnv,
-      requestUrl: request.url,
+      requestUrl: shopifyPublicOrigin(runtimeEnv, request.url),
     });
     return Response.json(result, {
       status: result.ok ? 200 : 207,

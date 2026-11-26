@@ -1,0 +1,75 @@
+.filters {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.filters label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.filters span,
+.resultHead {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.resultHead,
+.message,
+.warning {
+  margin: 0;
+  padding: 9px 14px;
+  font-size: 13px;
+}
+
+.message {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  background: #fff5f4;
+  color: #9b3029;
+}
+
+.warning {
+  background: #fff8eb;
+  color: #75430b;
+}
+
+.table table {
+  min-width: 530px;
+}
+
+.table summary {
+  color: var(--erp-blue-dark);
+  cursor: pointer;
+}
+
+.lines {
+  display: grid;
+  gap: 6px;
+  margin: 7px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.lines li {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 5px 12px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+
+.lines small {
+  display: block;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.lines li > span:last-child {
+  white-space: nowrap;
+}

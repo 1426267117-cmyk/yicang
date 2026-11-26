@@ -1,11 +1,13 @@
 import { HttpError, requirePermission, type UserContext } from './db';
-import { ROLE_PERMISSIONS, type Role } from './domain';
+import { isAccessProfile, resolveMemberAccess, type AccessProfile, type Permission, type Role } from './domain';
 
 type MemberRow = {
   id: string;
   email: string;
+  auth_user_id: string;
   display_name: string;
   role: Role;
+  access_profile: string | null;
   created_at: string;
 };
 
@@ -14,6 +16,8 @@ export type ManagedMember = {
   email: string;
   displayName: string;
   role: Role;
+  accessProfile: AccessProfile | null;
+  identityProvider: 'feishu' | 'existing';
   createdAt: string;
   protectedOwner: boolean;
 };
@@ -25,7 +29,7 @@ export async function listManagedMembers(
 ) {
   requirePermission(user, 'members:manage');
   const rows = await db.prepare(`
-    SELECT id, email, display_name, role, created_at
+    SELECT id, auth_user_id, email, display_name, role, access_profile, created_at
     FROM members
     WHERE tenant_id = ?
     ORDER BY
@@ -39,9 +43,8 @@ export async function listManagedMembers(
 export async function updateManagedMemberRole(
   db: D1Database,
   user: UserContext,
-  input: {
+  input: ({ role: Role } | { accessProfile: AccessProfile }) & {
     memberId: string;
-    role: Role;
     bootstrapOwnerEmail: string | null;
   },
 ) {
@@ -52,7 +55,7 @@ export async function updateManagedMemberRole(
   }
 
   const target = await db.prepare(`
-    SELECT id, email, display_name, role, created_at
+    SELECT id, auth_user_id, email, display_name, role, access_profile, created_at
     FROM members
     WHERE tenant_id = ? AND id = ?
     LIMIT 1
@@ -61,47 +64,54 @@ export async function updateManagedMemberRole(
     throw new HttpError(404, '成员不存在或不在当前工作区', 'MEMBER_NOT_FOUND');
   }
 
-  const protectedOwner = isBootstrapOwner(target.email, input.bootstrapOwnerEmail);
-  if (protectedOwner && input.role !== 'admin') {
+  const nextProfile = 'accessProfile' in input ? input.accessProfile : null;
+  const nextRole = 'role' in input ? input.role : nextProfile === 'purchase' ? 'operator' : 'viewer';
+  if (isBootstrapOwner(target, input.bootstrapOwnerEmail) && nextRole !== 'admin') {
     throw new HttpError(409, '工作区负责人必须保留管理员角色', 'BOOTSTRAP_OWNER_ROLE_PROTECTED');
   }
-  if (target.role === input.role) {
+  if (target.role === nextRole && target.access_profile === nextProfile) {
     return { member: toManagedMember(target, input.bootstrapOwnerEmail), replayed: true };
   }
 
-  if (target.role === 'admin' && input.role !== 'admin') {
+  if (target.role === 'admin' && target.access_profile === null && nextRole !== 'admin') {
     const admins = await db.prepare(`
       SELECT COUNT(*) AS count
       FROM members
-      WHERE tenant_id = ? AND role = 'admin'
+      WHERE tenant_id = ? AND role = 'admin' AND access_profile IS NULL
     `).bind(user.tenantId).first<{ count: number }>();
     if (Number(admins?.count ?? 0) <= 1) {
       throw new HttpError(409, '工作区必须至少保留一名管理员', 'LAST_ADMIN_ROLE_PROTECTED');
     }
   }
-  await assertRoleChangeDoesNotStrandProcurement(db, user.tenantId, target.id, input.role);
+  const nextPermissions = resolveMemberAccess(nextRole, nextProfile).permissions;
+  await assertRoleChangeDoesNotStrandProcurement(db, user.tenantId, target.id, nextPermissions);
 
   const now = new Date().toISOString();
   const auditId = crypto.randomUUID();
   const requestId = crypto.randomUUID();
   const protectedEmail = normalizeEmail(input.bootstrapOwnerEmail) ?? '';
-  const nextPermissions = ROLE_PERMISSIONS[input.role];
   const keepsSubmitPermission = nextPermissions.includes('purchase:submit') ? 1 : 0;
   const keepsReviewPermission = nextPermissions.includes('purchase:review') ? 1 : 0;
   const keepsOrderIssuePermission = nextPermissions.includes('purchase:order:issue') ? 1 : 0;
   const results = await db.batch([
     db.prepare(`
       UPDATE members
-      SET role = ?
-      WHERE tenant_id = ? AND id = ? AND role = ?
+      SET role = ?, access_profile = ?
+      WHERE tenant_id = ? AND id = ? AND role = ? AND access_profile IS ?
+        AND EXISTS (
+          SELECT 1 FROM members actor
+          WHERE actor.tenant_id = members.tenant_id AND actor.auth_user_id = ?
+            AND actor.role = 'admin' AND actor.access_profile IS NULL
+        )
         AND (
           ? = 'admin'
           OR (
             role <> 'admin'
-            OR (SELECT COUNT(*) FROM members admins WHERE admins.tenant_id = ? AND admins.role = 'admin') > 1
+            OR access_profile IS NOT NULL
+            OR (SELECT COUNT(*) FROM members admins WHERE admins.tenant_id = ? AND admins.role = 'admin' AND admins.access_profile IS NULL) > 1
           )
         )
-        AND (? = 'admin' OR ? = '' OR lower(email) <> ?)
+        AND (? = 'admin' OR ? = '' OR lower(email) <> ? OR auth_user_id LIKE 'feishu:%')
         AND (
           ? = 1
           OR NOT EXISTS (
@@ -145,13 +155,16 @@ export async function updateManagedMemberRole(
           )
         )
     `).bind(
-      input.role,
+      nextRole,
+      nextProfile,
       user.tenantId,
       target.id,
       target.role,
-      input.role,
+      target.access_profile,
+      user.id,
+      nextRole,
       user.tenantId,
-      input.role,
+      nextRole,
       protectedEmail,
       protectedEmail,
       keepsSubmitPermission,
@@ -171,8 +184,8 @@ export async function updateManagedMemberRole(
       user.id,
       user.email,
       target.id,
-      JSON.stringify({ role: target.role }),
-      JSON.stringify({ role: input.role }),
+      serializeAccess(target.role, target.access_profile),
+      serializeAccess(nextRole, nextProfile),
       requestId,
       `member-role:${target.id}:${auditId}`,
       now,
@@ -180,8 +193,15 @@ export async function updateManagedMemberRole(
   ]);
 
   if (Number(results[0]?.meta.changes ?? 0) !== 1) {
+    const activeAdmin = await db.prepare(`
+      SELECT 1 AS present FROM members
+      WHERE tenant_id = ? AND auth_user_id = ? AND role = 'admin' AND access_profile IS NULL
+    `).bind(user.tenantId, user.id).first<{ present: number }>();
+    if (!activeAdmin) {
+      throw new HttpError(403, '成员管理权限已变更，请刷新后重试', 'PERMISSION_DENIED');
+    }
     const current = await db.prepare(`
-      SELECT id, email, display_name, role, created_at
+      SELECT id, auth_user_id, email, display_name, role, access_profile, created_at
       FROM members
       WHERE tenant_id = ? AND id = ?
       LIMIT 1
@@ -189,15 +209,15 @@ export async function updateManagedMemberRole(
     if (!current) {
       throw new HttpError(404, '成员不存在或不在当前工作区', 'MEMBER_NOT_FOUND');
     }
-    if (isBootstrapOwner(current.email, input.bootstrapOwnerEmail) && input.role !== 'admin') {
+    if (isBootstrapOwner(current, input.bootstrapOwnerEmail) && nextRole !== 'admin') {
       throw new HttpError(409, '工作区负责人必须保留管理员角色', 'BOOTSTRAP_OWNER_ROLE_PROTECTED');
     }
-    await assertRoleChangeDoesNotStrandProcurement(db, user.tenantId, current.id, input.role);
+    await assertRoleChangeDoesNotStrandProcurement(db, user.tenantId, current.id, nextPermissions);
     throw new HttpError(409, '成员角色已变化，请刷新后重试', 'MEMBER_ROLE_CONFLICT');
   }
 
   const updated = await db.prepare(`
-    SELECT id, email, display_name, role, created_at
+    SELECT id, auth_user_id, email, display_name, role, access_profile, created_at
     FROM members
     WHERE tenant_id = ? AND id = ?
     LIMIT 1
@@ -214,14 +234,20 @@ function toManagedMember(row: MemberRow, bootstrapOwnerEmail: string | null): Ma
     email: row.email,
     displayName: row.display_name,
     role: row.role,
+    accessProfile: row.access_profile === null ? null : isAccessProfile(row.access_profile) ? row.access_profile : 'pending',
+    identityProvider: row.auth_user_id.startsWith('feishu:') ? 'feishu' : 'existing',
     createdAt: row.created_at,
-    protectedOwner: isBootstrapOwner(row.email, bootstrapOwnerEmail),
+    protectedOwner: isBootstrapOwner(row, bootstrapOwnerEmail),
   };
 }
 
-function isBootstrapOwner(email: string, bootstrapOwnerEmail: string | null) {
+function serializeAccess(role: Role, profile: string | null) {
+  return JSON.stringify(profile === null ? { role } : { role, accessProfile: profile });
+}
+
+function isBootstrapOwner(member: Pick<MemberRow, 'email' | 'auth_user_id'>, bootstrapOwnerEmail: string | null) {
   const owner = normalizeEmail(bootstrapOwnerEmail);
-  return owner !== null && email.trim().toLowerCase() === owner;
+  return owner !== null && !member.auth_user_id.startsWith('feishu:') && normalizeEmail(member.email) === owner;
 }
 
 function normalizeEmail(email: string | null) {
@@ -233,9 +259,8 @@ async function assertRoleChangeDoesNotStrandProcurement(
   db: D1Database,
   tenantId: string,
   memberId: string,
-  nextRole: Role,
+  permissions: Permission[],
 ) {
-  const permissions = ROLE_PERMISSIONS[nextRole];
   if (!permissions.includes('purchase:submit')) {
     const purchaserAssignments = await db.prepare(`
       SELECT COUNT(*) AS count

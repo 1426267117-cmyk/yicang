@@ -10,6 +10,8 @@ query ErpOrderLineItemsPage($id: ID!, $first: Int!, $after: String!) {
         quantity
         currentQuantity
         unfulfilledQuantity
+        requiresShipping
+        nonFulfillableQuantity
         originalUnitPriceSet { shopMoney { amount currencyCode } }
         originalTotalSet { shopMoney { amount currencyCode } }
         discountedTotalSet { shopMoney { amount currencyCode } }

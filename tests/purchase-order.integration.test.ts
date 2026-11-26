@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { Miniflare } from 'miniflare';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -21,6 +21,7 @@ import {
   createWarehouse,
   executePurchaseOrderAction as executePurchaseOrderActionService,
   getProcurementWorkspaceData,
+  updatePurchaseOrderDraft,
 } from '../lib/purchase-order-service';
 import {
   createPurchaseRequest,
@@ -48,14 +49,17 @@ const reviewerUser: UserContext = {
   email: 'reviewer@example.invalid',
   displayName: '复审员',
 };
+const otherOperator: UserContext = {
+  ...buyerUser, id: 'auth-other-operator', email: 'other-operator@example.invalid', displayName: '另一采购员',
+};
 const config: ShopifyCredentialConfig = {
-  key: 'bizfurniz', displayName: 'BizFurniz', domain: 'bizfurniz.myshopify.com',
-  expectedDomain: 'bizfurniz.myshopify.com', acceptedDomains: ['bizfurniz.myshopify.com'],
+  key: 'bizfurniz', displayName: 'BizFurniz', domain: 'fixture-bizfurniz-alias.myshopify.com',
+  expectedDomain: 'fixture-bizfurniz-alias.myshopify.com', acceptedDomains: ['fixture-bizfurniz-alias.myshopify.com'],
   environmentPrefix: 'SHOPIFY_BIZFURNIZ', authMode: 'oauth', credentialRef: 'env:test',
   adminAccessToken: null, clientId: null, clientSecret: null,
 };
 const shopContext: ShopifyShopContext = {
-  id: 'gid://shopify/Shop/9001', name: 'BizFurniz', domain: 'bizfurniz.myshopify.com',
+  id: 'gid://shopify/Shop/9001', name: 'BizFurniz', domain: 'fixture-bizfurniz-alias.myshopify.com',
   timezone: 'America/Los_Angeles', timezoneOffset: '-0700', currency: 'USD',
   scopes: new Set(['read_orders']),
 };
@@ -64,7 +68,7 @@ function executePurchaseOrderAction(
   database: D1Database,
   actor: UserContext,
   purchaseOrderId: string,
-  input: { action: 'issue' | 'cancel' | 'close'; note?: string },
+  input: { action: 'issue' | 'cancel' | 'close'; note?: string; expectedVersion?: number },
   idempotencyKey: string,
 ) {
   return executePurchaseOrderActionService(
@@ -325,6 +329,119 @@ describe('正式采购单与到货入库闭环', () => {
     expect(stored?.status).toBe('draft');
   });
 
+  it('草稿可更新交期、条款和单价并保留来源及快照，重复保存只写一次审计', async () => {
+    const { supplier } = await createSupplier(db, user, {
+      code: 'SUP-EDIT-DRAFT', name: '草稿编辑供应商',
+    }, 'supplier-edit-draft-0001');
+    const { purchaseOrder: original } = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
+      paymentTerms: '旧付款条款',
+      tradeTerms: '旧贸易条款',
+      note: '旧备注',
+    }, 'po-edit-draft-create-0001');
+    const input = {
+      expectedVersion: original.version,
+      expectedDeliveryAt: '2026-12-01',
+      currency: 'cny',
+      paymentTerms: ' 货到付款 ',
+      note: ' 更新后的备注 ',
+      lineCosts: [{
+        purchaseRequestLineId: original.lines[0].purchaseRequestLineId,
+        unitCostMinor: 1250,
+      }],
+    };
+    const [first, second] = await Promise.all([
+      updatePurchaseOrderDraft(db, buyerUser, original.id, input, 'po-edit-draft-0001'),
+      updatePurchaseOrderDraft(db, buyerUser, original.id, input, 'po-edit-draft-0001'),
+    ]);
+    expect([first.replayed, second.replayed].sort()).toEqual([false, true]);
+    expect(first.purchaseOrder).toMatchObject({
+      status: 'draft',
+      version: original.version + 1,
+      purchaseRequestId: approvedRequestId,
+      orderNo: original.orderNo,
+      supplier: original.supplier,
+      deliveryWarehouse: original.deliveryWarehouse,
+      expectedDeliveryAt: '2026-12-01',
+      currency: 'CNY',
+      paymentTerms: '货到付款',
+      tradeTerms: null,
+      note: '更新后的备注',
+      lines: [{
+        ...original.lines[0],
+        unitCostMinor: 1250,
+        currency: 'CNY',
+      }],
+    });
+    await expect(updatePurchaseOrderDraft(
+      db, buyerUser, original.id, { ...input, note: '不同参数' }, 'po-edit-draft-0001',
+    )).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+
+    const audit = await db.prepare(`
+      SELECT before_json, after_json FROM audit_logs
+      WHERE tenant_id = ? AND entity_id = ? AND action = 'UPDATE_PURCHASE_ORDER_DRAFT'
+    `).bind(tenantId, original.id).all<{ before_json: string; after_json: string }>();
+    expect(audit.results).toHaveLength(1);
+    expect(JSON.parse(audit.results[0].before_json)).toMatchObject({
+      paymentTerms: '旧付款条款',
+      lineCosts: [{ unitCostMinor: 100, currency: 'USD' }],
+    });
+    expect(JSON.parse(audit.results[0].after_json)).toMatchObject({
+      version: original.version + 1,
+      paymentTerms: '货到付款',
+      lineCosts: [{ unitCostMinor: 1250 }],
+    });
+  });
+
+  it('负责人或管理员可改草稿，拒绝旧版本确认及已下单修改', async () => {
+    const { supplier } = await createSupplier(db, user, {
+      code: 'SUP-EDIT-GUARDS', name: '草稿防护供应商',
+    }, 'supplier-edit-guards-0001');
+    const { purchaseOrder: original } = await createPurchaseOrder(db, buyerUser, {
+      purchaseRequestId: approvedRequestId,
+      supplierId: supplier.id,
+      ...(await readyPurchaseOrderFields(db, approvedRequestId)),
+    }, 'po-edit-guards-create-0001');
+    const input = {
+      expectedVersion: original.version,
+      expectedDeliveryAt: '2026-12-01',
+      currency: 'USD',
+      lineCosts: [{ purchaseRequestLineId: original.lines[0].purchaseRequestLineId, unitCostMinor: 200 }],
+    };
+    await expect(updatePurchaseOrderDraft(
+      db, otherOperator, original.id, input, 'po-edit-guards-denied-0001',
+    )).rejects.toMatchObject({ code: 'PURCHASE_ORDER_PURCHASER_REQUIRED' });
+    await expect(updatePurchaseOrderDraft(
+      db, { ...buyerUser, permissions: ROLE_PERMISSIONS.viewer }, original.id, input, 'po-edit-guards-denied-0002',
+    )).rejects.toMatchObject({ status: 403 });
+    await expect(updatePurchaseOrderDraft(
+      db, buyerUser, original.id, { ...input, lineCosts: [] }, 'po-edit-guards-line-invalid-0001',
+    )).rejects.toMatchObject({ code: 'PURCHASE_ORDER_LINE_INVALID' });
+
+    const { purchaseOrder: updated } = await updatePurchaseOrderDraft(
+      db, reviewerUser, original.id, input, 'po-edit-guards-update-0001',
+    );
+    await expect(updatePurchaseOrderDraft(
+      db, buyerUser, original.id, input, 'po-edit-guards-stale-0001',
+    )).rejects.toMatchObject({ code: 'CONCURRENT_UPDATE' });
+    await expect(executePurchaseOrderAction(
+      db, buyerUser, original.id, { action: 'issue', expectedVersion: original.version }, 'po-edit-guards-issue-0001',
+    )).rejects.toMatchObject({ code: 'CONCURRENT_UPDATE' });
+    const issue = { action: 'issue', expectedVersion: updated.version } as const;
+    const { purchaseOrder: issued } = await executePurchaseOrderAction(
+      db, buyerUser, original.id, issue, 'po-edit-guards-issue-0002',
+    );
+    expect(issued.status).toBe('issued');
+    await expect(executePurchaseOrderAction(
+      db, buyerUser, original.id, issue, 'po-edit-guards-issue-0002',
+    )).resolves.toMatchObject({ replayed: true });
+    await expect(updatePurchaseOrderDraft(
+      db, buyerUser, original.id, { ...input, expectedVersion: issued.version }, 'po-edit-guards-issued-0001',
+    )).rejects.toMatchObject({ code: 'PURCHASE_ORDER_NOT_EDITABLE' });
+  });
+
   it('正式下单缺仓库、交期、币种或单价时 fail-closed，完整采购单才能确认', async () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-ISSUE-GUARD', name: '正式下单校验供应商',
@@ -346,6 +463,13 @@ describe('正式采购单与到货入库闭环', () => {
       currency: 'USD',
       lineCosts: cost,
     }, 'po-issue-guard-create-no-warehouse');
+    const withoutWarehouse = await updatePurchaseOrderDraft(db, buyerUser, missingWarehouse.purchaseOrder.id, {
+      expectedVersion: missingWarehouse.purchaseOrder.version,
+      expectedDeliveryAt: '2026-12-01',
+      currency: 'USD',
+      lineCosts: cost,
+    }, 'po-issue-guard-update-no-warehouse');
+    expect(withoutWarehouse.purchaseOrder.deliveryWarehouse).toBeNull();
     await expect(executePurchaseOrderAction(db, buyerUser, missingWarehouse.purchaseOrder.id, {
       action: 'issue',
     }, 'po-issue-guard-issue-no-warehouse')).rejects.toMatchObject({
@@ -605,12 +729,12 @@ describe('正式采购单与到货入库闭环', () => {
     expect(legacyCompatible.deliveryWarehouse).toBeNull();
   });
 
-  it('只有来源申请指定的采购负责人可生成、确认或取消采购单', async () => {
+  it('复审管理员可为员工生成和确认采购单，取消仍由采购负责人办理', async () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-OWNER', name: '负责人权限测试供应商',
     }, 'supplier-create-owner-0001');
 
-    await expect(createPurchaseOrder(db, user, {
+    await expect(createPurchaseOrder(db, otherOperator, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
     }, 'purchase-order-owner-denied-0001')).rejects.toMatchObject({
@@ -618,14 +742,14 @@ describe('正式采购单与到货入库闭环', () => {
       code: 'PURCHASE_ORDER_PURCHASER_REQUIRED',
     });
 
-    const created = await createPurchaseOrder(db, buyerUser, {
+    const created = await createPurchaseOrder(db, reviewerUser, {
       purchaseRequestId: approvedRequestId,
       supplierId: supplier.supplier.id,
       ...(await readyPurchaseOrderFields(db, approvedRequestId)),
     }, 'purchase-order-owner-create-0001');
-    await expect(executePurchaseOrderAction(db, user, created.purchaseOrder.id, {
+    await expect(executePurchaseOrderAction(db, otherOperator, created.purchaseOrder.id, {
       action: 'issue',
-    }, 'purchase-order-owner-admin-denied-0001')).rejects.toMatchObject({
+    }, 'purchase-order-owner-operator-denied-0001')).rejects.toMatchObject({
       status: 403,
       code: 'PURCHASE_ORDER_PURCHASER_REQUIRED',
     });
@@ -635,13 +759,17 @@ describe('正式采购单与到货入库闭环', () => {
       status: 403,
       code: 'PURCHASE_ORDER_PURCHASER_REQUIRED',
     });
-    const issued = await executePurchaseOrderAction(db, buyerUser, created.purchaseOrder.id, {
+    const issued = await executePurchaseOrderAction(db, reviewerUser, created.purchaseOrder.id, {
       action: 'issue',
     }, 'purchase-order-owner-issue-0001');
-    expect(issued.purchaseOrder.status).toBe('issued');
+    expect(issued.purchaseOrder).toMatchObject({ status: 'issued', purchaserMemberId: 'member-buyer' });
+    for (const action of ['CREATE_PURCHASE_ORDER', 'ISSUE_PURCHASE_ORDER']) {
+      expect(await db.prepare('SELECT actor_id FROM audit_logs WHERE tenant_id = ? AND entity_id = ? AND action = ?')
+        .bind(tenantId, issued.purchaseOrder.id, action).first('actor_id')).toBe(reviewerUser.id);
+    }
   });
 
-  it('开发开放模式允许换账号接续转单、下单和关闭，正式模式仍拒绝', async () => {
+  it('开发开放模式允许普通操作员接续转单、下单和关闭，正式模式仍按采购分工', async () => {
     const supplier = await createSupplier(db, user, {
       code: 'SUP-ACCOUNT-HANDOFF', name: '换账号交接测试供应商',
     }, 'supplier-account-handoff-0001');
@@ -653,21 +781,21 @@ describe('正式采购单与到货入库闭环', () => {
 
     await expect(createPurchaseOrder(
       db,
-      user,
+      otherOperator,
       input,
       'purchase-order-account-handoff-formal-create',
     )).rejects.toMatchObject({ code: 'PURCHASE_ORDER_PURCHASER_REQUIRED' });
 
     const created = await createPurchaseOrder(
       db,
-      user,
+      otherOperator,
       input,
       'purchase-order-account-handoff-open-create',
       { developmentOpenAccess: true },
     );
     await expect(executePurchaseOrderActionService(
       db,
-      user,
+      otherOperator,
       created.purchaseOrder.id,
       { action: 'issue' },
       'purchase-order-account-handoff-formal-issue',
@@ -676,7 +804,7 @@ describe('正式采购单与到货入库闭环', () => {
 
     const issued = await executePurchaseOrderActionService(
       db,
-      user,
+      otherOperator,
       created.purchaseOrder.id,
       { action: 'issue', note: '换账号继续确认下单' },
       'purchase-order-account-handoff-open-issue',
@@ -689,7 +817,7 @@ describe('正式采购单与到货入库闭环', () => {
 
     await expect(executePurchaseOrderActionService(
       db,
-      user,
+      otherOperator,
       created.purchaseOrder.id,
       { action: 'close', note: '供应商无法继续交货' },
       'purchase-order-account-handoff-formal-close',
@@ -698,7 +826,7 @@ describe('正式采购单与到货入库闭环', () => {
 
     const closed = await executePurchaseOrderActionService(
       db,
-      user,
+      otherOperator,
       created.purchaseOrder.id,
       { action: 'close', note: '供应商无法继续交货' },
       'purchase-order-account-handoff-open-close',
@@ -715,7 +843,7 @@ describe('正式采购单与到货入库闭环', () => {
         AND action IN ('CREATE_PURCHASE_ORDER', 'ISSUE_PURCHASE_ORDER', 'CLOSE_PURCHASE_ORDER_REMAINDER')
     `).bind(tenantId, created.purchaseOrder.id).all<{ action: string; actor_email: string }>();
     expect(audit.results).toHaveLength(3);
-    expect(audit.results.every((row) => row.actor_email === user.email)).toBe(true);
+    expect(audit.results.every((row) => row.actor_email === otherOperator.email)).toBe(true);
   });
 
   it('采购单文档允许只读角色按当前租户读取，并拒绝跨租户标识', async () => {
@@ -1419,6 +1547,8 @@ async function seedFoundation(db: D1Database) {
       VALUES ('member-buyer', ?, 'auth-buyer', 'buyer@example.invalid', '采购员', 'operator', ?)`).bind(tenantId, now),
     db.prepare(`INSERT INTO members (id, tenant_id, auth_user_id, email, display_name, role, created_at)
       VALUES ('member-reviewer', ?, 'auth-reviewer', 'reviewer@example.invalid', '复审员', 'admin', ?)`).bind(tenantId, now),
+    db.prepare(`INSERT INTO members (id, tenant_id, auth_user_id, email, display_name, role, created_at)
+      VALUES ('member-other-operator', ?, ?, ?, '另一采购员', 'operator', ?)`).bind(tenantId, otherOperator.id, otherOperator.email, now),
     db.prepare(`INSERT INTO warehouses (id, tenant_id, code, name, created_at)
       VALUES ('warehouse-main', ?, 'MAIN', '主仓', ?)`).bind(tenantId, now),
     db.prepare(`INSERT INTO tenants (id, name, created_at)
@@ -1501,24 +1631,10 @@ async function inventoryOnHand(db: D1Database) {
 }
 
 async function applyMigrations(db: D1Database) {
-  for (const migration of [
-    '../drizzle/0000_wooden_deathstrike.sql',
-    '../drizzle/0001_premium_the_stranger.sql',
-    '../drizzle/0002_organic_titanium_man.sql',
-    '../drizzle/0003_fancy_jane_foster.sql',
-    '../drizzle/0004_illegal_black_panther.sql',
-    '../drizzle/0005_chilly_obadiah_stane.sql',
-    '../drizzle/0006_soft_wither.sql',
-    '../drizzle/0007_worried_stone_men.sql',
-    '../drizzle/0008_nifty_mimic.sql',
-    '../drizzle/0009_shocking_iron_lad.sql',
-    '../drizzle/0014_clever_silvermane.sql',
-    '../drizzle/0015_true_tigra.sql',
-    '../drizzle/0016_brief_doomsday.sql',
-  ]) {
-    const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
-    for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {
-      await db.prepare(statement).run();
-    }
+  const directory = new URL('../drizzle/', import.meta.url);
+  for (const migration of readdirSync(directory).filter((name) => name.endsWith('.sql')).sort()) {
+    const sql = readFileSync(new URL(migration, directory), 'utf8');
+    const statements = sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean);
+    await db.batch(statements.map((statement) => db.prepare(statement)));
   }
 }

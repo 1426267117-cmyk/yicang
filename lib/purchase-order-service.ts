@@ -4,10 +4,13 @@ import type {
   CreateSupplierInput,
   CreateWarehouseInput,
   PurchaseOrderActionInput,
+  UpdatePurchaseOrderDraftInput,
 } from './contracts';
 import type { PurchasePlanningEvidence } from './purchase-planning-service';
+import type { PurchaseRequestSource } from './purchase-workflow-service';
 import { HttpError, requirePermission, type UserContext } from './db';
 import { sha256Hex, stableJson } from './connectors/stable';
+import { parsePurchaseProductDetails, resolvePurchaseProductDetails } from './purchase-product-details';
 
 type PurchaseOrderStatus = 'draft' | 'issued' | 'partially_received' | 'received' | 'closed_short' | 'cancelled';
 
@@ -45,7 +48,7 @@ type PurchaseOrderRow = {
   purchase_request_id: string;
   purchase_request_no: string;
   purchaser_member_id: string;
-  supplier_id: string;
+  supplier_id: string | null;
   supplier_code: string;
   supplier_name: string;
   supplier_contact_name: string | null;
@@ -82,7 +85,9 @@ type PurchaseOrderIssueReadinessRow = {
   status: PurchaseOrderStatus;
   version: number;
   purchase_request_id: string;
-  supplier_active: number;
+  request_source: PurchaseRequestSource;
+  supplier_id: string | null;
+  supplier_active: number | null;
   delivery_warehouse_id: string | null;
   expected_delivery_at: string | null;
   currency: string | null;
@@ -92,6 +97,23 @@ type PurchaseOrderIssueReadinessRow = {
   line_currency_mismatch_count: number;
   planning_audit_json: string | null;
   source_ready: number;
+};
+
+type PurchaseOrderPlanningSource = Pick<PurchaseOrderIssueReadinessRow, 'request_source' | 'planning_audit_json'>;
+type PurchaseOrderWriteOptions = {
+  developmentOpenAccess?: boolean;
+  planningNow?: Date;
+  validatePlanningEvidence?: (
+    db: D1Database,
+    user: UserContext,
+    purchaseRequestId: string,
+    evidence: PurchasePlanningEvidence,
+  ) => Promise<void>;
+};
+type PurchaseOrderActor = {
+  memberId: string;
+  developmentOpenAccess: boolean;
+  canActAsAdministrator: boolean;
 };
 
 type PurchaseOrderLineRow = {
@@ -105,6 +127,7 @@ type PurchaseOrderLineRow = {
   received_quantity: number;
   unit_cost_minor: number | null;
   currency: string | null;
+  product_details_json: string | null;
 };
 
 type PurchaseReceiptRow = {
@@ -142,13 +165,17 @@ type RequestLineRow = {
   sku_id: string;
   sku_code: string;
   sku_name: string;
+  sku_active: number;
   requested_quantity: number;
   active: number;
+  product_details_json: string | null;
+  purchase_demand_id: string | null;
   demand_status: string | null;
   demand_mapped_sku_id: string | null;
   demand_required_quantity: number | null;
   demand_source_updated_at: string | null;
-  source_updated_at: string;
+  source_required_quantity: number | null;
+  source_updated_at: string | null;
 };
 
 type ReceiptTargetLineRow = {
@@ -325,21 +352,9 @@ export async function getProcurementWorkspaceData(db: D1Database, user: UserCont
     `).bind(user.tenantId).first<ProcurementSummaryRow>(),
   ]);
 
-  const linesByOrder = new Map<string, ReturnType<typeof mapPurchaseOrderLine>[]>();
-  for (const row of orderLineRows.results) {
-    const lines = linesByOrder.get(row.purchase_order_id) ?? [];
-    lines.push(mapPurchaseOrderLine(row));
-    linesByOrder.set(row.purchase_order_id, lines);
-  }
-  const linesByReceipt = new Map<string, ReturnType<typeof mapPurchaseReceiptLine>[]>();
-  for (const row of receiptLineRows.results) {
-    const lines = linesByReceipt.get(row.purchase_receipt_id) ?? [];
-    lines.push(mapPurchaseReceiptLine(row));
-    linesByReceipt.set(row.purchase_receipt_id, lines);
-  }
-
-  const purchaseOrders = orderRows.results.map((row) => mapPurchaseOrder(row, linesByOrder.get(row.id) ?? []));
-  const purchaseReceipts = receiptRows.results.map((row) => mapPurchaseReceipt(row, linesByReceipt.get(row.id) ?? []));
+  const { purchaseOrders, purchaseReceipts } = mapProcurementRecords(
+    orderRows.results, orderLineRows.results, receiptRows.results, receiptLineRows.results,
+  );
   return {
     suppliers: supplierRows.results.map(mapSupplier),
     warehouses: warehouseRows.results.map(mapWarehouse),
@@ -358,6 +373,43 @@ export async function getProcurementWorkspaceData(db: D1Database, user: UserCont
       correctedQuantity: Number(summaryRow?.corrected_quantity ?? 0),
       receivedQuantity: Number(summaryRow?.received_quantity ?? 0),
     },
+  };
+}
+
+export function toWarehousePurchaseOrder(order: NonNullable<Awaited<ReturnType<typeof getPurchaseOrder>>>) {
+  const { id, orderNo, status, deliveryWarehouse, expectedDeliveryAt, orderedQuantity, receivedQuantity, lines } = order;
+  return { id, orderNo, status, deliveryWarehouse, expectedDeliveryAt, orderedQuantity, receivedQuantity,
+    supplier: order.supplier ? { name: order.supplier.name } : null,
+    lines: lines.map(({ id, skuCode, skuName, remainingQuantity }) => ({ id, skuCode, skuName, remainingQuantity })),
+  };
+}
+
+export async function getWarehouseWorkspaceData(db: D1Database, user: UserContext) {
+  requirePermission(user, 'warehouse:read');
+  const tenantId = user.tenantId;
+  const pending = "po.tenant_id = ? AND po.status IN ('issued', 'partially_received')";
+  const recentReceipt = `receipt.tenant_id = ? AND receipt.id IN (
+    SELECT id FROM purchase_receipts WHERE tenant_id = ? ORDER BY created_at DESC, id DESC LIMIT 500
+  )`;
+  const [warehouses, orders, orderLines, receipts, receiptLines, receiptCount] = await Promise.all([
+    db.prepare(`SELECT id, code, name, contact_name, contact_phone, address, created_at FROM warehouses
+      WHERE tenant_id = ? ORDER BY code, name LIMIT 500`).bind(tenantId).all<WarehouseRow>(),
+    db.prepare(`${PURCHASE_ORDER_SELECT} WHERE ${pending} GROUP BY po.id ORDER BY po.created_at, po.id`)
+      .bind(tenantId).all<PurchaseOrderRow>(),
+    db.prepare(`${PURCHASE_ORDER_LINE_SELECT} WHERE ${pending} ORDER BY line.created_at, line.id`)
+      .bind(tenantId).all<PurchaseOrderLineRow>(),
+    db.prepare(`${PURCHASE_RECEIPT_SELECT} WHERE ${recentReceipt} GROUP BY receipt.id ORDER BY receipt.created_at DESC, receipt.id DESC`)
+      .bind(tenantId, tenantId).all<PurchaseReceiptRow>(),
+    db.prepare(`${PURCHASE_RECEIPT_LINE_SELECT} WHERE ${recentReceipt} ORDER BY line.created_at, line.id`)
+      .bind(tenantId, tenantId).all<PurchaseReceiptLineRow>(),
+    db.prepare('SELECT COUNT(*) AS count FROM purchase_receipts WHERE tenant_id = ?').bind(tenantId).first<{ count: number }>(),
+  ]);
+  const { purchaseOrders, purchaseReceipts } = mapProcurementRecords(orders.results, orderLines.results, receipts.results, receiptLines.results);
+  return {
+    warehouses: warehouses.results.map(mapWarehouse),
+    purchaseOrders: purchaseOrders.map(toWarehousePurchaseOrder),
+    purchaseReceipts,
+    procurementSummary: { receiptCount: Number(receiptCount?.count ?? 0) },
   };
 }
 
@@ -517,18 +569,87 @@ export async function createSupplier(
   return { supplier: await getSupplier(db, user.tenantId, supplierId), replayed: false };
 }
 
+const ORDER_LINE_PRODUCT_DETAILS_SQL = `COALESCE(line.product_details_json, CASE
+  WHEN sku.specification IS NOT NULL OR sku.dimensions IS NOT NULL OR sku.image_url IS NOT NULL OR sku.description IS NOT NULL
+  THEN json_object('name', sku.name, 'specification', sku.specification, 'dimensions', sku.dimensions,
+    'imageUrl', sku.image_url, 'description', sku.description)
+  ELSE NULL END)`;
+
+export async function prepareApprovedPurchaseOrderDraft(
+  db: D1Database,
+  user: UserContext,
+  args: { purchaseRequestId: string; approvedVersion: number; approvalIdempotencyKey: string; actorMemberId: string; now: string },
+): Promise<D1PreparedStatement[]> {
+  const orderId = crypto.randomUUID();
+  const orderNo = createDocumentNumber('CGD');
+  const idempotencyKey = await approvedDraftKey(args.purchaseRequestId, args.approvalIdempotencyKey);
+  const { purchaseRequestId, approvedVersion, approvalIdempotencyKey, actorMemberId, now } = args;
+  const draftExistsSql = 'EXISTS (SELECT 1 FROM purchase_orders WHERE id = ? AND tenant_id = ?)';
+  return [
+    db.prepare(`
+      INSERT INTO purchase_orders (
+        id, tenant_id, order_no, purchase_request_id, status, version,
+        idempotency_key, request_hash, last_action_key, created_by_member_id, created_at, updated_at
+      )
+      SELECT ?, request.tenant_id, ?, request.id, 'draft', 1, ?, ?, ?, ?, ?, ?
+      FROM purchase_requests request
+      WHERE request.tenant_id = ? AND request.id = ? AND request.status = 'approved'
+        AND request.version = ? AND request.last_action_key = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM purchase_orders existing
+          WHERE existing.tenant_id = request.tenant_id AND existing.purchase_request_id = request.id
+            AND (existing.status <> 'cancelled' OR existing.idempotency_key = ?)
+        )
+    `).bind(orderId, orderNo, idempotencyKey, await hashPayload({ purchaseRequestId, approvalIdempotencyKey }),
+      idempotencyKey, actorMemberId, now, now, user.tenantId, purchaseRequestId, approvedVersion,
+      approvalIdempotencyKey, idempotencyKey),
+    db.prepare(`
+      INSERT INTO purchase_order_lines (
+        id, tenant_id, purchase_order_id, purchase_request_line_id, sku_id, sku_code_snapshot,
+        sku_name_snapshot, ordered_quantity, received_quantity, product_details_json, created_at, updated_at
+      )
+      SELECT lower(hex(randomblob(16))), line.tenant_id, ?, line.id, line.sku_id, sku.code,
+        sku.name, line.requested_quantity, 0, ${ORDER_LINE_PRODUCT_DETAILS_SQL}, ?, ?
+      FROM purchase_request_lines line
+      JOIN skus sku ON sku.tenant_id = line.tenant_id AND sku.id = line.sku_id
+      WHERE line.tenant_id = ? AND line.request_id = ? AND line.active = 1 AND ${draftExistsSql}
+    `).bind(orderId, now, now, user.tenantId, purchaseRequestId, orderId, user.tenantId),
+    auditStatement(db, user, {
+      action: 'CREATE_PURCHASE_ORDER', entityType: 'purchase_order', entityId: orderId, beforeJson: null,
+      afterJson: stableJson({ orderNo, purchaseRequestId, supplierId: null, autoFromApproval: true }),
+      idempotencyKey, now, onlyWhenSql: draftExistsSql, onlyWhenBindings: [orderId, user.tenantId],
+    }),
+  ];
+}
+
+export async function getPurchaseOrderForApproval(
+  db: D1Database, tenantId: string, purchaseRequestId: string, approvalIdempotencyKey: string,
+) {
+  const idempotencyKey = await approvedDraftKey(purchaseRequestId, approvalIdempotencyKey);
+  const row = await db.prepare(`
+    SELECT id FROM purchase_orders WHERE tenant_id = ? AND purchase_request_id = ? AND idempotency_key = ?
+  `).bind(tenantId, purchaseRequestId, idempotencyKey).first<{ id: string }>();
+  return row ? getPurchaseOrder(db, tenantId, row.id) : null;
+}
+
+async function approvedDraftKey(purchaseRequestId: string, approvalIdempotencyKey: string) {
+  return `approval-draft:${await hashPayload([purchaseRequestId, approvalIdempotencyKey])}`;
+}
+
 export async function createPurchaseOrder(
   db: D1Database,
   user: UserContext,
   input: CreatePurchaseOrderInput,
   idempotencyKey: string,
-  options: { developmentOpenAccess?: boolean } = {},
+  options: PurchaseOrderWriteOptions = {},
 ) {
   requirePermission(user, 'purchase:order:create');
+  if (input.issue) requirePermission(user, 'purchase:order:issue');
   validateIdempotencyKey(idempotencyKey);
+  const developmentOpenAccess = options.developmentOpenAccess === true;
   const normalized = {
     purchaseRequestId: input.purchaseRequestId.trim(),
-    supplierId: input.supplierId.trim(),
+    supplierId: input.supplierId?.trim() || null,
     deliveryWarehouseId: input.deliveryWarehouseId?.trim() || null,
     expectedDeliveryAt: input.expectedDeliveryAt ?? null,
     paymentTerms: input.paymentTerms?.trim() || null,
@@ -536,15 +657,18 @@ export async function createPurchaseOrder(
     currency: input.currency?.trim().toUpperCase() || null,
     note: input.note?.trim() || null,
     lineCosts: [...(input.lineCosts ?? [])]
-      .map((line) => ({ purchaseRequestLineId: line.purchaseRequestLineId.trim(), unitCostMinor: line.unitCostMinor }))
+      .map(({ purchaseRequestLineId, unitCostMinor, productDetails }) => ({
+        purchaseRequestLineId: purchaseRequestLineId.trim(), unitCostMinor, productDetails,
+      }))
       .sort((left, right) => left.purchaseRequestLineId.localeCompare(right.purchaseRequestLineId)),
+    ...(input.issue ? { issue: true } : {}),
   };
   const requestHash = await hashPayload(normalized);
-  const actorMemberId = await assertPurchaseRequestPurchaser(
+  const actor = await authorizePurchaseOrderCreation(
     db,
     user,
     normalized.purchaseRequestId,
-    options.developmentOpenAccess === true,
+    developmentOpenAccess,
   );
   const replay = await db.prepare(`
     SELECT id, request_hash FROM purchase_orders
@@ -557,7 +681,7 @@ export async function createPurchaseOrder(
   }
 
   const [supplier, deliveryWarehouse, request, requestLines] = await Promise.all([
-    db.prepare(`
+    normalized.supplierId ? db.prepare(`
       SELECT id, code, name, contact_name, contact_phone, contact_email, address
       FROM suppliers
       WHERE tenant_id = ? AND id = ? AND active = 1
@@ -570,7 +694,7 @@ export async function createPurchaseOrder(
       contact_phone: string | null;
       contact_email: string | null;
       address: string | null;
-    }>(),
+    }>() : null,
     normalized.deliveryWarehouseId
       ? db.prepare(`
           SELECT id, code, name, contact_name, contact_phone, address, created_at
@@ -580,15 +704,17 @@ export async function createPurchaseOrder(
         `).bind(user.tenantId, normalized.deliveryWarehouseId).first<WarehouseRow>()
       : Promise.resolve(null),
     db.prepare(`
-      SELECT id, request_no, status FROM purchase_requests
-      WHERE tenant_id = ? AND id = ?
+      SELECT request.id, request.status, request.source, request.note,
+        ${PURCHASE_REQUEST_PLANNING_AUDIT_SQL} AS planning_audit_json
+      FROM purchase_requests request
+      WHERE request.tenant_id = ? AND request.id = ?
       LIMIT 1
     `).bind(user.tenantId, normalized.purchaseRequestId).first<{
-      id: string; request_no: string; status: string;
+      id: string; status: string; source: PurchaseRequestSource; note: string | null; planning_audit_json: string | null;
     }>(),
     loadRequestLines(db, user.tenantId, normalized.purchaseRequestId),
   ]);
-  if (!supplier) throw new HttpError(404, '供应商不存在或已停用', 'PURCHASE_SUPPLIER_NOT_FOUND');
+  if (normalized.supplierId && !supplier) throw new HttpError(404, '供应商不存在或已停用', 'PURCHASE_SUPPLIER_NOT_FOUND');
   if (normalized.deliveryWarehouseId && !deliveryWarehouse) {
     throw new HttpError(404, '收货仓库不存在或不在当前数据范围内', 'PURCHASE_DELIVERY_WAREHOUSE_NOT_FOUND');
   }
@@ -599,12 +725,33 @@ export async function createPurchaseOrder(
   if (requestLines.length === 0) {
     throw new HttpError(409, '采购申请没有可下单明细', 'PURCHASE_REQUEST_EMPTY');
   }
-  assertRequestLinesCurrent(requestLines);
+  assertRequestLinesCurrent(requestLines, request.source);
 
   const lineCostMap = new Map(normalized.lineCosts.map((line) => [line.purchaseRequestLineId, line.unitCostMinor]));
+  const lineDetails = new Map(normalized.lineCosts.map((line) => [line.purchaseRequestLineId, line.productDetails]));
   const requestLineIds = new Set(requestLines.map((line) => line.id));
   if (normalized.lineCosts.some((line) => !requestLineIds.has(line.purchaseRequestLineId))) {
     throw new HttpError(400, '采购单价格包含不属于该申请的明细', 'PURCHASE_ORDER_LINE_INVALID');
+  }
+
+  if (input.issue) {
+    assertPurchaseOrderIssuable({
+      supplier_id: supplier?.id ?? null,
+      supplier_active: Number(Boolean(supplier)),
+      delivery_warehouse_id: normalized.deliveryWarehouseId,
+      delivery_warehouse_valid: Number(Boolean(deliveryWarehouse)),
+      expected_delivery_at: normalized.expectedDeliveryAt,
+      currency: normalized.currency,
+      line_count: requestLines.length,
+      missing_unit_cost_count: requestLines.filter((line) => (lineCostMap.get(line.id) ?? -1) < 0).length,
+      line_currency_mismatch_count: 0,
+    });
+    if (request.source === 'manual' && !request.note?.trim()) {
+      throw new HttpError(409, '采购申请缺少采购原因，请复核后再提交', 'PURCHASE_REQUEST_CHANGED');
+    }
+    await validateIssuePlanningBasis(db, user, request.id, {
+      request_source: request.source, planning_audit_json: request.planning_audit_json,
+    }, options);
   }
 
   const now = new Date().toISOString();
@@ -624,7 +771,8 @@ export async function createPurchaseOrder(
         currency, note, action_note, version, idempotency_key, request_hash,
         last_action_key, created_by_member_id, issued_at, closed_at, cancelled_at, created_at, updated_at
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft',
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        CASE WHEN ${purchaseOrderActorGuardSql('?', '?')} THEN 'draft' ELSE NULL END,
         ?, ?, NULL, 1, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?
       )
     `).bind(
@@ -637,35 +785,39 @@ export async function createPurchaseOrder(
       normalized.expectedDeliveryAt,
       normalized.paymentTerms,
       normalized.tradeTerms,
-      supplier.code,
-      supplier.name,
-      supplier.contact_name,
-      supplier.contact_phone,
-      supplier.contact_email,
-      supplier.address,
+      supplier?.code ?? null,
+      supplier?.name ?? null,
+      supplier?.contact_name ?? null,
+      supplier?.contact_phone ?? null,
+      supplier?.contact_email ?? null,
+      supplier?.address ?? null,
       deliveryWarehouse?.code ?? null,
       deliveryWarehouse?.name ?? null,
       deliveryWarehouse?.contact_name ?? null,
       deliveryWarehouse?.contact_phone ?? null,
       deliveryWarehouse?.address ?? null,
+      ...purchaseOrderActorBindings(actor),
+      user.tenantId,
+      normalized.purchaseRequestId,
       normalized.currency,
       normalized.note,
       idempotencyKey,
       requestHash,
       idempotencyKey,
-      actorMemberId,
+      actor.memberId,
       now,
       now,
     ),
   ];
   for (const line of requestLines) {
     const unitCostMinor = lineCostMap.get(line.id) ?? null;
+    const details = lineDetails.get(line.id);
     statements.push(db.prepare(`
       INSERT INTO purchase_order_lines (
         id, tenant_id, purchase_order_id, purchase_request_line_id, sku_id,
         sku_code_snapshot, sku_name_snapshot, ordered_quantity, received_quantity,
-        unit_cost_minor, currency, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+        unit_cost_minor, currency, product_details_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
     `).bind(
       crypto.randomUUID(),
       user.tenantId,
@@ -677,6 +829,7 @@ export async function createPurchaseOrder(
       line.requested_quantity,
       unitCostMinor,
       normalized.currency,
+      details ? stableJson(resolvePurchaseProductDetails(parsePurchaseProductDetails(line.product_details_json), details)) : line.product_details_json,
       now,
       now,
     ));
@@ -700,6 +853,11 @@ export async function createPurchaseOrder(
     idempotencyKey,
     now,
   }));
+  if (input.issue) {
+    statements.push(...await combinedIssueStatements(db, user, {
+      id: purchaseOrderId, version: 1, idempotencyKey, now, actor,
+    }));
+  }
 
   try {
     await db.batch(statements);
@@ -718,26 +876,226 @@ export async function createPurchaseOrder(
   return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: false };
 }
 
+export async function updatePurchaseOrderDraft(
+  db: D1Database,
+  user: UserContext,
+  purchaseOrderId: string,
+  input: UpdatePurchaseOrderDraftInput,
+  idempotencyKey: string,
+  options: PurchaseOrderWriteOptions = {},
+) {
+  requirePermission(user, 'purchase:order:issue');
+  validateIdempotencyKey(idempotencyKey);
+  const legacyPatch = typeof input.expectedDeliveryAt === 'string' && typeof input.currency === 'string'
+    && input.supplierId === undefined && input.deliveryWarehouseId === undefined
+    && input.lineCosts?.every((line) => typeof line.unitCostMinor === 'number' && line.productDetails === undefined);
+  const normalized = {
+    expectedVersion: input.expectedVersion,
+    expectedDeliveryAt: input.expectedDeliveryAt,
+    supplierId: input.supplierId,
+    deliveryWarehouseId: input.deliveryWarehouseId,
+    paymentTerms: input.paymentTerms === undefined && !legacyPatch ? undefined : input.paymentTerms?.trim() || null,
+    tradeTerms: input.tradeTerms === undefined && !legacyPatch ? undefined : input.tradeTerms?.trim() || null,
+    currency: input.currency === undefined ? undefined : input.currency?.trim().toUpperCase() || null,
+    note: input.note === undefined && !legacyPatch ? undefined : input.note?.trim() || null,
+    lineCosts: input.lineCosts
+      ?.map(({ purchaseRequestLineId, unitCostMinor, productDetails }) => ({
+        purchaseRequestLineId: purchaseRequestLineId.trim(), unitCostMinor, productDetails,
+      }))
+      .sort((left, right) => left.purchaseRequestLineId.localeCompare(right.purchaseRequestLineId)),
+    ...(input.issue ? { issue: true } : {}),
+  };
+  const developmentOpenAccess = options.developmentOpenAccess === true;
+  const actor = await authorizePurchaseOrderAction(db, user, purchaseOrderId, developmentOpenAccess, true);
+  const action = 'UPDATE_PURCHASE_ORDER_DRAFT';
+  const requestHash = await hashPayload(normalized);
+  const isReplay = () => readActionReplay(db, user.tenantId, purchaseOrderId, action, requestHash, idempotencyKey);
+  if (await isReplay()) {
+    return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: true };
+  }
+
+  const current = await getPurchaseOrder(db, user.tenantId, purchaseOrderId);
+  if (input.issue && (current.status !== 'draft' || current.version !== normalized.expectedVersion)
+    && await isReplay()) {
+    return { purchaseOrder: current, replayed: true };
+  }
+  if (current.status !== 'draft') {
+    throw new HttpError(409, '只有采购单草稿可以编辑', 'PURCHASE_ORDER_NOT_EDITABLE');
+  }
+  if (current.version !== normalized.expectedVersion) {
+    throw new HttpError(409, '采购单草稿已更新，请刷新后重新编辑', 'CONCURRENT_UPDATE');
+  }
+  const submittedLines = new Map(normalized.lineCosts?.map((line) => [line.purchaseRequestLineId, line]));
+  const currentLineIds = new Set(current.lines.map((line) => line.purchaseRequestLineId));
+  if (submittedLines.size !== (normalized.lineCosts?.length ?? 0) || (legacyPatch && submittedLines.size !== current.lines.length)
+    || [...submittedLines.keys()].some((id) => !currentLineIds.has(id))) {
+    throw new HttpError(400, '只能编辑该采购单中已批准的采购明细', 'PURCHASE_ORDER_LINE_INVALID');
+  }
+
+  const previousSupplierId = current.supplier?.id ?? null;
+  const previousWarehouseId = current.deliveryWarehouse?.id ?? null;
+  const supplierId = normalized.supplierId === undefined ? previousSupplierId : normalized.supplierId;
+  const warehouseId = normalized.deliveryWarehouseId === undefined ? previousWarehouseId : normalized.deliveryWarehouseId;
+  const supplierChanged = supplierId !== previousSupplierId;
+  const warehouseChanged = warehouseId !== previousWarehouseId;
+  const [supplier, warehouse] = await Promise.all([
+    supplierChanged && supplierId ? db.prepare(`
+      SELECT code, name, contact_name, contact_phone, contact_email, address FROM suppliers
+      WHERE tenant_id = ? AND id = ? AND active = 1
+    `).bind(user.tenantId, supplierId).first<Pick<SupplierRow, 'code' | 'name' | 'contact_name' | 'contact_phone' | 'contact_email' | 'address'>>() : null,
+    warehouseChanged && warehouseId ? db.prepare(`
+      SELECT code, name, contact_name, contact_phone, address FROM warehouses WHERE tenant_id = ? AND id = ?
+    `).bind(user.tenantId, warehouseId).first<Pick<WarehouseRow, 'code' | 'name' | 'contact_name' | 'contact_phone' | 'address'>>() : null,
+  ]);
+  if (supplierChanged && supplierId && !supplier) throw new HttpError(404, '供应商不存在或已停用', 'PURCHASE_SUPPLIER_NOT_FOUND');
+  if (warehouseChanged && warehouseId && !warehouse) throw new HttpError(404, '收货仓库不存在或不在当前数据范围内', 'PURCHASE_DELIVERY_WAREHOUSE_NOT_FOUND');
+  const expectedDeliveryAt = normalized.expectedDeliveryAt === undefined ? current.expectedDeliveryAt : normalized.expectedDeliveryAt;
+  const currency = normalized.currency === undefined ? current.currency : normalized.currency;
+  const paymentTerms = normalized.paymentTerms === undefined ? current.paymentTerms : normalized.paymentTerms;
+  const tradeTerms = normalized.tradeTerms === undefined ? current.tradeTerms : normalized.tradeTerms;
+  const note = normalized.note === undefined ? current.note : normalized.note;
+  const updatedLines = current.lines.map((line) => {
+    const patch = submittedLines.get(line.purchaseRequestLineId);
+    return {
+      purchaseRequestLineId: line.purchaseRequestLineId,
+      unitCostMinor: patch?.unitCostMinor === undefined ? line.unitCostMinor : patch.unitCostMinor,
+      productDetails: patch?.productDetails === undefined ? undefined : resolvePurchaseProductDetails(line.productDetails ?? null, patch.productDetails),
+    };
+  });
+
+  if (input.issue) {
+    const readiness = await loadPurchaseOrderIssueReadiness(db, user.tenantId, purchaseOrderId);
+    if (!readiness || readiness.status !== 'draft' || readiness.version !== current.version) {
+      if (await isReplay()) {
+        return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: true };
+      }
+      throw new HttpError(409, '采购单草稿已更新，请刷新并核对后再确认下单', 'CONCURRENT_UPDATE');
+    }
+    assertPurchaseOrderIssuable({ ...readiness, expected_delivery_at: expectedDeliveryAt,
+      supplier_id: supplierId, supplier_active: supplierChanged ? Number(Boolean(supplier)) : readiness.supplier_active,
+      delivery_warehouse_id: warehouseId, delivery_warehouse_valid: warehouseChanged ? Number(Boolean(warehouse)) : readiness.delivery_warehouse_valid,
+      currency, missing_unit_cost_count: updatedLines.filter((line) => line.unitCostMinor === null || line.unitCostMinor < 0).length,
+      line_currency_mismatch_count: 0 });
+    assertPurchaseOrderSourceCurrent(readiness);
+    await validateIssuePlanningBasis(db, user, readiness.purchase_request_id, readiness, options);
+  }
+
+  const now = new Date().toISOString();
+  const nextVersion = current.version + 1;
+  const updatedOrderSql = `EXISTS (
+    SELECT 1 FROM purchase_orders
+    WHERE id = ? AND tenant_id = ? AND version = ? AND status = 'draft' AND last_action_key = ?
+  )`;
+  const updatedOrderBindings = [purchaseOrderId, user.tenantId, nextVersion, idempotencyKey];
+  const beforeJson = stableJson({
+    version: current.version,
+    supplierId: previousSupplierId,
+    deliveryWarehouseId: previousWarehouseId,
+    expectedDeliveryAt: current.expectedDeliveryAt,
+    paymentTerms: current.paymentTerms,
+    tradeTerms: current.tradeTerms,
+    currency: current.currency,
+    note: current.note,
+    lineCosts: current.lines.map(({ purchaseRequestLineId, unitCostMinor, currency, productDetails }) => ({
+      purchaseRequestLineId, unitCostMinor, currency, productDetails,
+    })),
+  });
+  const issueStatements = input.issue ? await combinedIssueStatements(db, user, {
+    id: purchaseOrderId, version: nextVersion, idempotencyKey, now, actor,
+  }) : [];
+  let changed = false;
+  try {
+    const [orderUpdate] = await db.batch([
+      db.prepare(`
+        UPDATE purchase_orders
+        SET expected_delivery_at = ?, payment_terms = ?, trade_terms = ?, currency = ?, note = ?,
+            ${supplierChanged ? `supplier_id = ?, supplier_code_snapshot = ?, supplier_name_snapshot = ?,
+              supplier_contact_name_snapshot = ?, supplier_contact_phone_snapshot = ?, supplier_contact_email_snapshot = ?, supplier_address_snapshot = ?,` : ''}
+            ${warehouseChanged ? `delivery_warehouse_id = ?, delivery_warehouse_code_snapshot = ?, delivery_warehouse_name_snapshot = ?,
+              delivery_contact_name_snapshot = ?, delivery_contact_phone_snapshot = ?, delivery_address_snapshot = ?,` : ''}
+            version = version + 1, last_action_key = ?, updated_at = ?
+        WHERE id = ? AND tenant_id = ? AND status = 'draft' AND version = ?
+          AND ${PURCHASE_ORDER_ACTOR_GUARD_SQL}
+      `).bind(
+        expectedDeliveryAt,
+        paymentTerms,
+        tradeTerms,
+        currency,
+        note,
+        ...(supplierChanged ? [supplierId, supplier?.code ?? null, supplier?.name ?? null, supplier?.contact_name ?? null,
+          supplier?.contact_phone ?? null, supplier?.contact_email ?? null, supplier?.address ?? null] : []),
+        ...(warehouseChanged ? [warehouseId, warehouse?.code ?? null, warehouse?.name ?? null, warehouse?.contact_name ?? null,
+          warehouse?.contact_phone ?? null, warehouse?.address ?? null] : []),
+        idempotencyKey,
+        now,
+        purchaseOrderId,
+        user.tenantId,
+        current.version,
+        ...purchaseOrderActorBindings(actor),
+      ),
+      db.prepare(`
+        UPDATE purchase_order_lines AS line
+        SET unit_cost_minor = json_extract(cost.value, '$.unitCostMinor'), currency = ?, updated_at = ?,
+          product_details_json = CASE WHEN json_type(cost.value, '$.productDetails') IS NULL THEN line.product_details_json
+            ELSE json_extract(cost.value, '$.productDetails') END
+        FROM json_each(?) AS cost
+        WHERE line.tenant_id = ? AND line.purchase_order_id = ?
+          AND line.purchase_request_line_id = json_extract(cost.value, '$.purchaseRequestLineId')
+          AND ${updatedOrderSql}
+      `).bind(
+        currency,
+        now,
+        stableJson(updatedLines),
+        user.tenantId,
+        purchaseOrderId,
+        ...updatedOrderBindings,
+      ),
+      auditStatement(db, user, {
+        action,
+        entityType: 'purchase_order',
+        entityId: purchaseOrderId,
+        beforeJson,
+        afterJson: stableJson({ ...normalized, requestHash, version: nextVersion }),
+        idempotencyKey,
+        now,
+        onlyWhenSql: updatedOrderSql,
+        onlyWhenBindings: updatedOrderBindings,
+      }),
+      ...issueStatements,
+    ]);
+    changed = orderUpdate.meta.changes === 1;
+  } catch (error) {
+    if (await isReplay()) {
+      return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: true };
+    }
+    throw translateProcurementError(error);
+  }
+  if (!changed) {
+    if (await isReplay()) {
+      return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: true };
+    }
+    await authorizePurchaseOrderAction(db, user, purchaseOrderId, developmentOpenAccess, true);
+    throw new HttpError(409, '采购单草稿已更新，请刷新后重新编辑', 'CONCURRENT_UPDATE');
+  }
+  return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: false };
+}
+
 export async function executePurchaseOrderAction(
   db: D1Database,
   user: UserContext,
   purchaseOrderId: string,
   input: PurchaseOrderActionInput,
   idempotencyKey: string,
-  options: {
-    developmentOpenAccess?: boolean;
-    planningNow?: Date;
-    validatePlanningEvidence?: (
-      db: D1Database,
-      user: UserContext,
-      purchaseRequestId: string,
-      evidence: PurchasePlanningEvidence,
-    ) => Promise<void>;
-  } = {},
+  options: PurchaseOrderWriteOptions = {},
 ) {
   requirePermission(user, 'purchase:order:issue');
   validateIdempotencyKey(idempotencyKey);
-  const normalized = { action: input.action, note: input.note?.trim() || null };
+  const expectedVersion = input.action === 'issue' ? input.expectedVersion : undefined;
+  const normalized = {
+    action: input.action,
+    note: input.note?.trim() || null,
+    ...(expectedVersion === undefined ? {} : { expectedVersion }),
+  };
   if (normalized.action === 'close' && !normalized.note) {
     throw new HttpError(400, '关闭采购单剩余量时必须填写原因', 'PURCHASE_ORDER_CLOSE_REASON_REQUIRED');
   }
@@ -747,17 +1105,22 @@ export async function executePurchaseOrderAction(
     : input.action === 'close'
       ? 'CLOSE_PURCHASE_ORDER_REMAINDER'
       : 'CANCEL_PURCHASE_ORDER';
-  await assertPurchaseOrderPurchaser(
+  const developmentOpenAccess = options.developmentOpenAccess === true;
+  const actor = await authorizePurchaseOrderAction(
     db,
     user,
     purchaseOrderId,
-    options.developmentOpenAccess === true,
+    developmentOpenAccess,
+    input.action === 'issue',
   );
   const replay = await readActionReplay(db, user.tenantId, purchaseOrderId, auditAction, requestHash, idempotencyKey);
   if (replay) return { purchaseOrder: await getPurchaseOrder(db, user.tenantId, purchaseOrderId), replayed: true };
 
   const current = await loadPurchaseOrderIssueReadiness(db, user.tenantId, purchaseOrderId);
   if (!current) throw new HttpError(404, '采购单不存在或不在当前数据范围内', 'PURCHASE_ORDER_NOT_FOUND');
+  if (expectedVersion !== undefined && current.version !== expectedVersion) {
+    throw new HttpError(409, '采购单草稿已更新，请刷新并核对后再确认下单', 'CONCURRENT_UPDATE');
+  }
   const validCurrentStatus = input.action === 'close'
     ? current.status === 'issued' || current.status === 'partially_received'
     : current.status === 'draft';
@@ -766,23 +1129,7 @@ export async function executePurchaseOrderAction(
   }
   if (input.action === 'issue') {
     assertPurchaseOrderIssuable(current);
-    const planningEvidence = assertPurchaseOrderPlanningEvidence(current);
-    if (options.validatePlanningEvidence) {
-      await options.validatePlanningEvidence(
-        db,
-        user,
-        current.purchase_request_id,
-        planningEvidence,
-      );
-    } else {
-      await validateCurrentPurchasePlanningEvidence(
-        db,
-        user,
-        current.purchase_request_id,
-        planningEvidence,
-        options.planningNow,
-      );
-    }
+    await validateIssuePlanningBasis(db, user, current.purchase_request_id, current, options);
     assertPurchaseOrderSourceCurrent(current);
     const request = await db.prepare(`
       SELECT status FROM purchase_requests WHERE tenant_id = ? AND id = ? LIMIT 1
@@ -791,7 +1138,7 @@ export async function executePurchaseOrderAction(
     if (request?.status !== 'approved' || lines.length === 0) {
       throw new HttpError(409, '来源采购申请已变化，不能确认下单', 'PURCHASE_REQUEST_CHANGED');
     }
-    assertRequestLinesCurrent(lines);
+    assertRequestLinesCurrent(lines, current.request_source);
   }
 
   const nextStatus: PurchaseOrderStatus = input.action === 'issue'
@@ -818,6 +1165,7 @@ export async function executePurchaseOrderAction(
             cancelled_at = CASE WHEN ? = 'cancelled' THEN ? ELSE cancelled_at END,
             updated_at = ?
         WHERE id = ? AND tenant_id = ? AND version = ?
+          AND ${PURCHASE_ORDER_ACTOR_GUARD_SQL}
           AND (
             (? = 'close' AND status IN ('issued', 'partially_received'))
             OR (? <> 'close' AND status = 'draft')
@@ -826,7 +1174,7 @@ export async function executePurchaseOrderAction(
             ? <> 'issue'
             OR (
               ${PURCHASE_ORDER_ISSUE_GUARD_SQL}
-              AND ${purchaseOrderPlanningEvidenceGuardSql('purchase_orders')}
+              AND ${purchaseOrderIssueBasisGuardSql('purchase_orders')}
               AND ${purchaseOrderSourceGuardSql('purchase_orders')}
             )
           )
@@ -844,6 +1192,7 @@ export async function executePurchaseOrderAction(
         purchaseOrderId,
         user.tenantId,
         current.version,
+        ...purchaseOrderActorBindings(actor),
         input.action,
         input.action,
         input.action,
@@ -881,11 +1230,12 @@ export async function executePurchaseOrderAction(
     idempotencyKey,
   );
   if (!applied) {
+    await authorizePurchaseOrderAction(db, user, purchaseOrderId, developmentOpenAccess, input.action === 'issue');
     if (input.action === 'issue') {
       const latest = await loadPurchaseOrderIssueReadiness(db, user.tenantId, purchaseOrderId);
-      if (latest?.status === 'draft') {
+      if (latest?.status === 'draft' && latest.version === current.version) {
         assertPurchaseOrderIssuable(latest);
-        assertPurchaseOrderPlanningEvidence(latest);
+        readPurchaseOrderPlanningEvidence(latest);
         assertPurchaseOrderSourceCurrent(latest);
       }
     }
@@ -1176,8 +1526,17 @@ const PURCHASE_ORDER_ISSUE_GUARD_SQL = `
   )
 `;
 
-function purchaseOrderPlanningEvidenceGuardSql(orderAlias: 'po' | 'purchase_orders') {
+function purchaseOrderIssueBasisGuardSql(orderAlias: 'po' | 'purchase_orders') {
   return `
+    (
+    EXISTS (
+      SELECT 1 FROM purchase_requests manual_request
+      WHERE manual_request.id = ${orderAlias}.purchase_request_id
+        AND manual_request.tenant_id = ${orderAlias}.tenant_id
+        AND manual_request.source = 'manual'
+        AND length(trim(manual_request.note)) > 0
+    )
+    OR
     EXISTS (
       SELECT 1
       FROM audit_logs planning_audit
@@ -1212,6 +1571,7 @@ function purchaseOrderPlanningEvidenceGuardSql(orderAlias: 'po' | 'purchase_orde
           ELSE 0
         END = 1
     )
+    )
   `;
 }
 
@@ -1223,6 +1583,7 @@ function purchaseOrderSourceGuardSql(orderAlias: 'po' | 'purchase_orders') {
       WHERE issue_request.id = ${orderAlias}.purchase_request_id
         AND issue_request.tenant_id = ${orderAlias}.tenant_id
         AND issue_request.status = 'approved'
+        AND (issue_request.source <> 'manual' OR length(trim(issue_request.note)) > 0)
     )
     AND EXISTS (
       SELECT 1
@@ -1233,12 +1594,17 @@ function purchaseOrderSourceGuardSql(orderAlias: 'po' | 'purchase_orders') {
     AND NOT EXISTS (
       SELECT 1
       FROM purchase_order_lines issue_line
+      JOIN purchase_requests issue_request
+        ON issue_request.id = ${orderAlias}.purchase_request_id
+        AND issue_request.tenant_id = issue_line.tenant_id
       LEFT JOIN purchase_request_lines request_line
         ON request_line.id = issue_line.purchase_request_line_id
         AND request_line.tenant_id = issue_line.tenant_id
       LEFT JOIN purchase_demands demand
         ON demand.id = request_line.purchase_demand_id
         AND demand.tenant_id = request_line.tenant_id
+      LEFT JOIN skus sku
+        ON sku.id = request_line.sku_id AND sku.tenant_id = request_line.tenant_id
       WHERE issue_line.purchase_order_id = ${orderAlias}.id
         AND issue_line.tenant_id = ${orderAlias}.tenant_id
         AND (
@@ -1247,12 +1613,19 @@ function purchaseOrderSourceGuardSql(orderAlias: 'po' | 'purchase_orders') {
           OR request_line.active <> 1
           OR request_line.sku_id IS NOT issue_line.sku_id
           OR request_line.requested_quantity <> issue_line.ordered_quantity
-          OR demand.id IS NULL
-          OR demand.status <> 'open'
-          OR demand.mapped_sku_id IS NOT request_line.sku_id
-          OR demand.required_quantity IS NULL
-          OR demand.required_quantity < request_line.requested_quantity
-          OR demand.source_updated_at IS NOT request_line.source_updated_at
+          OR CASE WHEN issue_request.source = 'manual' THEN
+            request_line.purchase_demand_id IS NOT NULL
+            OR request_line.source_required_quantity IS NOT NULL
+            OR request_line.source_updated_at IS NOT NULL
+            OR sku.active IS NOT 1
+          ELSE
+            demand.id IS NULL
+            OR demand.status <> 'open'
+            OR demand.mapped_sku_id IS NOT request_line.sku_id
+            OR demand.required_quantity IS NULL
+            OR demand.required_quantity < request_line.requested_quantity
+            OR demand.source_updated_at IS NOT request_line.source_updated_at
+          END
         )
     )
     AND NOT EXISTS (
@@ -1272,6 +1645,46 @@ function purchaseOrderSourceGuardSql(orderAlias: 'po' | 'purchase_orders') {
   `;
 }
 
+const PURCHASE_REQUEST_PLANNING_AUDIT_SQL = `(SELECT planning_audit.after_json
+  FROM audit_logs planning_audit
+  WHERE planning_audit.tenant_id = request.tenant_id
+    AND planning_audit.entity_type = 'purchase_request'
+    AND planning_audit.entity_id = request.id
+    AND planning_audit.action = 'CREATE_PURCHASE_REQUEST_FROM_PLAN'
+  ORDER BY planning_audit.created_at, planning_audit.id
+  LIMIT 1)`;
+
+async function combinedIssueStatements(db: D1Database, user: UserContext, input: {
+  id: string; version: number; idempotencyKey: string; now: string; actor: PurchaseOrderActor;
+}) {
+  const issueKey = `issue:${await hashPayload([input.id, input.idempotencyKey])}`;
+  const issueRequestHash = await hashPayload({ action: 'issue', note: null, expectedVersion: input.version });
+  // A failed guard violates the status constraint so D1 rolls back the preceding save as well.
+  return [
+    db.prepare(`
+      UPDATE purchase_orders
+      SET status = CASE WHEN ${PURCHASE_ORDER_ACTOR_GUARD_SQL}
+          AND ${PURCHASE_ORDER_ISSUE_GUARD_SQL}
+          AND ${purchaseOrderIssueBasisGuardSql('purchase_orders')}
+          AND ${purchaseOrderSourceGuardSql('purchase_orders')}
+        THEN 'issued' ELSE NULL END,
+        issued_at = ?, updated_at = ?, version = version + 1, last_action_key = ?
+      WHERE id = ? AND tenant_id = ? AND version = ? AND status = 'draft' AND last_action_key = ?
+    `).bind(
+      ...purchaseOrderActorBindings(input.actor), input.now, input.now, issueKey,
+      input.id, user.tenantId, input.version, input.idempotencyKey,
+    ),
+    auditStatement(db, user, {
+      action: 'ISSUE_PURCHASE_ORDER', entityType: 'purchase_order', entityId: input.id,
+      beforeJson: stableJson({ status: 'draft', version: input.version }),
+      afterJson: stableJson({ requestHash: issueRequestHash, status: 'issued', version: input.version + 1, note: null }),
+      idempotencyKey: issueKey, now: input.now,
+      onlyWhenSql: `EXISTS (SELECT 1 FROM purchase_orders WHERE id = ? AND tenant_id = ? AND status = 'issued' AND last_action_key = ?)`,
+      onlyWhenBindings: [input.id, user.tenantId, issueKey],
+    }),
+  ];
+}
+
 async function loadPurchaseOrderIssueReadiness(
   db: D1Database,
   tenantId: string,
@@ -1283,6 +1696,8 @@ async function loadPurchaseOrderIssueReadiness(
       po.status,
       po.version,
       po.purchase_request_id,
+      request.source AS request_source,
+      po.supplier_id,
       supplier.active AS supplier_active,
       po.delivery_warehouse_id,
       po.expected_delivery_at,
@@ -1302,17 +1717,12 @@ async function loadPurchaseOrderIssueReadiness(
         WHERE line.purchase_order_id = po.id
           AND line.tenant_id = po.tenant_id
           AND (line.currency IS NULL OR line.currency <> po.currency)) AS line_currency_mismatch_count,
-      (SELECT planning_audit.after_json
-        FROM audit_logs planning_audit
-        WHERE planning_audit.tenant_id = po.tenant_id
-          AND planning_audit.entity_type = 'purchase_request'
-          AND planning_audit.entity_id = po.purchase_request_id
-          AND planning_audit.action = 'CREATE_PURCHASE_REQUEST_FROM_PLAN'
-        ORDER BY planning_audit.created_at, planning_audit.id
-        LIMIT 1) AS planning_audit_json,
+      ${PURCHASE_REQUEST_PLANNING_AUDIT_SQL} AS planning_audit_json,
       CASE WHEN (${purchaseOrderSourceGuardSql('po')}) THEN 1 ELSE 0 END AS source_ready
     FROM purchase_orders po
-    JOIN suppliers supplier
+    JOIN purchase_requests request
+      ON request.id = po.purchase_request_id AND request.tenant_id = po.tenant_id
+    LEFT JOIN suppliers supplier
       ON supplier.id = po.supplier_id
       AND supplier.tenant_id = po.tenant_id
     WHERE po.tenant_id = ? AND po.id = ?
@@ -1320,7 +1730,12 @@ async function loadPurchaseOrderIssueReadiness(
   `).bind(tenantId, purchaseOrderId).first<PurchaseOrderIssueReadinessRow>();
 }
 
-function assertPurchaseOrderIssuable(order: PurchaseOrderIssueReadinessRow) {
+function assertPurchaseOrderIssuable(order: Pick<PurchaseOrderIssueReadinessRow,
+  'supplier_id' | 'supplier_active' | 'delivery_warehouse_id' | 'delivery_warehouse_valid' | 'expected_delivery_at' | 'currency'
+  | 'line_count' | 'missing_unit_cost_count' | 'line_currency_mismatch_count'>) {
+  if (!order.supplier_id) {
+    throw new HttpError(409, '确认下单前必须选择供应商', 'PURCHASE_ORDER_SUPPLIER_REQUIRED');
+  }
   if (order.supplier_active !== 1) {
     throw new HttpError(409, '供应商已停用，不能确认下单', 'PURCHASE_SUPPLIER_INACTIVE');
   }
@@ -1374,7 +1789,8 @@ function assertPurchaseOrderSourceCurrent(order: PurchaseOrderIssueReadinessRow)
   }
 }
 
-function assertPurchaseOrderPlanningEvidence(order: PurchaseOrderIssueReadinessRow) {
+function readPurchaseOrderPlanningEvidence(order: PurchaseOrderPlanningSource) {
+  if (order.request_source === 'manual') return null;
   const parsed = parseJson(order.planning_audit_json);
   const evidence = parsed.planningEvidence;
   if (!isPurchasePlanningEvidence(evidence)) {
@@ -1425,6 +1841,22 @@ async function validateCurrentPurchasePlanningEvidence(
   await assertPurchaseRequestPlanningEvidenceCurrent(db, user, purchaseRequestId, evidence, { now });
 }
 
+async function validateIssuePlanningBasis(
+  db: D1Database,
+  user: UserContext,
+  requestId: string,
+  source: PurchaseOrderPlanningSource,
+  options: PurchaseOrderWriteOptions,
+) {
+  const evidence = readPurchaseOrderPlanningEvidence(source);
+  if (!evidence) return;
+  if (options.validatePlanningEvidence) {
+    await options.validatePlanningEvidence(db, user, requestId, evidence);
+  } else {
+    await validateCurrentPurchasePlanningEvidence(db, user, requestId, evidence, options.planningNow);
+  }
+}
+
 const PURCHASE_ORDER_SELECT = `
   SELECT
     po.id,
@@ -1471,7 +1903,7 @@ const PURCHASE_ORDER_SELECT = `
     COALESCE(SUM(line.received_quantity), 0) AS received_quantity
   FROM purchase_orders po
   JOIN purchase_requests pr ON pr.id = po.purchase_request_id AND pr.tenant_id = po.tenant_id
-  JOIN suppliers supplier ON supplier.id = po.supplier_id AND supplier.tenant_id = po.tenant_id
+  LEFT JOIN suppliers supplier ON supplier.id = po.supplier_id AND supplier.tenant_id = po.tenant_id
   LEFT JOIN warehouses delivery_warehouse
     ON delivery_warehouse.id = po.delivery_warehouse_id
     AND delivery_warehouse.tenant_id = po.tenant_id
@@ -1489,7 +1921,8 @@ const PURCHASE_ORDER_LINE_SELECT = `
     line.ordered_quantity,
     line.received_quantity,
     line.unit_cost_minor,
-    line.currency
+    line.currency,
+    line.product_details_json
   FROM purchase_order_lines line
   JOIN purchase_orders po ON po.id = line.purchase_order_id AND po.tenant_id = line.tenant_id
 `;
@@ -1564,6 +1997,27 @@ function mapSupplier(row: SupplierRow) {
   };
 }
 
+function mapProcurementRecords(
+  orders: PurchaseOrderRow[], orderLines: PurchaseOrderLineRow[], receipts: PurchaseReceiptRow[], receiptLines: PurchaseReceiptLineRow[],
+) {
+  const linesByOrder = new Map<string, ReturnType<typeof mapPurchaseOrderLine>[]>();
+  for (const row of orderLines) {
+    const lines = linesByOrder.get(row.purchase_order_id) ?? [];
+    lines.push(mapPurchaseOrderLine(row));
+    linesByOrder.set(row.purchase_order_id, lines);
+  }
+  const linesByReceipt = new Map<string, ReturnType<typeof mapPurchaseReceiptLine>[]>();
+  for (const row of receiptLines) {
+    const lines = linesByReceipt.get(row.purchase_receipt_id) ?? [];
+    lines.push(mapPurchaseReceiptLine(row));
+    linesByReceipt.set(row.purchase_receipt_id, lines);
+  }
+  return {
+    purchaseOrders: orders.map((row) => mapPurchaseOrder(row, linesByOrder.get(row.id) ?? [])),
+    purchaseReceipts: receipts.map((row) => mapPurchaseReceipt(row, linesByReceipt.get(row.id) ?? [])),
+  };
+}
+
 function mapWarehouse(row: WarehouseRow) {
   return {
     id: row.id,
@@ -1583,7 +2037,7 @@ function mapPurchaseOrder(row: PurchaseOrderRow, lines: ReturnType<typeof mapPur
     purchaseRequestId: row.purchase_request_id,
     purchaseRequestNo: row.purchase_request_no,
     purchaserMemberId: row.purchaser_member_id,
-    supplier: {
+    supplier: row.supplier_id ? {
       id: row.supplier_id,
       code: row.supplier_code,
       name: row.supplier_name,
@@ -1591,7 +2045,7 @@ function mapPurchaseOrder(row: PurchaseOrderRow, lines: ReturnType<typeof mapPur
       contactPhone: row.supplier_contact_phone,
       contactEmail: row.supplier_contact_email,
       address: row.supplier_address,
-    },
+    } : null,
     deliveryWarehouse: row.delivery_warehouse_id ? {
       id: row.delivery_warehouse_id,
       code: row.delivery_warehouse_code,
@@ -1621,6 +2075,7 @@ function mapPurchaseOrder(row: PurchaseOrderRow, lines: ReturnType<typeof mapPur
 }
 
 function mapPurchaseOrderLine(row: PurchaseOrderLineRow) {
+  const details = parsePurchaseProductDetails(row.product_details_json);
   return {
     id: row.id,
     purchaseRequestLineId: row.purchase_request_line_id,
@@ -1632,6 +2087,7 @@ function mapPurchaseOrderLine(row: PurchaseOrderLineRow) {
     remainingQuantity: Math.max(0, Number(row.ordered_quantity) - Number(row.received_quantity)),
     unitCostMinor: row.unit_cost_minor === null ? null : Number(row.unit_cost_minor),
     currency: row.currency,
+    ...(details ? { productDetails: resolvePurchaseProductDetails(details) } : {}),
   };
 }
 
@@ -1678,8 +2134,12 @@ async function loadRequestLines(db: D1Database, tenantId: string, purchaseReques
       line.sku_id,
       sku.code AS sku_code,
       sku.name AS sku_name,
+      sku.active AS sku_active,
       line.requested_quantity,
       line.active,
+      ${ORDER_LINE_PRODUCT_DETAILS_SQL} AS product_details_json,
+      line.purchase_demand_id,
+      line.source_required_quantity,
       pd.status AS demand_status,
       pd.mapped_sku_id AS demand_mapped_sku_id,
       pd.required_quantity AS demand_required_quantity,
@@ -1695,7 +2155,14 @@ async function loadRequestLines(db: D1Database, tenantId: string, purchaseReques
   return rows.results;
 }
 
-function assertRequestLinesCurrent(lines: RequestLineRow[]) {
+function assertRequestLinesCurrent(lines: RequestLineRow[], source: PurchaseRequestSource) {
+  if (source === 'manual') {
+    if (lines.some((line) => line.active !== 1 || line.sku_active !== 1
+      || line.purchase_demand_id !== null || line.source_required_quantity !== null || line.source_updated_at !== null)) {
+      throw new HttpError(409, '手工采购申请含无效 SKU 或采购明细，请重新建单', 'PURCHASE_SKU_UNAVAILABLE');
+    }
+    return;
+  }
   if (lines.some((line) => (
     line.active !== 1
     || line.demand_status !== 'open'
@@ -1766,7 +2233,7 @@ function assertPurchaseReceiptWarehouse(
   }
 }
 
-async function assertPurchaseRequestPurchaser(
+async function authorizePurchaseOrderCreation(
   db: D1Database,
   user: UserContext,
   purchaseRequestId: string,
@@ -1781,22 +2248,33 @@ async function assertPurchaseRequestPurchaser(
   if (!request) {
     throw new HttpError(404, '采购申请不存在或不在当前数据范围内', 'PURCHASE_REQUEST_NOT_FOUND');
   }
-  const actorMemberId = await resolveActorMemberId(db, user);
-  if (!developmentOpenAccess && request.purchaser_member_id !== actorMemberId) {
-    throw new HttpError(
-      403,
-      '只有该申请指定的采购负责人可以生成正式采购单',
-      'PURCHASE_ORDER_PURCHASER_REQUIRED',
-    );
-  }
-  return actorMemberId;
+  return authorizePurchaseOrderMember(db, user, request.purchaser_member_id, developmentOpenAccess, true);
 }
 
-async function assertPurchaseOrderPurchaser(
+const PURCHASE_ORDER_ACTOR_GUARD_SQL = purchaseOrderActorGuardSql('purchase_orders.tenant_id', 'purchase_orders.purchase_request_id');
+
+function purchaseOrderActorGuardSql(tenant: string, request: string) {
+  return `(? = 1 OR EXISTS (
+    SELECT 1 FROM purchase_requests request
+    JOIN members actor ON actor.tenant_id = request.tenant_id AND actor.id = ?
+    WHERE (
+        (actor.id = request.purchaser_member_id AND actor.role IN ('operator', 'admin'))
+        OR (? = 1 AND actor.role = 'admin')
+      )
+      AND request.tenant_id = ${tenant} AND request.id = ${request}
+  ))`;
+}
+
+function purchaseOrderActorBindings(actor: PurchaseOrderActor) {
+  return [Number(actor.developmentOpenAccess), actor.memberId, Number(actor.canActAsAdministrator)];
+}
+
+async function authorizePurchaseOrderAction(
   db: D1Database,
   user: UserContext,
   purchaseOrderId: string,
-  developmentOpenAccess = false,
+  developmentOpenAccess: boolean,
+  allowAdministrator: boolean,
 ) {
   const order = await db.prepare(`
     SELECT request.purchaser_member_id
@@ -1810,22 +2288,39 @@ async function assertPurchaseOrderPurchaser(
   if (!order) {
     throw new HttpError(404, '采购单不存在或不在当前数据范围内', 'PURCHASE_ORDER_NOT_FOUND');
   }
-  const actorMemberId = await resolveActorMemberId(db, user);
-  if (!developmentOpenAccess && order.purchaser_member_id !== actorMemberId) {
+  return authorizePurchaseOrderMember(db, user, order.purchaser_member_id, developmentOpenAccess, allowAdministrator);
+}
+
+async function authorizePurchaseOrderMember(
+  db: D1Database,
+  user: UserContext,
+  purchaserMemberId: string,
+  developmentOpenAccess: boolean,
+  allowAdministrator: boolean,
+): Promise<PurchaseOrderActor> {
+  const actor = await resolveActorMember(db, user);
+  const canActAsAdministrator = allowAdministrator && user.role === 'admin' && actor.role === 'admin';
+  const isPurchaser = purchaserMemberId === actor.id && (actor.role === 'operator' || actor.role === 'admin');
+  if (!developmentOpenAccess && !isPurchaser && !canActAsAdministrator) {
     throw new HttpError(
       403,
-      '只有来源申请指定的采购负责人可以确认、取消或关闭采购单剩余量',
+      allowAdministrator ? '只有采购负责人或本工作区管理员可以继续下单' : '只有来源申请指定的采购负责人可以操作该采购单',
       'PURCHASE_ORDER_PURCHASER_REQUIRED',
     );
   }
+  return { memberId: actor.id, developmentOpenAccess, canActAsAdministrator };
 }
 
 async function resolveActorMemberId(db: D1Database, user: UserContext) {
+  return (await resolveActorMember(db, user)).id;
+}
+
+async function resolveActorMember(db: D1Database, user: UserContext) {
   const member = await db.prepare(`
-    SELECT id FROM members WHERE tenant_id = ? AND auth_user_id = ? LIMIT 1
-  `).bind(user.tenantId, user.id).first<{ id: string }>();
+    SELECT id, role FROM members WHERE tenant_id = ? AND auth_user_id = ? LIMIT 1
+  `).bind(user.tenantId, user.id).first<{ id: string; role: UserContext['role'] }>();
   if (!member) throw new HttpError(409, '当前操作人尚未加入采购工作区', 'PURCHASE_MEMBER_NOT_FOUND');
-  return member.id;
+  return member;
 }
 
 async function readActionReplay(
@@ -1970,6 +2465,9 @@ function parseJson(value: string | null) {
 
 function translateProcurementError(error: unknown): unknown {
   const message = error instanceof Error ? error.message : String(error);
+  if (message.includes('NOT NULL constraint failed: purchase_orders.status')) {
+    return new HttpError(409, '采购权限、供应商、收货仓或采购依据刚发生变化，请刷新后再操作', 'PURCHASE_ORDER_ISSUE_CONFLICT');
+  }
   if (message.includes('INVALID_PURCHASE_SUPPLIER')) {
     return new HttpError(409, '供应商不存在或已停用', 'PURCHASE_SUPPLIER_NOT_FOUND');
   }
@@ -2004,6 +2502,9 @@ function translateProcurementError(error: unknown): unknown {
   }
   if (message.includes('INVALID_RECEIPT_WAREHOUSE')) {
     return new HttpError(409, '入库仓库不存在或不在当前数据范围内', 'RECEIPT_WAREHOUSE_NOT_FOUND');
+  }
+  if (message.includes('PURCHASE_RECEIPT_QUALITY_LIMIT')) {
+    return new HttpError(409, '本次入库数量超过质检放行数量，请先完成质检', 'PURCHASE_RECEIPT_QUALITY_LIMIT');
   }
   if (message.includes('INVALID_PURCHASE_RECEIPT_LINE')
     || message.includes('ck_purchase_order_lines_received_range')) {

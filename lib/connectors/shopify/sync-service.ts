@@ -5,25 +5,35 @@ import { ShopifyOrderConnector } from './connector';
 import { sanitizedConnectorError, ShopifyConnectorError } from './errors';
 
 const DEFAULT_OVERLAP_SECONDS = 6 * 60 * 60;
+const INITIAL_BACKFILL_MILLISECONDS = 7 * 24 * 60 * 60 * 1000;
+
+export type ShopifyScheduledAuthorization = {
+  officialStoreId: string;
+  initialBackfillEnabled: boolean;
+};
 
 export async function runShopifyOrderSync(input: {
   request: ShopifyOrderSyncInput;
   config: ShopifyCredentialConfig;
   connector: Pick<ShopifyOrderConnector, 'getShopContext' | 'fetchOrdersPage' | 'fetchOrder'>;
   repository: PlatformOrderRepository;
+  scheduledAuthorization?: ShopifyScheduledAuthorization;
   now?: () => Date;
 }) {
   const nowFn = input.now ?? (() => new Date());
   const startedAt = nowFn().toISOString();
   const context = await input.connector.getShopContext();
+  if (input.scheduledAuthorization && context.id !== input.scheduledAuthorization.officialStoreId) {
+    throw new ShopifyConnectorError('SHOPIFY_IDENTITY_MISMATCH', 'Shopify 返回的官方 Shop ID 与租户已保存的授权不一致');
+  }
   const store = await input.repository.upsertVerifiedShopifyStore(input.config, context, startedAt);
   const previousState = await input.repository.getSyncState(store.id);
-  const window = determineWindow(input.request, previousState, startedAt);
+  const window = determineWindow(input.request, previousState, startedAt, input.scheduledAuthorization?.initialBackfillEnabled ?? false);
   verifyHistoricalScope(window.start, startedAt, context.scopes);
 
   const runId = await input.repository.beginSyncRun({
     storeId: store.id,
-    mode: input.request.mode,
+    mode: window.mode,
     windowStart: window.start,
     windowEnd: window.end,
     startingCursor: window.cursor,
@@ -116,7 +126,7 @@ export async function runShopifyOrderSync(input: {
         domain: context.domain,
       },
       apiVersion: SHOPIFY_API_VERSION,
-      mode: input.request.mode,
+      mode: window.mode,
       window: { from: window.start, to: window.end, overlapSeconds: window.overlapSeconds },
       stats,
       completedAt: finishedAt,
@@ -139,10 +149,14 @@ function determineWindow(
   request: ShopifyOrderSyncInput,
   state: Awaited<ReturnType<PlatformOrderRepository['getSyncState']>>,
   now: string,
+  initialBackfillEnabled: boolean,
 ) {
   const overlapSeconds = state?.overlapSeconds ?? DEFAULT_OVERLAP_SECONDS;
   const requestedStart = request.from ? new Date(request.from).toISOString() : null;
   const requestedEnd = request.to ? new Date(request.to).toISOString() : null;
+  const automaticInitialBackfill = initialBackfillEnabled && request.mode === 'incremental'
+    && !requestedStart && !requestedEnd && !state?.completedWatermark;
+  const mode: ShopifyOrderSyncInput['mode'] = automaticInitialBackfill ? 'backfill' : request.mode;
   const canResume = state
     && state.status !== 'idle'
     && state.activeWindowStart
@@ -156,12 +170,16 @@ function determineWindow(
       end: state.activeWindowEnd as string,
       cursor: state.nextPageCursor,
       overlapSeconds,
+      mode,
     };
   }
 
   let start = requestedStart;
   if (!start && state?.completedWatermark) {
     start = new Date(new Date(state.completedWatermark).getTime() - overlapSeconds * 1000).toISOString();
+  }
+  if (!start && automaticInitialBackfill) {
+    start = new Date(new Date(now).getTime() - INITIAL_BACKFILL_MILLISECONDS).toISOString();
   }
   if (!start) {
     throw new ShopifyConnectorError(
@@ -173,7 +191,7 @@ function determineWindow(
   if (new Date(start).getTime() > new Date(end).getTime()) {
     throw new ShopifyConnectorError('INVALID_SYNC_WINDOW', '同步开始时间不能晚于结束时间');
   }
-  return { start, end, cursor: null, overlapSeconds };
+  return { start, end, cursor: null, overlapSeconds, mode };
 }
 
 function verifyHistoricalScope(start: string, now: string, scopes: Set<string>) {

@@ -232,7 +232,7 @@ export async function listPurchaseReceiptCorrections(
   user: UserContext,
   purchaseReceiptId: string,
 ) {
-  requirePermission(user, 'purchase:read');
+  if (!user.permissions.includes('warehouse:read')) requirePermission(user, 'purchase:read');
   const normalizedId = purchaseReceiptId.trim();
   const receipt = await db.prepare(`
     SELECT id FROM purchase_receipts WHERE tenant_id = ? AND id = ? LIMIT 1

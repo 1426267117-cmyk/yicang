@@ -1,35 +1,32 @@
 export const SHOPIFY_API_VERSION = '2026-07';
+export const SHOPIFY_ORDER_READ_SCOPES = ['read_orders'] as const;
+export const SHOPIFY_CATALOG_READ_SCOPES = ['read_products', 'read_inventory'] as const;
+type ShopifyReadScope = (typeof SHOPIFY_ORDER_READ_SCOPES)[number] | (typeof SHOPIFY_CATALOG_READ_SCOPES)[number];
+export type ShopifyCapabilityState = 'granted' | 'missing' | 'unknown' | 'unconfigured';
+export type ShopifyAccessCapabilities = Record<'orders' | 'products' | 'inventory', ShopifyCapabilityState>;
 
 export const SHOPIFY_STORE_CANDIDATES = [
   {
     key: 'zimasya',
     displayName: 'ZIMASYA',
-    expectedDomain: '346c85.myshopify.com',
-    acceptedDomains: ['346c85.myshopify.com'],
     environmentPrefix: 'SHOPIFY_ZIMASYA',
     authMode: 'oauth',
   },
   {
     key: 'kaguyasu',
     displayName: 'Kaguyasu',
-    expectedDomain: 'officebaseca.myshopify.com',
-    acceptedDomains: ['officebaseca.myshopify.com'],
     environmentPrefix: 'SHOPIFY_KAGUYASU',
     authMode: 'oauth',
   },
   {
     key: 'anzhap',
     displayName: 'Anzhap',
-    expectedDomain: 'anzhap.myshopify.com',
-    acceptedDomains: ['anzhap.myshopify.com'],
     environmentPrefix: 'SHOPIFY_ANZ',
     authMode: 'oauth',
   },
   {
     key: 'bizfurniz',
     displayName: 'BizFurniz',
-    expectedDomain: 'z6w01w-xs.myshopify.com',
-    acceptedDomains: ['z6w01w-xs.myshopify.com', 'bizfurniz.myshopify.com'],
     environmentPrefix: 'SHOPIFY_BIZFURNIZ',
     authMode: 'oauth',
   },
@@ -53,6 +50,7 @@ export type ShopifyCredentialConfig = {
   adminAccessToken: string | null;
   clientId: string | null;
   clientSecret: string | null;
+  catalogReadEnabled?: boolean;
 };
 
 export type ShopifyStoreConfigurationInspection =
@@ -60,7 +58,7 @@ export type ShopifyStoreConfigurationInspection =
   | {
       ok: false;
       config: null;
-      errorCode: 'INVALID_SHOPIFY_DOMAIN' | 'SHOPIFY_CONFIGURATION_INVALID';
+      errorCode: 'SHOPIFY_DOMAIN_UNCONFIGURED' | 'INVALID_SHOPIFY_DOMAIN' | 'SHOPIFY_CONFIGURATION_INVALID';
       candidate: (typeof SHOPIFY_STORE_CANDIDATES)[number];
     };
 
@@ -70,21 +68,41 @@ export function resolveShopifyStoreConfig(
 ): ShopifyCredentialConfig {
   const candidate = SHOPIFY_STORE_CANDIDATES.find((item) => item.key === storeKey);
   if (!candidate) throw new Error('UNKNOWN_SHOPIFY_STORE');
-  const overrideDomain = envString(runtimeEnv, `${candidate.environmentPrefix}_SHOP_DOMAIN`);
-  const domain = normalizeShopifyDomain(overrideDomain ?? candidate.expectedDomain);
-  const acceptedDomains = [...new Set([
-    domain,
-    ...candidate.acceptedDomains.map(normalizeShopifyDomain),
-  ])];
+  const configuredDomain = envString(runtimeEnv, `${candidate.environmentPrefix}_SHOP_DOMAIN`);
+  if (!configuredDomain) throw new Error('SHOPIFY_DOMAIN_UNCONFIGURED');
+  const domain = normalizeShopifyDomain(configuredDomain);
+  const aliases = envString(runtimeEnv, `${candidate.environmentPrefix}_ACCEPTED_DOMAINS`)
+    ?.split(',').map((alias) => alias.trim()).filter(Boolean) ?? [];
+  const acceptedDomains = [...new Set([domain, ...aliases.map(normalizeShopifyDomain)])];
   return {
     ...candidate,
     domain,
+    expectedDomain: domain,
     acceptedDomains,
     credentialRef: `env:${candidate.environmentPrefix}`,
     adminAccessToken: envString(runtimeEnv, `${candidate.environmentPrefix}_ADMIN_ACCESS_TOKEN`),
     clientId: envString(runtimeEnv, `${candidate.environmentPrefix}_CLIENT_ID`),
     clientSecret: envString(runtimeEnv, `${candidate.environmentPrefix}_CLIENT_SECRET`),
+    catalogReadEnabled: envString(runtimeEnv, `${candidate.environmentPrefix}_CATALOG_READ_ENABLED`) === 'true',
   };
+}
+
+export function shopifyRequestedReadScopes(config: Pick<ShopifyCredentialConfig, 'catalogReadEnabled'>): ShopifyReadScope[] {
+  return config.catalogReadEnabled ? [...SHOPIFY_ORDER_READ_SCOPES, ...SHOPIFY_CATALOG_READ_SCOPES] : [...SHOPIFY_ORDER_READ_SCOPES];
+}
+
+export function hasShopifyReadScope(scopes: ReadonlySet<string>, scope: ShopifyReadScope) {
+  return scopes.has(scope) || (scope !== 'read_orders' && scopes.has(`write_${scope.slice(5)}`));
+}
+
+export function missingShopifyReadScopes(config: Pick<ShopifyCredentialConfig, 'catalogReadEnabled'>, scopes: ReadonlySet<string>) {
+  return shopifyRequestedReadScopes(config).filter((scope) => !hasShopifyReadScope(scopes, scope));
+}
+
+export function shopifyAccessCapabilities(configured: boolean, scopes: ReadonlySet<string> | null): ShopifyAccessCapabilities {
+  const state = (scope: ShopifyReadScope): ShopifyCapabilityState => !configured ? 'unconfigured' : !scopes ? 'unknown'
+    : hasShopifyReadScope(scopes, scope) ? 'granted' : 'missing';
+  return { orders: state('read_orders'), products: state('read_products'), inventory: state('read_inventory') };
 }
 
 export function inspectShopifyStoreConfiguration(
@@ -96,11 +114,12 @@ export function inspectShopifyStoreConfiguration(
   try {
     return { ok: true, config: resolveShopifyStoreConfig(runtimeEnv, storeKey), errorCode: null };
   } catch (error) {
+    const message = error instanceof Error ? error.message : '';
     return {
       ok: false,
       config: null,
-      errorCode: error instanceof Error && error.message === 'INVALID_SHOPIFY_DOMAIN'
-        ? 'INVALID_SHOPIFY_DOMAIN'
+      errorCode: message === 'SHOPIFY_DOMAIN_UNCONFIGURED' || message === 'INVALID_SHOPIFY_DOMAIN'
+        ? message
         : 'SHOPIFY_CONFIGURATION_INVALID',
       candidate,
     };

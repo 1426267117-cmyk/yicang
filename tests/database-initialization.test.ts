@@ -5,6 +5,8 @@ import {
   assertDatabaseSchemaReady,
   DATABASE_REQUIRED_COLUMNS,
   DATABASE_REQUIRED_TABLES,
+  DATABASE_REQUIRED_TRIGGERS,
+  DATABASE_REQUIRED_VIEWS,
   DATABASE_SCHEMA_READINESS,
 } from '../db/initialize';
 
@@ -27,14 +29,35 @@ describe('数据库初始化', () => {
     expect(source).toContain('DATABASE_MIGRATIONS_PENDING');
   });
 
-  it('收货冲正、短到关闭和采购交付字段齐全时才判定数据库就绪', async () => {
+  it('采购、物流、财务和仓库的数据结构齐全时判定数据库就绪', async () => {
     await expect(assertDatabaseSchemaReady(readinessDatabase())).resolves.toBeUndefined();
-    expect(DATABASE_SCHEMA_READINESS).toBe('procurement-0016');
+    expect(DATABASE_SCHEMA_READINESS).toBe('erp-0035');
     expect(DATABASE_REQUIRED_TABLES).toEqual(expect.arrayContaining([
       'purchase_receipt_corrections',
       'purchase_receipt_correction_lines',
       'inventory_receipt_correction_movements',
+      'feishu_procurement_previews',
+      'feishu_procurement_sync_state',
+      'logistics_tracking_events',
+      'purchase_payments',
+      'warehouse_stock_counts',
+      'warehouse_outbound_events',
+      'purchase_invoices',
+      'nine_store_order_snapshots',
+      'native_channel_handoff_proofs',
+      'shopify_inventory_mirror_entries',
+      'purchase_supplier_quotes',
+      'purchase_quality_requirements',
     ]));
+  });
+
+  it('盘点写入触发器漏迁移时失败关闭', async () => {
+    await expect(assertDatabaseSchemaReady(readinessDatabase({ triggers: [] })))
+      .rejects.toThrow('DATABASE_MIGRATIONS_PENDING');
+  });
+
+  it('渠道转单证据视图漏迁移时失败关闭', async () => {
+    await expect(assertDatabaseSchemaReady(readinessDatabase({ views: [] }))).rejects.toThrow('DATABASE_MIGRATIONS_PENDING');
   });
 
   it('收货冲正表漏迁移时失败关闭', async () => {
@@ -46,6 +69,9 @@ describe('数据库初始化', () => {
   });
 
   it.each([
+    ['feishu_procurement_sync_state', 'lease_id'],
+    ['feishu_procurement_previews', 'payload_json'],
+    ['purchase_requests', 'source'],
     ['purchase_receipt_corrections', 'reason'],
     ['purchase_receipt_correction_lines', 'quantity'],
     ['inventory_receipt_correction_movements', 'on_hand_delta'],
@@ -98,7 +124,8 @@ describe('数据库初始化', () => {
     expect(dbSource).toContain('ERP_ACCESS_NOT_ALLOWED');
     expect(dbSource).toContain('ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED');
     expect(dbSource).toContain('ERP_SYNC_OPERATOR_EMAIL_REQUIRED');
-    expect(syncSource).toContain('requireProductionAccessPolicy(runtimeEnv, user.email)');
+    expect(dbSource).toContain('function requireShopifyConnectorOperator');
+    expect(syncSource).toContain('requireShopifyConnectorOperator(runtimeEnv, user)');
   });
 });
 
@@ -113,16 +140,20 @@ function readinessColumns(): Record<RequiredColumnTable, string[]> {
 
 function readinessDatabase(input: {
   tables?: readonly RequiredTable[];
+  triggers?: readonly string[];
+  views?: readonly string[];
   columns?: Record<RequiredColumnTable, string[]>;
 } = {}) {
   const tables = input.tables ?? DATABASE_REQUIRED_TABLES;
+  const triggers = input.triggers ?? DATABASE_REQUIRED_TRIGGERS;
+  const views = input.views ?? DATABASE_REQUIRED_VIEWS;
   const columns = input.columns ?? readinessColumns();
   return {
     prepare(sql: string) {
       return {
         async all<T>() {
           if (sql.includes('sqlite_master')) {
-            return { results: tables.map((name) => ({ name })) as T[] };
+            return { results: [...tables, ...triggers, ...views].map((name) => ({ name })) as T[] };
           }
           const match = sql.match(/PRAGMA table_info\('([^']+)'\)/u);
           const table = match?.[1] as RequiredColumnTable | undefined;

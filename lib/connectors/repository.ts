@@ -1,4 +1,4 @@
-import type { CanonicalOrderGraph } from './types';
+import type { CanonicalOrderGraph, OrderConnectorPlatform } from './types';
 import { sha256Hex, stableId, stableJson } from './stable';
 import type { ShopifyCredentialConfig } from './shopify/config';
 import type { ShopifyShopContext } from './shopify/connector';
@@ -48,11 +48,37 @@ export type SyncRunStats = {
   ordersUnchanged: number;
 };
 
+export class PlatformOrderRepositoryError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly retryable = false,
+  ) {
+    super(message);
+  }
+}
+
 export class PlatformOrderRepository {
+  private readonly platform: OrderConnectorPlatform;
+
   constructor(
     private readonly db: D1Database,
     private readonly tenantId: string,
-  ) {}
+    platform: OrderConnectorPlatform = 'shopify',
+  ) {
+    this.platform = platform === 'amazon' ? 'amazon' : 'shopify';
+  }
+
+  private stateError(code: string, message: string, retryable = false, status: number | null = null) {
+    const qualifiedCode = `${this.platform.toUpperCase()}_${code}`;
+    return this.platform === 'shopify'
+      ? new ShopifyConnectorError(qualifiedCode, message, retryable, status)
+      : new PlatformOrderRepositoryError(qualifiedCode, message, retryable);
+  }
+
+  private syncLeaseLost() {
+    return this.stateError('SYNC_LEASE_LOST', '该同步任务已被新的任务接管，当前任务已停止', true);
+  }
 
   async upsertVerifiedShopifyStore(
     config: ShopifyCredentialConfig,
@@ -143,7 +169,7 @@ export class PlatformOrderRepository {
       SELECT completed_watermark, active_window_start, active_window_end, next_page_cursor,
              overlap_seconds, status, last_run_id
       FROM connector_sync_state
-      WHERE tenant_id = ? AND platform_store_id = ? AND connector = 'shopify' AND resource = 'orders'
+      WHERE tenant_id = ? AND platform_store_id = ? AND connector = '${this.platform}' AND resource = 'orders'
       LIMIT 1
     `).bind(this.tenantId, storeId).first<{
       completed_watermark: string | null;
@@ -177,7 +203,7 @@ export class PlatformOrderRepository {
     now: string;
   }) {
     const runId = crypto.randomUUID();
-    const stateId = await stableId('syncstate', this.tenantId, input.storeId, 'shopify', 'orders');
+    const stateId = await stableId('syncstate', this.tenantId, input.storeId, this.platform, 'orders');
     const leaseExpiredBefore = new Date(new Date(input.now).getTime() - SYNC_LEASE_MILLISECONDS).toISOString();
     const results = await this.db.batch([
       this.db.prepare(`
@@ -185,7 +211,7 @@ export class PlatformOrderRepository {
           id, tenant_id, platform_store_id, connector, resource, completed_watermark,
           active_window_start, active_window_end, next_page_cursor, overlap_seconds,
           status, last_run_id, last_success_at, last_error_code, last_error_at, updated_at
-        ) VALUES (?, ?, ?, 'shopify', 'orders', NULL, NULL, NULL, NULL, ?, 'idle', NULL, NULL, NULL, NULL, ?)
+        ) VALUES (?, ?, ?, '${this.platform}', 'orders', NULL, NULL, NULL, NULL, ?, 'idle', NULL, NULL, NULL, NULL, ?)
       `).bind(
         stateId,
         this.tenantId,
@@ -199,7 +225,7 @@ export class PlatformOrderRepository {
             overlap_seconds = ?, status = 'running', last_run_id = ?,
             last_error_code = NULL, last_error_at = NULL, updated_at = ?
         WHERE tenant_id = ? AND platform_store_id = ?
-          AND connector = 'shopify' AND resource = 'orders'
+          AND connector = '${this.platform}' AND resource = 'orders'
           AND (status <> 'running' OR updated_at < ?)
           AND last_run_id IS ? AND completed_watermark IS ?
       `).bind(
@@ -217,15 +243,15 @@ export class PlatformOrderRepository {
       ),
       this.db.prepare(`
         UPDATE connector_sync_runs
-        SET status = 'failed', error_code = 'SHOPIFY_SYNC_LEASE_EXPIRED',
+        SET status = 'failed', error_code = '${this.platform.toUpperCase()}_SYNC_LEASE_EXPIRED',
             error_message = '同步租约已过期并由新任务接管', finished_at = ?
         WHERE tenant_id = ? AND platform_store_id = ?
-          AND connector = 'shopify' AND resource = 'orders'
+          AND connector = '${this.platform}' AND resource = 'orders'
           AND status = 'running' AND id <> ?
           AND EXISTS (
             SELECT 1 FROM connector_sync_state
             WHERE tenant_id = ? AND platform_store_id = ?
-              AND connector = 'shopify' AND resource = 'orders'
+              AND connector = '${this.platform}' AND resource = 'orders'
               AND status = 'running' AND last_run_id = ?
           )
       `).bind(
@@ -244,12 +270,12 @@ export class PlatformOrderRepository {
           pages_completed, orders_seen, orders_inserted, orders_updated, orders_unchanged,
           error_code, error_message, started_at, finished_at
         )
-        SELECT ?, ?, ?, 'shopify', 'orders', ?, ?, ?, ?, ?, 'running',
+        SELECT ?, ?, ?, '${this.platform}', 'orders', ?, ?, ?, ?, ?, 'running',
                0, 0, 0, 0, 0, NULL, NULL, ?, NULL
         WHERE EXISTS (
           SELECT 1 FROM connector_sync_state
           WHERE tenant_id = ? AND platform_store_id = ?
-            AND connector = 'shopify' AND resource = 'orders'
+            AND connector = '${this.platform}' AND resource = 'orders'
             AND status = 'running' AND last_run_id = ?
         )
       `).bind(
@@ -270,8 +296,8 @@ export class PlatformOrderRepository {
     if (changedRows(results[3]) !== 1) {
       const current = await this.getSyncState(input.storeId);
       const running = current?.status === 'running';
-      throw new ShopifyConnectorError(
-        running ? 'SHOPIFY_SYNC_ALREADY_RUNNING' : 'SHOPIFY_SYNC_STATE_CHANGED',
+      throw this.stateError(
+        running ? 'SYNC_ALREADY_RUNNING' : 'SYNC_STATE_CHANGED',
         running
           ? '该店铺已有订单同步任务正在运行，请等待当前任务完成后再试'
           : '同步状态在任务启动前发生变化，请重新发起同步以使用最新水位',
@@ -285,10 +311,10 @@ export class PlatformOrderRepository {
     const result = await this.db.prepare(`
       UPDATE connector_sync_state SET updated_at = ?
       WHERE tenant_id = ? AND platform_store_id = ?
-        AND connector = 'shopify' AND resource = 'orders'
+        AND connector = '${this.platform}' AND resource = 'orders'
         AND status = 'running' AND last_run_id = ?
     `).bind(input.now, this.tenantId, input.storeId, input.runId).run();
-    if (changedRows(result) !== 1) throw syncLeaseLost();
+    if (changedRows(result) !== 1) throw this.syncLeaseLost();
   }
 
   async checkpointPage(input: {
@@ -307,7 +333,7 @@ export class PlatformOrderRepository {
           AND EXISTS (
             SELECT 1 FROM connector_sync_state
             WHERE tenant_id = ? AND platform_store_id = ?
-              AND connector = 'shopify' AND resource = 'orders'
+              AND connector = '${this.platform}' AND resource = 'orders'
               AND status = 'running' AND last_run_id = ?
           )
       `).bind(
@@ -326,11 +352,11 @@ export class PlatformOrderRepository {
       this.db.prepare(`
         UPDATE connector_sync_state
         SET next_page_cursor = ?, status = 'running', updated_at = ?
-        WHERE tenant_id = ? AND platform_store_id = ? AND connector = 'shopify' AND resource = 'orders'
+        WHERE tenant_id = ? AND platform_store_id = ? AND connector = '${this.platform}' AND resource = 'orders'
           AND status = 'running' AND last_run_id = ?
       `).bind(input.nextCursor, input.now, this.tenantId, input.storeId, input.runId),
     ]);
-    if (changedRows(results[1]) !== 1) throw syncLeaseLost();
+    if (changedRows(results[1]) !== 1) throw this.syncLeaseLost();
   }
 
   async completeSyncRun(input: {
@@ -349,7 +375,7 @@ export class PlatformOrderRepository {
           AND EXISTS (
             SELECT 1 FROM connector_sync_state
             WHERE tenant_id = ? AND platform_store_id = ?
-              AND connector = 'shopify' AND resource = 'orders'
+              AND connector = '${this.platform}' AND resource = 'orders'
               AND status = 'running' AND last_run_id = ?
           )
       `).bind(
@@ -367,20 +393,22 @@ export class PlatformOrderRepository {
       ),
       this.db.prepare(`
         UPDATE connector_sync_state
-        SET completed_watermark = ?, active_window_start = NULL, active_window_end = NULL,
+        SET completed_watermark = CASE WHEN completed_watermark IS NULL OR completed_watermark < ?
+              THEN ? ELSE completed_watermark END,
+            active_window_start = NULL, active_window_end = NULL,
             next_page_cursor = NULL, status = 'idle', last_success_at = ?,
             last_error_code = NULL, last_error_at = NULL, updated_at = ?
-        WHERE tenant_id = ? AND platform_store_id = ? AND connector = 'shopify' AND resource = 'orders'
+        WHERE tenant_id = ? AND platform_store_id = ? AND connector = '${this.platform}' AND resource = 'orders'
           AND status = 'running' AND last_run_id = ?
-      `).bind(input.windowEnd, input.now, input.now, this.tenantId, input.storeId, input.runId),
+      `).bind(input.windowEnd, input.windowEnd, input.now, input.now, this.tenantId, input.storeId, input.runId),
       this.db.prepare(`
         UPDATE platform_stores SET last_successful_sync_at = ?, updated_at = ?
         WHERE id = ? AND tenant_id = ?
           AND EXISTS (
             SELECT 1 FROM connector_sync_state
             WHERE tenant_id = ? AND platform_store_id = ?
-              AND connector = 'shopify' AND resource = 'orders'
-              AND status = 'idle' AND last_run_id = ? AND completed_watermark = ?
+              AND connector = '${this.platform}' AND resource = 'orders'
+            AND status = 'idle' AND last_run_id = ? AND completed_watermark >= ?
           )
       `).bind(
         input.now,
@@ -393,7 +421,7 @@ export class PlatformOrderRepository {
         input.windowEnd,
       ),
     ]);
-    if (changedRows(results[1]) !== 1) throw syncLeaseLost();
+    if (changedRows(results[1]) !== 1) throw this.syncLeaseLost();
   }
 
   async failSyncRun(input: {
@@ -425,7 +453,7 @@ export class PlatformOrderRepository {
       this.db.prepare(`
         UPDATE connector_sync_state
         SET status = 'failed', last_error_code = ?, last_error_at = ?, updated_at = ?
-        WHERE tenant_id = ? AND platform_store_id = ? AND connector = 'shopify' AND resource = 'orders'
+        WHERE tenant_id = ? AND platform_store_id = ? AND connector = '${this.platform}' AND resource = 'orders'
           AND status = 'running' AND last_run_id = ?
       `).bind(input.errorCode, input.now, input.now, this.tenantId, input.storeId, input.runId),
     ]);
@@ -433,11 +461,14 @@ export class PlatformOrderRepository {
 
   async upsertOrderGraph(input: {
     storeId: string;
-    graph: CanonicalOrderGraph;
+    graph: CanonicalOrderGraph<OrderConnectorPlatform>;
     apiVersion: string;
     runId: string | null;
     fetchedAt: string;
   }): Promise<'inserted' | 'updated' | 'unchanged'> {
+    if (input.graph.platform !== this.platform) {
+      throw this.stateError('ORDER_PLATFORM_MISMATCH', '订单渠道与同步任务不一致');
+    }
     const orderId = await stableId('porder', this.tenantId, input.storeId, input.graph.sourceOrderId);
     const leaseId = await this.acquireOrderWriteLease(orderId);
     try {
@@ -451,7 +482,7 @@ export class PlatformOrderRepository {
     orderId: string,
     input: {
       storeId: string;
-      graph: CanonicalOrderGraph;
+      graph: CanonicalOrderGraph<OrderConnectorPlatform>;
       apiVersion: string;
       runId: string | null;
       fetchedAt: string;
@@ -460,26 +491,24 @@ export class PlatformOrderRepository {
     const rawJson = stableJson(input.graph.raw);
     const rawHash = await sha256Hex(rawJson);
     const existing = await this.db.prepare(
-      'SELECT raw_hash, source_updated_at FROM platform_orders WHERE id = ? AND tenant_id = ? LIMIT 1',
-    ).bind(orderId, this.tenantId).first<{ raw_hash: string; source_updated_at: string }>();
-    if (existing && Date.parse(existing.source_updated_at) > Date.parse(input.graph.sourceUpdatedAt)) {
-      await this.db.batch([
-        this.db.prepare(`
-          UPDATE platform_orders SET fetched_at = ?, last_seen_at = ?
-          WHERE id = ? AND tenant_id = ?
-        `).bind(input.fetchedAt, input.fetchedAt, orderId, this.tenantId),
-        this.purchaseDemandRefreshStatement(orderId, input.fetchedAt),
-      ]);
-      return 'unchanged';
+      'SELECT raw_hash, source_updated_at, fetched_at FROM platform_orders WHERE id = ? AND tenant_id = ? LIMIT 1',
+    ).bind(orderId, this.tenantId).first<{ raw_hash: string; source_updated_at: string; fetched_at: string }>();
+    if (existing) {
+      const storedUpdate = Date.parse(existing.source_updated_at);
+      const incomingUpdate = Date.parse(input.graph.sourceUpdatedAt);
+      if (storedUpdate > incomingUpdate || (storedUpdate === incomingUpdate && existing.fetched_at > input.fetchedAt)) {
+        return 'unchanged';
+      }
     }
     if (existing?.raw_hash === rawHash) {
-      await this.db.batch([
+      const updates = [
         this.db.prepare(`
           UPDATE platform_orders SET fetched_at = ?, last_seen_at = ?
-          WHERE id = ? AND tenant_id = ?
-        `).bind(input.fetchedAt, input.fetchedAt, orderId, this.tenantId),
-        this.purchaseDemandRefreshStatement(orderId, input.fetchedAt),
-      ]);
+          WHERE id = ? AND tenant_id = ? AND fetched_at <= ?
+        `).bind(input.fetchedAt, input.fetchedAt, orderId, this.tenantId, input.fetchedAt),
+      ];
+      if (this.platform === 'shopify') updates.push(this.purchaseDemandRefreshStatement(orderId, input.fetchedAt));
+      await this.db.batch(updates);
       return 'unchanged';
     }
 
@@ -521,7 +550,7 @@ export class PlatformOrderRepository {
         line.discount?.amount ?? null, line.discount?.minor ?? null,
         lineJson, lineHash, input.fetchedAt, input.fetchedAt,
       ));
-      if (line.rawSku && line.normalizedSku) {
+      if (this.platform === 'shopify' && line.rawSku && line.normalizedSku) {
         const mappingId = await stableId('skumap', this.tenantId, input.storeId, line.rawSku);
         statements.push(this.db.prepare(`
           INSERT INTO platform_sku_mappings (
@@ -668,7 +697,7 @@ export class PlatformOrderRepository {
     }
 
     const snapshotId = await stableId('posnapshot', orderId, rawHash);
-    statements.push(this.purchaseDemandRefreshStatement(orderId, input.fetchedAt));
+    if (this.platform === 'shopify') statements.push(this.purchaseDemandRefreshStatement(orderId, input.fetchedAt));
     statements.push(this.db.prepare(`
       INSERT OR IGNORE INTO platform_order_snapshots (
         id, tenant_id, order_id, sync_run_id, source_updated_at, raw_hash, raw_json, fetched_at
@@ -702,8 +731,8 @@ export class PlatformOrderRepository {
       ]);
       if (changedRows(results[1]) === 1) return leaseId;
       if (Date.now() >= deadline) {
-        throw new ShopifyConnectorError(
-          'SHOPIFY_ORDER_WRITE_BUSY',
+        throw this.stateError(
+          'ORDER_WRITE_BUSY',
           '同一订单正在由另一同步任务更新，请稍后重试',
           true,
           409,
@@ -725,7 +754,7 @@ export class PlatformOrderRepository {
     orderId: string,
     input: {
       storeId: string;
-      graph: CanonicalOrderGraph;
+      graph: CanonicalOrderGraph<OrderConnectorPlatform>;
       apiVersion: string;
       runId: string | null;
       fetchedAt: string;
@@ -744,7 +773,7 @@ export class PlatformOrderRepository {
         original_total_amount, original_total_minor, current_total_amount, current_total_minor,
         received_amount, received_minor, refunded_amount, refunded_minor, business_ownership,
         api_version, raw_json, raw_hash, fetched_at, first_seen_at, last_seen_at
-      ) VALUES (?, ?, ?, 'shopify', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         source_order_name = excluded.source_order_name, source_created_at = excluded.source_created_at,
         source_updated_at = excluded.source_updated_at, source_processed_at = excluded.source_processed_at,
@@ -766,7 +795,7 @@ export class PlatformOrderRepository {
         raw_json = excluded.raw_json, raw_hash = excluded.raw_hash, fetched_at = excluded.fetched_at,
         last_seen_at = excluded.last_seen_at
     `).bind(
-      orderId, this.tenantId, input.storeId, order.sourceOrderId, order.sourceOrderName,
+      orderId, this.tenantId, input.storeId, order.platform, order.sourceOrderId, order.sourceOrderName,
       order.sourceCreatedAt, order.sourceUpdatedAt, order.sourceProcessedAt, order.sourceCancelledAt,
       order.sourceClosedAt, order.sourceTimezone, order.businessDate, order.test,
       order.financialStatus, order.fulfillmentStatus, order.currency,
@@ -935,12 +964,4 @@ function changedRows(result: D1Result<unknown> | undefined) {
 
 function wait(milliseconds: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
-}
-
-function syncLeaseLost() {
-  return new ShopifyConnectorError(
-    'SHOPIFY_SYNC_LEASE_LOST',
-    '该同步任务已被新的任务接管，当前任务已停止',
-    true,
-  );
 }

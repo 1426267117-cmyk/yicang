@@ -6,12 +6,12 @@ import {
 } from '../../../../../../../lib/connectors/shopify/config';
 import { assertCredentialEncryptionKey } from '../../../../../../../lib/connectors/shopify/credential-store';
 import { createShopifyOAuthApi } from '../../../../../../../lib/connectors/shopify/oauth';
+import { shopifyPublicOrigin } from '../../../../../../../lib/connectors/shopify/public-origin';
 import {
   HttpError,
   jsonError,
   requestContext,
-  requirePermission,
-  requireProductionAccessPolicy,
+  requireShopifyConnectorOperator,
 } from '../../../../../../../lib/db';
 
 export const dynamic = 'force-dynamic';
@@ -22,9 +22,8 @@ export async function GET(
 ) {
   try {
     const { user } = await requestContext(request);
-    requirePermission(user, 'connectors:sync');
     const runtimeEnv = env as unknown as Record<string, unknown>;
-    requireProductionAccessPolicy(runtimeEnv, user.email);
+    requireShopifyConnectorOperator(runtimeEnv, user);
     const { storeKey } = await context.params;
     if (!isShopifyStoreKey(storeKey)) {
       throw new HttpError(404, '未找到该 Shopify 店铺配置', 'UNKNOWN_SHOPIFY_STORE');
@@ -38,7 +37,7 @@ export async function GET(
       );
     }
     assertCredentialEncryptionKey(runtimeEnv);
-    const api = createShopifyOAuthApi(config, request.url);
+    const api = createShopifyOAuthApi(config, shopifyPublicOrigin(runtimeEnv, request.url));
     return api.auth.begin({
       shop: config.domain,
       callbackPath: `/api/connectors/shopify/oauth/${storeKey}/callback`,

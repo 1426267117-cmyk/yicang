@@ -1,13 +1,18 @@
 import { env } from 'cloudflare:workers';
+import { developmentOpenAccessEnabled, identityExplicitlyListed, readProductionAccessPolicy } from '../../../../../lib/access-policy';
 import {
   hasShopifyAppCredentials,
   hasShopifyCredentials,
   inspectShopifyStoreConfiguration,
+  missingShopifyReadScopes,
+  shopifyAccessCapabilities,
+  shopifyRequestedReadScopes,
   SHOPIFY_API_VERSION,
   SHOPIFY_STORE_CANDIDATES,
 } from '../../../../../lib/connectors/shopify/config';
 import { hasValidCredentialEncryptionKey } from '../../../../../lib/connectors/shopify/credential-store';
-import { jsonError, requestContext, requirePermission } from '../../../../../lib/db';
+import { isWorkspaceFeishuAdministrator, jsonError, requestContext, requirePermission } from '../../../../../lib/db';
+import { externalScheduleConfigured, hasSecureInternalJobToken } from '../../../../../lib/procurement-operations';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,6 +21,11 @@ export async function GET(request: Request) {
     const { db, user } = await requestContext(request);
     requirePermission(user, 'connectors:read');
     const runtimeEnv = env as unknown as Record<string, unknown>;
+    const accessPolicy = readProductionAccessPolicy(runtimeEnv);
+    const canStartAuthorization = user.permissions.includes('connectors:sync') && (
+      developmentOpenAccessEnabled(runtimeEnv)
+      || (accessPolicy.configured && (identityExplicitlyListed(user.email, accessPolicy) || isWorkspaceFeishuAdministrator(runtimeEnv, user)))
+    );
     const stored = await db.prepare(`
       SELECT s.connector_key, s.display_name, s.official_store_id, s.source_domain,
              s.identity_verified_at, s.last_successful_sync_at,
@@ -37,7 +47,7 @@ export async function GET(request: Request) {
     }>();
     const byKey = new Map(stored.results.map((row) => [row.connector_key, row]));
     const oauthCredentials = await db.prepare(`
-      SELECT store_key, official_store_id, shop_domain, access_token_expires_at,
+      SELECT store_key, official_store_id, shop_domain, granted_scopes, access_token_expires_at,
              refresh_token_expires_at, updated_at
       FROM connector_credentials
       WHERE tenant_id = ? AND platform = 'shopify'
@@ -45,6 +55,7 @@ export async function GET(request: Request) {
       store_key: string;
       official_store_id: string;
       shop_domain: string;
+      granted_scopes: string;
       access_token_expires_at: string | null;
       refresh_token_expires_at: string | null;
       updated_at: string;
@@ -55,16 +66,20 @@ export async function GET(request: Request) {
       const oauth = credentialByKey.get(candidate.key);
       const inspection = inspectShopifyStoreConfiguration(runtimeEnv, candidate.key);
       if (!inspection.ok) {
+        const configurationErrorCode = inspection.errorCode === 'SHOPIFY_DOMAIN_UNCONFIGURED' && !oauth && !row
+          ? null : inspection.errorCode;
         return {
           key: candidate.key,
           displayName: row?.display_name ?? candidate.displayName,
-          expectedDomain: candidate.expectedDomain,
-          configurationErrorCode: inspection.errorCode,
+          expectedDomain: null,
+          configurationErrorCode,
           appConfigured: false,
           encryptionReady: hasValidCredentialEncryptionKey(runtimeEnv),
           credentialsConfigured: false,
           authorizationRequired: false,
+          reauthorizationRequired: false,
           authorizationStartUrl: null,
+          accessCapabilities: shopifyAccessCapabilities(false, null),
           authorizationVerified: Boolean(oauth),
           authorizationUpdatedAt: oauth?.updated_at ?? null,
           accessTokenExpiresAt: oauth?.access_token_expires_at ?? null,
@@ -75,14 +90,18 @@ export async function GET(request: Request) {
           identityVerifiedAt: row?.identity_verified_at ?? null,
           lastSuccessfulSyncAt: row?.last_successful_sync_at ?? null,
           completedWatermark: row?.completed_watermark ?? null,
-          syncStatus: 'configuration_error',
-          lastErrorCode: inspection.errorCode,
+          syncStatus: configurationErrorCode ? 'configuration_error' : 'not_started',
+          lastErrorCode: configurationErrorCode,
         };
       }
       const config = inspection.config;
       const appConfigured = hasShopifyAppCredentials(config);
       const encryptionReady = hasValidCredentialEncryptionKey(runtimeEnv);
       const credentialsConfigured = hasShopifyCredentials(config) || Boolean(oauth);
+      const grantedScopes = oauth ? new Set(oauth.granted_scopes.split(',').map((scope) => scope.trim()).filter(Boolean)) : null;
+      const missingRequestedScopes = grantedScopes ? missingShopifyReadScopes(config, grantedScopes) : [];
+      const authorizationRequired = config.authMode === 'oauth' && !credentialsConfigured;
+      const reauthorizationRequired = config.authMode === 'oauth' && Boolean(oauth) && missingRequestedScopes.length > 0;
       return {
         key: candidate.key,
         displayName: row?.display_name ?? candidate.displayName,
@@ -91,8 +110,13 @@ export async function GET(request: Request) {
         appConfigured,
         encryptionReady,
         credentialsConfigured,
-        authorizationRequired: config.authMode === 'oauth' && !credentialsConfigured,
-        authorizationStartUrl: appConfigured && encryptionReady && config.authMode === 'oauth' && !credentialsConfigured
+        catalogReadEnabled: config.catalogReadEnabled === true,
+        requestedReadScopes: shopifyRequestedReadScopes(config),
+        missingRequestedScopes,
+        accessCapabilities: shopifyAccessCapabilities(credentialsConfigured, grantedScopes),
+        authorizationRequired,
+        reauthorizationRequired,
+        authorizationStartUrl: canStartAuthorization && appConfigured && encryptionReady && (authorizationRequired || reauthorizationRequired)
           ? `/api/connectors/shopify/oauth/${candidate.key}/start`
           : null,
         authorizationVerified: Boolean(oauth),
@@ -109,7 +133,12 @@ export async function GET(request: Request) {
         lastErrorCode: row?.last_error_code ?? null,
       };
     });
-    return Response.json({ ok: true, apiVersion: SHOPIFY_API_VERSION, readOnly: true, stores }, {
+    const automation = {
+      scheduledReconciliationConfigured: hasSecureInternalJobToken(runtimeEnv) && externalScheduleConfigured(runtimeEnv, 'shopify'),
+      reconciliationIntervalMinutes: 15,
+      webhookRetryIntervalMinutes: 1,
+    };
+    return Response.json({ ok: true, apiVersion: SHOPIFY_API_VERSION, readOnly: true, automation, stores }, {
       headers: { 'Cache-Control': 'no-store' },
     });
   } catch (error) {

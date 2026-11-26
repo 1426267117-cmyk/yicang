@@ -1,8 +1,18 @@
 import { sql } from 'drizzle-orm';
+import { definePurchaseInvoices, definePurchasePayments } from './finance-schema';
+import { createWarehouseStockCountsTable } from './warehouse-schema';
+import { createWarehouseOutboundEventsTable } from './warehouse-outbound-schema';
+import { defineSupplierQuotes } from './supplier-quote-schema';
+import { createPurchaseQualityTables } from './purchase-quality-schema';
+import { definePurchasePaymentRequestLinks, definePurchasePaymentRequests } from './payment-request-schema';
+import { defineNineStoreOrderHistory } from './nine-store-history-schema';
+import { makeNineStoreHandoffSchema } from './nine-store-handoff-schema';
 import {
+  blob,
   check,
   index,
   integer,
+  primaryKey,
   sqliteTable,
   text,
   uniqueIndex,
@@ -21,6 +31,7 @@ export const members = sqliteTable('members', {
   email: text('email').notNull(),
   displayName: text('display_name').notNull(),
   role: text('role', { enum: ['admin', 'operator', 'viewer'] }).notNull(),
+  accessProfile: text('access_profile', { enum: ['purchase', 'finance', 'amazon', 'wayfair', 'shopify', 'warehouse', 'pending'] }),
   createdAt: text('created_at').notNull(),
 }, (table) => [
   uniqueIndex('uq_members_auth_user').on(table.authUserId),
@@ -43,9 +54,21 @@ export const skus = sqliteTable('skus', {
   tenantId: text('tenant_id').notNull().references(() => tenants.id),
   code: text('code').notNull(),
   name: text('name').notNull(),
+  specification: text('specification'),
+  dimensions: text('dimensions'),
+  imageUrl: text('image_url'),
+  description: text('description'),
   active: integer('active', { mode: 'boolean' }).notNull().default(true),
   createdAt: text('created_at').notNull(),
 }, (table) => [uniqueIndex('uq_skus_tenant_code').on(table.tenantId, table.code)]);
+
+export const purchaseProductImages = sqliteTable('purchase_product_images', {
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  id: text('id').notNull(),
+  contentType: text('content_type').notNull(),
+  content: blob('content', { mode: 'buffer' }).notNull(),
+  createdAt: text('created_at').notNull(),
+}, (table) => [primaryKey({ columns: [table.tenantId, table.id] })]);
 
 export const mukuSkuMappings = sqliteTable('muku_sku_mappings', {
   id: text('id').primaryKey(),
@@ -109,6 +132,28 @@ export const orders = sqliteTable('orders', {
   index('idx_orders_tenant_status').on(table.tenantId, table.status),
   check('ck_orders_amount_positive', sql`${table.amountMinor} > 0`),
   check('ck_orders_quantity_positive', sql`${table.quantity} > 0`),
+]);
+
+export const logisticsTrackingEvents = sqliteTable('logistics_tracking_events', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  orderId: text('order_id').notNull().references(() => orders.id),
+  packageId: text('package_id').notNull(),
+  version: integer('version').notNull(),
+  carrier: text('carrier').notNull(),
+  trackingNumber: text('tracking_number').notNull(),
+  status: text('status', { enum: ['registered', 'in_transit', 'exception', 'delivered'] }).notNull(),
+  note: text('note'),
+  createdBy: text('created_by').notNull(),
+  createdAt: text('created_at').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+}, (table) => [
+  uniqueIndex('uq_logistics_package_version').on(table.tenantId, table.packageId, table.version),
+  uniqueIndex('uq_logistics_idempotency').on(table.tenantId, table.idempotencyKey),
+  index('idx_logistics_order_package').on(table.tenantId, table.orderId, table.packageId, table.version),
+  check('ck_logistics_version', sql`${table.version} > 0`),
+  check('ck_logistics_status', sql`${table.status} IN ('registered', 'in_transit', 'exception', 'delivered')`),
 ]);
 
 export const inventoryMovements = sqliteTable('inventory_movements', {
@@ -192,6 +237,40 @@ export const connectorCredentials = sqliteTable('connector_credentials', {
   uniqueIndex('uq_connector_credentials_store').on(table.tenantId, table.platform, table.storeKey),
   uniqueIndex('uq_connector_credentials_identity').on(table.tenantId, table.platform, table.officialStoreId),
   index('idx_connector_credentials_tenant').on(table.tenantId, table.platform),
+]);
+
+export const shopifyInventoryMirrorState = sqliteTable('shopify_inventory_mirror_state', {
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  platformStoreId: text('platform_store_id').notNull().references(() => platformStores.id),
+  cursorSku: text('cursor_sku'),
+  status: text('status', { enum: ['running', 'complete', 'partial', 'unavailable'] }).notNull(),
+  leaseId: text('lease_id'),
+  leaseExpiresAt: text('lease_expires_at'),
+  lastAttemptedAt: text('last_attempted_at').notNull(),
+  lastCompletedAt: text('last_completed_at'),
+  lastErrorCode: text('last_error_code'),
+}, table => [
+  primaryKey({ columns: [table.tenantId, table.platformStoreId] }),
+  check('ck_shopify_inventory_mirror_lease', sql`(${table.leaseId} IS NULL) = (${table.leaseExpiresAt} IS NULL)`),
+  check('ck_shopify_inventory_mirror_run_status', sql`${table.status} IN ('running', 'complete', 'partial', 'unavailable')`),
+]);
+
+export const shopifyInventoryMirrorEntries = sqliteTable('shopify_inventory_mirror_entries', {
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  platformStoreId: text('platform_store_id').notNull().references(() => platformStores.id),
+  sku: text('sku').notNull(),
+  status: text('status', { enum: ['verified', 'not_found', 'ambiguous', 'untracked', 'unavailable'] }).notNull(),
+  observedAt: text('observed_at'),
+  snapshotJson: text('snapshot_json'),
+  lastCheckedAt: text('last_checked_at').notNull(),
+  lastErrorCode: text('last_error_code'),
+}, table => [
+  primaryKey({ columns: [table.tenantId, table.platformStoreId, table.sku] }),
+  check('ck_shopify_inventory_mirror_entry_status', sql`${table.status} IN ('verified', 'not_found', 'ambiguous', 'untracked', 'unavailable')`),
+  check('ck_shopify_inventory_mirror_snapshot', sql`(
+    (${table.observedAt} IS NULL AND ${table.snapshotJson} IS NULL)
+    OR (${table.observedAt} IS NOT NULL AND ${table.snapshotJson} IS NOT NULL AND json_valid(${table.snapshotJson}) = 1)
+  )`),
 ]);
 
 export const shopifyWebhookEvents = sqliteTable('shopify_webhook_events', {
@@ -358,6 +437,7 @@ export const purchaseRequests = sqliteTable('purchase_requests', {
   status: text('status', {
     enum: ['draft', 'pending_review', 'approved', 'rejected', 'cancelled'],
   }).notNull(),
+  source: text('source', { enum: ['legacy', 'planning', 'manual'] }).notNull().default('legacy'),
   purchaserMemberId: text('purchaser_member_id').notNull().references(() => members.id),
   reviewerMemberId: text('reviewer_member_id').notNull().references(() => members.id),
   createdByMemberId: text('created_by_member_id').notNull().references(() => members.id),
@@ -377,17 +457,20 @@ export const purchaseRequests = sqliteTable('purchase_requests', {
   index('idx_purchase_requests_status').on(table.tenantId, table.status, table.updatedAt),
   index('idx_purchase_requests_purchaser').on(table.tenantId, table.purchaserMemberId),
   index('idx_purchase_requests_reviewer').on(table.tenantId, table.reviewerMemberId),
+  check('ck_purchase_requests_source', sql`${table.source} IN ('legacy', 'planning', 'manual')`),
+  check('ck_manual_purchase_requests_note', sql`${table.source} <> 'manual' OR (${table.note} IS NOT NULL AND length(trim(${table.note})) > 0)`),
 ]);
 
 export const purchaseRequestLines = sqliteTable('purchase_request_lines', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),
   requestId: text('request_id').notNull().references(() => purchaseRequests.id),
-  purchaseDemandId: text('purchase_demand_id').notNull().references(() => purchaseDemands.id),
+  purchaseDemandId: text('purchase_demand_id').references(() => purchaseDemands.id),
   skuId: text('sku_id').notNull().references(() => skus.id),
   requestedQuantity: integer('requested_quantity').notNull(),
-  sourceRequiredQuantity: integer('source_required_quantity').notNull(),
-  sourceUpdatedAt: text('source_updated_at').notNull(),
+  sourceRequiredQuantity: integer('source_required_quantity'),
+  sourceUpdatedAt: text('source_updated_at'),
+  productDetailsJson: text('product_details_json'),
   active: integer('active', { mode: 'boolean' }).notNull().default(true),
   createdAt: text('created_at').notNull(),
 }, (table) => [
@@ -395,9 +478,16 @@ export const purchaseRequestLines = sqliteTable('purchase_request_lines', {
   uniqueIndex('uq_purchase_request_lines_active_demand')
     .on(table.tenantId, table.purchaseDemandId)
     .where(sql`${table.active} = 1`),
+  uniqueIndex('uq_purchase_request_lines_manual_sku')
+    .on(table.requestId, table.skuId)
+    .where(sql`${table.purchaseDemandId} IS NULL`),
   index('idx_purchase_request_lines_request').on(table.tenantId, table.requestId),
   index('idx_purchase_request_lines_demand').on(table.tenantId, table.purchaseDemandId),
   check('ck_purchase_request_lines_quantity_positive', sql`${table.requestedQuantity} > 0`),
+  check('ck_purchase_request_lines_source_fields', sql`
+    (${table.purchaseDemandId} IS NULL AND ${table.sourceRequiredQuantity} IS NULL AND ${table.sourceUpdatedAt} IS NULL)
+    OR (${table.purchaseDemandId} IS NOT NULL AND ${table.sourceRequiredQuantity} IS NOT NULL AND ${table.sourceUpdatedAt} IS NOT NULL)
+  `),
 ]);
 
 export const suppliers = sqliteTable('suppliers', {
@@ -466,12 +556,38 @@ export const skuInventoryConfirmations = sqliteTable('sku_inventory_confirmation
   check('ck_sku_inventory_confirmation_non_negative', sql`${table.confirmedAvailableQty} >= 0`),
 ]);
 
+export const feishuProcurementPreviews = sqliteTable('feishu_procurement_previews', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  snapshotDate: text('snapshot_date').notNull(),
+  payloadHash: text('payload_hash').notNull(),
+  payloadJson: text('payload_json').notNull(),
+  importedBy: text('imported_by').notNull(),
+  importedAt: text('imported_at').notNull(),
+}, (table) => [
+  uniqueIndex('uq_feishu_procurement_previews_payload').on(table.tenantId, table.payloadHash),
+  index('idx_feishu_procurement_previews_latest').on(table.tenantId, table.snapshotDate, table.id),
+  check('ck_feishu_procurement_previews_payload_json', sql`json_valid(${table.payloadJson}) = 1`),
+]);
+
+export const feishuProcurementSyncState = sqliteTable('feishu_procurement_sync_state', {
+  tenantId: text('tenant_id').primaryKey().references(() => tenants.id),
+  queued: integer('queued', { mode: 'boolean' }).notNull().default(false),
+  leaseId: text('lease_id'),
+  leaseExpiresAt: text('lease_expires_at'),
+  lastAttemptAt: text('last_attempt_at'),
+  lastSuccessAt: text('last_success_at'),
+  lastError: text('last_error', { enum: ['SOURCE_FAILED', 'SOURCE_TIMEOUT', 'INVALID_SNAPSHOT', 'WORKER_STOPPED'] }),
+}, (table) => [
+  check('ck_feishu_procurement_sync_lease', sql`(${table.leaseId} IS NULL) = (${table.leaseExpiresAt} IS NULL)`),
+]);
+
 export const purchaseOrders = sqliteTable('purchase_orders', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),
   orderNo: text('order_no').notNull(),
   purchaseRequestId: text('purchase_request_id').notNull().references(() => purchaseRequests.id),
-  supplierId: text('supplier_id').notNull().references(() => suppliers.id),
+  supplierId: text('supplier_id').references(() => suppliers.id),
   deliveryWarehouseId: text('delivery_warehouse_id').references(() => warehouses.id),
   expectedDeliveryAt: text('expected_delivery_at'),
   paymentTerms: text('payment_terms'),
@@ -522,6 +638,7 @@ export const purchaseOrderLines = sqliteTable('purchase_order_lines', {
   skuId: text('sku_id').notNull().references(() => skus.id),
   skuCodeSnapshot: text('sku_code_snapshot').notNull(),
   skuNameSnapshot: text('sku_name_snapshot').notNull(),
+  productDetailsJson: text('product_details_json'),
   orderedQuantity: integer('ordered_quantity').notNull(),
   receivedQuantity: integer('received_quantity').notNull().default(0),
   unitCostMinor: integer('unit_cost_minor'),
@@ -1004,3 +1121,62 @@ export const mukuSourceStatusRecords = sqliteTable('muku_source_status_records',
   uniqueIndex('uq_muku_source_status_snapshot_key').on(table.snapshotId, table.stableKey),
   index('idx_muku_source_status_lookup').on(table.tenantId, table.snapshotId, table.sourceKind, table.sourceId, table.businessDate),
 ]);
+
+export const purchasePayments = definePurchasePayments({
+  tenantId: tenants.id,
+  purchaseOrderId: purchaseOrders.id,
+  memberId: members.id,
+});
+
+export const purchaseInvoices = definePurchaseInvoices({
+  tenantId: tenants.id,
+  purchaseOrderId: purchaseOrders.id,
+  memberId: members.id,
+});
+
+export const warehouseStockCounts = createWarehouseStockCountsTable({
+  tenant: () => tenants.id,
+  warehouse: () => warehouses.id,
+  sku: () => skus.id,
+});
+
+export const warehouseOutboundEvents = createWarehouseOutboundEventsTable({
+  tenant: () => tenants.id,
+  order: () => orders.id,
+});
+
+export const nineStoreOrderSnapshots = sqliteTable('nine_store_order_snapshots', {
+  tenantId: text('tenant_id').primaryKey().notNull().references(() => tenants.id),
+  observedAt: text('observed_at').notNull(),
+  payloadHash: text('payload_hash').notNull(),
+  payloadJson: text('payload_json').notNull(),
+  importedAt: text('imported_at').notNull(),
+}, (table) => [
+  check('ck_nine_store_order_snapshot_json', sql`json_valid(${table.payloadJson}) = 1`),
+]);
+
+export const nineStoreOrderHistory = defineNineStoreOrderHistory({ tenantId: tenants.id });
+export const { nineStoreOrderHandoffs, nativeChannelHandoffProofs } = makeNineStoreHandoffSchema({
+  tenants, orders, platformOrders, platformStores, platformOrderLines,
+});
+
+export const purchaseSupplierQuotes = defineSupplierQuotes({
+  tenantId: tenants.id, supplierId: suppliers.id, skuId: skus.id, memberId: members.id,
+});
+
+export const {
+  requirements: purchaseQualityRequirements,
+  inspections: purchaseQualityInspections,
+  lines: purchaseQualityInspectionLines,
+} = createPurchaseQualityTables({
+  tenant: () => tenants.id, order: () => purchaseOrders.id,
+  orderLine: () => purchaseOrderLines.id, member: () => members.id,
+});
+
+export const purchasePaymentRequests = definePurchasePaymentRequests({
+  tenantId: tenants.id, memberId: members.id, purchaseOrderId: purchaseOrders.id,
+});
+
+export const purchasePaymentRequestLinks = definePurchasePaymentRequestLinks({
+  tenantId: tenants.id, memberId: members.id, requestId: purchasePaymentRequests.id, paymentId: purchasePayments.id,
+});

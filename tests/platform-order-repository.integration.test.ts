@@ -8,13 +8,13 @@ import { shopifyOrderFixture } from './fixtures/shopify-order';
 
 const tenantId = 'tenant_test';
 const config: ShopifyCredentialConfig = {
-  key: 'zimasya', displayName: 'ZIMASYA', domain: '346c85.myshopify.com',
-  expectedDomain: '346c85.myshopify.com', environmentPrefix: 'SHOPIFY_ZIMASYA',
-  acceptedDomains: ['346c85.myshopify.com'], authMode: 'oauth', credentialRef: 'env:SHOPIFY_ZIMASYA',
+  key: 'zimasya', displayName: 'ZIMASYA', domain: 'fixture-zimasya.myshopify.com',
+  expectedDomain: 'fixture-zimasya.myshopify.com', environmentPrefix: 'SHOPIFY_ZIMASYA',
+  acceptedDomains: ['fixture-zimasya.myshopify.com'], authMode: 'oauth', credentialRef: 'env:SHOPIFY_ZIMASYA',
   adminAccessToken: null, clientId: null, clientSecret: null,
 };
 const context: ShopifyShopContext = {
-  id: 'gid://shopify/Shop/1', name: 'ZIMASYA', domain: '346c85.myshopify.com',
+  id: 'gid://shopify/Shop/1', name: 'ZIMASYA', domain: 'fixture-zimasya.myshopify.com',
   timezone: 'America/Los_Angeles', timezoneOffset: '-0700', currency: 'USD',
   scopes: new Set(['read_orders', 'read_all_orders']),
 };

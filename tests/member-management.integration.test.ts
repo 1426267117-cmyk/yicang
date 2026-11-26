@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('cloudflare:workers', () => ({ env: {} }));
 
 import type { UserContext } from '../lib/db';
-import { ROLE_PERMISSIONS, type Role } from '../lib/domain';
+import { ROLE_PERMISSIONS, resolveMemberAccess, type Role } from '../lib/domain';
 import {
   listManagedMembers,
   updateManagedMemberRole,
@@ -122,6 +122,54 @@ describe('采购团队角色管理', () => {
     });
 
     expect(result.replayed).toBe(true);
+    expect(await auditCount(db)).toBe(0);
+  });
+
+  it('可给飞书成员分配单平台权限，重复保存不写第二条审计', async () => {
+    await memberStatement(db, 'member-feishu', tenantId, 'feishu:test:employee', ownerEmail, '新员工', 'viewer').run();
+    await db.prepare("UPDATE members SET access_profile = 'pending' WHERE id = 'member-feishu'").run();
+    const input = { memberId: 'member-feishu', accessProfile: 'amazon' as const, bootstrapOwnerEmail: ownerEmail };
+    const result = await updateManagedMemberRole(db, admin, input);
+    expect(result).toMatchObject({ replayed: false, member: {
+      role: 'viewer', accessProfile: 'amazon', identityProvider: 'feishu', protectedOwner: false,
+    } });
+    expect(resolveMemberAccess(result.member.role, result.member.accessProfile)).toEqual({
+      permissions: ['channels:read'], channelScope: 'amazon',
+    });
+    expect(await updateManagedMemberRole(db, admin, input)).toMatchObject({ replayed: true });
+    expect(await auditCount(db)).toBe(1);
+    const audit = await db.prepare('SELECT before_json, after_json FROM audit_logs WHERE entity_id = ?')
+      .bind('member-feishu').first<{ before_json: string; after_json: string }>();
+    expect(JSON.parse(audit!.before_json)).toEqual({ role: 'viewer', accessProfile: 'pending' });
+    expect(JSON.parse(audit!.after_json)).toEqual({ role: 'viewer', accessProfile: 'amazon' });
+  });
+
+  it('同一底层角色切换岗位仍需守住采购指派和租户边界', async () => {
+    const purchaser = await updateManagedMemberRole(db, admin, {
+      memberId: 'member-buyer', accessProfile: 'purchase', bootstrapOwnerEmail: ownerEmail,
+    });
+    expect(purchaser.member).toMatchObject({ role: 'operator', accessProfile: 'purchase' });
+    await insertRequest(db, 'request-profile', 'draft', 'member-buyer', 'member-owner');
+    await expect(updateManagedMemberRole(db, admin, {
+      memberId: 'member-buyer', accessProfile: 'finance', bootstrapOwnerEmail: ownerEmail,
+    })).rejects.toMatchObject({ code: 'MEMBER_ROLE_ACTIVE_PURCHASER_ASSIGNMENTS' });
+    await expect(updateManagedMemberRole(db, admin, {
+      memberId: 'member-other-admin', accessProfile: 'pending', bootstrapOwnerEmail: ownerEmail,
+    })).rejects.toMatchObject({ code: 'MEMBER_NOT_FOUND' });
+    expect(await auditCount(db)).toBe(1);
+  });
+
+  it('管理员失权后不能凭旧授权批量修改成员', async () => {
+    const staleActorDb = {
+      prepare: db.prepare.bind(db),
+      batch: async (statements: D1PreparedStatement[]) => {
+        await db.prepare("UPDATE members SET role = 'viewer', access_profile = 'pending' WHERE id = 'member-owner'").run();
+        return db.batch(statements);
+      },
+    } as D1Database;
+    await expect(updateManagedMemberRole(staleActorDb, admin, {
+      memberId: 'member-viewer', accessProfile: 'finance', bootstrapOwnerEmail: ownerEmail,
+    })).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
     expect(await auditCount(db)).toBe(0);
   });
 
@@ -285,6 +333,7 @@ async function createSchema(db: D1Database) {
       email TEXT NOT NULL,
       display_name TEXT NOT NULL,
       role TEXT NOT NULL,
+      access_profile TEXT,
       created_at TEXT NOT NULL
     )
   `).run();

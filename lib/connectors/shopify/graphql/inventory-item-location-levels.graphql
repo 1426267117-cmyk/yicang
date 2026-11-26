@@ -1,0 +1,26 @@
+query ErpInventoryItemLocationLevels($id: ID!, $first: Int!, $after: String, $names: [String!]!) {
+  inventoryItem(id: $id) {
+    id
+    sku
+    tracked
+    inventoryLevels(first: $first, after: $after, includeInactive: true) {
+      nodes {
+        isActive
+        updatedAt
+        location {
+          id
+          name
+          isActive
+        }
+        quantities(names: $names) {
+          name
+          quantity
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}

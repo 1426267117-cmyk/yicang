@@ -14,8 +14,7 @@ import { runShopifyOrderSync } from '../../../../../lib/connectors/shopify/sync-
 import {
   jsonError,
   requestContext,
-  requirePermission,
-  requireProductionAccessPolicy,
+  requireShopifyConnectorOperator,
 } from '../../../../../lib/db';
 
 export const dynamic = 'force-dynamic';
@@ -23,7 +22,8 @@ export const dynamic = 'force-dynamic';
 export async function POST(request: Request) {
   try {
     const { db, user } = await requestContext(request);
-    requirePermission(user, 'connectors:sync');
+    const runtimeEnv = env as unknown as Record<string, unknown>;
+    requireShopifyConnectorOperator(runtimeEnv, user);
     const parsed = shopifyOrderSyncSchema.safeParse(await request.json().catch(() => null));
     if (!parsed.success) {
       return Response.json({
@@ -32,8 +32,6 @@ export async function POST(request: Request) {
         message: parsed.error.issues[0]?.message ?? '同步参数无效',
       }, { status: 400 });
     }
-    const runtimeEnv = env as unknown as Record<string, unknown>;
-    requireProductionAccessPolicy(runtimeEnv, user.email);
     const baseConfig = resolveShopifyStoreConfig(runtimeEnv, parsed.data.storeKey);
     const config = await resolveShopifyRuntimeConfig({
       db,

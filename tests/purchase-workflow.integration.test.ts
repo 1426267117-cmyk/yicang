@@ -1,31 +1,36 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { Miniflare } from 'miniflare';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('cloudflare:workers', () => ({ env: {} }));
 
 import { PlatformOrderRepository } from '../lib/connectors/repository';
+import { POST as applyPurchaseRequestAction } from '../app/api/purchase/requests/[id]/actions/route';
 import type { ShopifyCredentialConfig } from '../lib/connectors/shopify/config';
 import type { ShopifyShopContext } from '../lib/connectors/shopify/connector';
 import type { UserContext } from '../lib/db';
+import * as databaseRuntime from '../lib/db';
 import { ROLE_PERMISSIONS } from '../lib/domain';
 import { createPurchaseOrder, createSupplier } from '../lib/purchase-order-service';
+import { createPurchaseSku } from '../lib/purchase-sku-service';
 import {
+  createManualPurchaseRequest,
   createPurchaseRequest,
   executePurchaseRequestAction,
+  getPurchaseRequest,
   getPurchaseWorkspace,
 } from '../lib/purchase-workflow-service';
 import { shopifyOrderFixture } from './fixtures/shopify-order';
 
 const tenantId = 'tenant_purchase_workflow';
 const config: ShopifyCredentialConfig = {
-  key: 'bizfurniz', displayName: 'BizFurniz', domain: 'bizfurniz.myshopify.com',
-  expectedDomain: 'bizfurniz.myshopify.com', acceptedDomains: ['bizfurniz.myshopify.com'],
+  key: 'bizfurniz', displayName: 'BizFurniz', domain: 'fixture-bizfurniz-alias.myshopify.com',
+  expectedDomain: 'fixture-bizfurniz-alias.myshopify.com', acceptedDomains: ['fixture-bizfurniz-alias.myshopify.com'],
   environmentPrefix: 'SHOPIFY_BIZFURNIZ', authMode: 'oauth', credentialRef: 'env:test',
   adminAccessToken: null, clientId: null, clientSecret: null,
 };
 const shopContext: ShopifyShopContext = {
-  id: 'gid://shopify/Shop/9001', name: 'BizFurniz', domain: 'bizfurniz.myshopify.com',
+  id: 'gid://shopify/Shop/9001', name: 'BizFurniz', domain: 'fixture-bizfurniz-alias.myshopify.com',
   timezone: 'America/Los_Angeles', timezoneOffset: '-0700', currency: 'USD',
   scopes: new Set(['read_orders']),
 };
@@ -66,6 +71,74 @@ describe('采购申请闭环', () => {
   });
 
   afterEach(async () => { await mf.dispose(); });
+
+  async function submitManualCustomPurchase() {
+    const { sku } = await createPurchaseSku(db, buyerUser, {
+      code: 'CUSTOM-CHAIR', name: '标准椅',
+      productDetails: { specification: '木纹', dimensions: '60 × 80 cm', imageUrl: 'https://example.invalid/chair.png', description: '标准椅包装说明' },
+    }, 'create-custom-chair-sku');
+    return (await createManualPurchaseRequest(db, buyerUser, {
+      purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer', note: '客户定制', intent: 'submit',
+      lines: [{ skuId: sku.id, quantity: 2, productDetails: { name: '客户定制椅', dimensions: '70 × 95 cm' } }],
+    }, 'submission-for-auto-purchase')).request;
+  }
+
+  function approveViaApi(id: string, idempotencyKey: string) {
+    return applyPurchaseRequestAction(new Request(`http://localhost/api/purchase/requests/${id}/actions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify({ action: 'approve' }),
+    }), { params: Promise.resolve({ id }) });
+  }
+
+  it('复审接口自动生成一张未下单的采购单，保留定制信息和 SKU 默认值', async () => {
+    const request = await submitManualCustomPurchase();
+    const requestContext = vi.spyOn(databaseRuntime, 'requestContext').mockResolvedValue({ db, user: reviewerUser });
+    try {
+      const responses = await Promise.all([
+        approveViaApi(request.id, 'approve-and-auto-create'), approveViaApi(request.id, 'approve-and-auto-create'),
+      ]);
+      expect(responses.map((response) => response.status)).toEqual([200, 200]);
+      const outcomes = await Promise.all(responses.map(async (response) => await response.json() as {
+        replayed: boolean;
+        purchaseOrder: { id: string };
+      }));
+      expect(outcomes.map((outcome) => outcome.replayed).sort()).toEqual([false, true]);
+      const purchaseOrder = outcomes[0].purchaseOrder;
+      expect(outcomes[1].purchaseOrder.id).toBe(purchaseOrder.id);
+      expect(purchaseOrder).toMatchObject({
+        purchaseRequestId: request.id, status: 'draft', supplier: null, issuedAt: null,
+        purchaserMemberId: 'member-buyer', lines: [{ skuCode: 'CUSTOM-CHAIR', orderedQuantity: 2, productDetails: {
+          name: '客户定制椅', specification: '木纹', dimensions: '70 × 95 cm', imageUrl: 'https://example.invalid/chair.png', description: '标准椅包装说明',
+        } }],
+      });
+      expect(await db.prepare('SELECT COUNT(*) AS count FROM purchase_orders WHERE tenant_id = ? AND purchase_request_id = ?')
+        .bind(tenantId, request.id).first('count')).toBe(1);
+      expect(await db.prepare(`SELECT actor_id FROM audit_logs WHERE tenant_id = ? AND entity_id = ? AND action = 'CREATE_PURCHASE_ORDER'`)
+        .bind(tenantId, purchaseOrder.id).first('actor_id')).toBe(reviewerUser.id);
+    } finally {
+      requestContext.mockRestore();
+    }
+  });
+
+  it('自动开草稿失败时回滚批准，恢复后重试可以正常通过', async () => {
+    const request = await submitManualCustomPurchase();
+    await db.prepare(`CREATE TRIGGER reject_approval_purchase_order BEFORE INSERT ON purchase_orders
+      BEGIN SELECT RAISE(ABORT, 'simulated purchase order insert failure'); END`).run();
+    const requestContext = vi.spyOn(databaseRuntime, 'requestContext').mockResolvedValue({ db, user: reviewerUser });
+    try {
+      const response = await approveViaApi(request.id, 'approve-atomic-rollback');
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect((await getPurchaseRequest(db, tenantId, request.id)).status).toBe('pending_review');
+      expect(await db.prepare('SELECT COUNT(*) AS count FROM audit_logs WHERE tenant_id = ? AND idempotency_key = ?')
+        .bind(tenantId, 'approve-atomic-rollback').first('count')).toBe(0);
+      await db.prepare('DROP TRIGGER reject_approval_purchase_order').run();
+      const retried = await approveViaApi(request.id, 'approve-atomic-rollback');
+      expect(retried.status).toBe(200);
+      expect(await retried.json()).toMatchObject({ ok: true, replayed: false, purchaseOrder: { status: 'draft' } });
+    } finally {
+      requestContext.mockRestore();
+    }
+  });
 
   it('从真实订单需求创建草稿，幂等重放且阻止重复采购', async () => {
     const input = {
@@ -158,6 +231,8 @@ describe('采购申请闭环', () => {
   });
 
   it('草稿可提交和批准，源需求后续变化会保留申请并标记关注', async () => {
+    await db.prepare("UPDATE skus SET specification = '标准规格', dimensions = '80 × 60 cm' WHERE tenant_id = ? AND code = 'SERVICE-01'")
+      .bind(tenantId).run();
     const created = await createPurchaseRequest(db, user, {
       demandIds: [demandId], purchaserMemberId: 'member-buyer', reviewerMemberId: 'member-reviewer',
     }, 'create-request-1001');
@@ -167,14 +242,17 @@ describe('采购申请闭环', () => {
     expect(submitted.request.status).toBe('pending_review');
     const approved = await executePurchaseRequestAction(db, reviewerUser, created.request.id, {
       action: 'approve', note: '批准采购',
-    }, 'approve-request-1001');
+    }, 'approve-request-1001', { createOrderDraftOnApproval: true });
     expect(approved.request).toEqual(expect.objectContaining({
       status: 'approved', reviewNote: '批准采购', needsAttention: false,
     }));
+    expect(approved.purchaseOrder).toMatchObject({ status: 'draft', lines: [
+      { productDetails: { specification: '标准规格', dimensions: '80 × 60 cm' } },
+    ] });
 
     const replay = await executePurchaseRequestAction(db, reviewerUser, created.request.id, {
       action: 'approve', note: '批准采购',
-    }, 'approve-request-1001');
+    }, 'approve-request-1001', { createOrderDraftOnApproval: true });
     expect(replay.replayed).toBe(true);
 
     await db.prepare(`
@@ -497,25 +575,10 @@ async function seedMappedDemand(db: D1Database) {
 }
 
 async function applyMigrations(db: D1Database) {
-  for (const migration of [
-    '../drizzle/0000_wooden_deathstrike.sql',
-    '../drizzle/0001_premium_the_stranger.sql',
-    '../drizzle/0002_organic_titanium_man.sql',
-    '../drizzle/0003_fancy_jane_foster.sql',
-    '../drizzle/0004_illegal_black_panther.sql',
-    '../drizzle/0005_chilly_obadiah_stane.sql',
-    '../drizzle/0006_soft_wither.sql',
-    '../drizzle/0007_worried_stone_men.sql',
-    '../drizzle/0008_nifty_mimic.sql',
-    '../drizzle/0009_shocking_iron_lad.sql',
-    '../drizzle/0013_guarded_withdrawal.sql',
-    '../drizzle/0014_clever_silvermane.sql',
-    '../drizzle/0015_true_tigra.sql',
-    '../drizzle/0016_brief_doomsday.sql',
-  ]) {
-    const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
-    for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {
-      await db.prepare(statement).run();
-    }
+  const directory = new URL('../drizzle/', import.meta.url);
+  for (const migration of readdirSync(directory).filter((name) => name.endsWith('.sql')).sort()) {
+    const sql = readFileSync(new URL(migration, directory), 'utf8');
+    const statements = sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean);
+    await db.batch(statements.map((statement) => db.prepare(statement)));
   }
 }

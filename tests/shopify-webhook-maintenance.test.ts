@@ -5,9 +5,9 @@ import { registerStoredShopifyWebhooks } from '../lib/connectors/shopify/webhook
 const config: ShopifyCredentialConfig = {
   key: 'bizfurniz',
   displayName: 'BizFurniz',
-  domain: 'bizfurniz.myshopify.com',
-  expectedDomain: 'bizfurniz.myshopify.com',
-  acceptedDomains: ['bizfurniz.myshopify.com'],
+  domain: 'fixture-bizfurniz-alias.myshopify.com',
+  expectedDomain: 'fixture-bizfurniz-alias.myshopify.com',
+  acceptedDomains: ['fixture-bizfurniz-alias.myshopify.com'],
   environmentPrefix: 'SHOPIFY_BIZFURNIZ',
   authMode: 'oauth',
   credentialRef: 'd1:shopify:bizfurniz',
@@ -19,7 +19,7 @@ const config: ShopifyCredentialConfig = {
 const context = {
   id: 'gid://shopify/Shop/100',
   name: 'BizFurniz',
-  domain: 'bizfurniz.myshopify.com',
+  domain: 'fixture-bizfurniz-alias.myshopify.com',
   timezone: 'America/Los_Angeles',
   timezoneOffset: '-0700',
   currency: 'USD',
@@ -81,7 +81,7 @@ describe('已保存授权的 Shopify webhook 维护注册', () => {
         loadTargets: async () => [
           {
             tenantId: 'tenant-a', storeKey: 'bizfurniz',
-            shopDomain: 'bizfurniz.myshopify.com', officialStoreId: 'gid://shopify/Shop/100',
+            shopDomain: 'fixture-bizfurniz-alias.myshopify.com', officialStoreId: 'gid://shopify/Shop/100',
           },
           {
             tenantId: 'tenant-b', storeKey: 'bizfurniz',

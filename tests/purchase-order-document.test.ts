@@ -27,6 +27,37 @@ const viewer: UserContext = {
 };
 
 describe('采购单交付文档', () => {
+  it('打印件和 CSV 使用单据保存的定制信息，并支持未选供应商的草稿', () => {
+    const original = sourceOrder();
+    const document = buildPurchaseOrderDocument(sourceOrder({
+      status: 'draft', supplier: null, issuedAt: null,
+      lines: [
+        { ...original.lines[0], productDetails: {
+          name: '定制桌 & 配件', specification: '=定制规格 <加固>', dimensions: '120 × 60 cm',
+          description: '配件与装配说明 <防夹手>',
+          imageUrl: 'https://example.invalid/product.png?size=100&kind=custom',
+        } },
+        { ...original.lines[1], productDetails: {
+          name: null, specification: null, dimensions: null, imageUrl: 'javascript:alert(1)',
+        } },
+      ],
+    }));
+
+    const html = renderPurchaseOrderHtml(document);
+    expect(html).toContain('供应商</span><strong>未填写');
+    expect(html).toContain('定制桌 &amp; 配件');
+    expect(html).toContain('规格：=定制规格 &lt;加固&gt;');
+    expect(html).toContain('尺寸：120 × 60 cm');
+    expect(html).toContain('介绍：配件与装配说明 &lt;防夹手&gt;');
+    expect(html).toContain('src="https://example.invalid/product.png?size=100&amp;kind=custom"');
+    expect(html).not.toContain('javascript:');
+
+    const csv = renderPurchaseOrderCsv(document);
+    expect(csv).toContain('规格,尺寸,图片链接,商品介绍');
+    expect(csv).toContain("'=定制规格 <加固>,120 × 60 cm,https://example.invalid/product.png");
+    expect(csv).not.toContain('javascript:');
+  });
+
   it('只以当前用户租户读取采购单，并允许只读角色下载', async () => {
     const loader = vi.fn(async (_db: D1Database, tenantId: string, purchaseOrderId: string) => {
       expect(tenantId).toBe('tenant-a');
@@ -159,6 +190,28 @@ describe('采购单交付文档', () => {
     expect(csv).toContain('1234,2468,CNY');
     expect(csv).toContain('250,750,CNY');
     expect(csv).toContain('合计,,,5,1,4,,3218,CNY');
+  });
+
+  it.each([
+    { status: 'draft', title: '采购单草稿', notice: '待确认下单，仅供核对。' },
+    { status: 'cancelled', title: '已取消采购单', notice: '采购单已取消，仅供历史查阅。' },
+  ] as const)('在打印件和 CSV 标注 $status 的核对用途', ({ status, title, notice }) => {
+    const document = buildPurchaseOrderDocument(sourceOrder({ status, issuedAt: null }));
+    const html = renderPurchaseOrderHtml(document);
+
+    expect(html).toContain(`<title>${document.orderNo} · ${title}</title>`);
+    expect(html).toContain(`<p class="review-only">${notice}</p>`);
+    expect(html).not.toContain('正式采购单');
+    expect(renderPurchaseOrderCsv(document)).toContain(`单据用途,${notice}`);
+  });
+
+  it.each(['issued', 'received'] as const)('为 %s 采购单保留正式打印与 CSV', (status) => {
+    const document = buildPurchaseOrderDocument(sourceOrder({ status }));
+    const html = renderPurchaseOrderHtml(document);
+
+    expect(html).toContain('易仓 ERP · 正式采购单');
+    expect(html).not.toContain('class="review-only"');
+    expect(renderPurchaseOrderCsv(document)).not.toContain('单据用途');
   });
 
   it('任一行缺少单价或币种不一致时保持总额未知，不按 0 合计', () => {

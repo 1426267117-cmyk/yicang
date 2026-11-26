@@ -5,9 +5,9 @@ import type { ShopifyCredentialConfig } from '../lib/connectors/shopify/config';
 const config: ShopifyCredentialConfig = {
   key: 'bizfurniz',
   displayName: 'BizFurniz',
-  domain: 'z6w01w-xs.myshopify.com',
-  expectedDomain: 'z6w01w-xs.myshopify.com',
-  acceptedDomains: ['z6w01w-xs.myshopify.com'],
+  domain: 'fixture-bizfurniz-canonical.myshopify.com',
+  expectedDomain: 'fixture-bizfurniz-canonical.myshopify.com',
+  acceptedDomains: ['fixture-bizfurniz-canonical.myshopify.com'],
   environmentPrefix: 'SHOPIFY_BIZFURNIZ',
   authMode: 'oauth',
   credentialRef: 'test:shopify',

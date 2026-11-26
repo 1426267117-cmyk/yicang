@@ -5,7 +5,7 @@ import {
 } from '../lib/connectors/shopify/credential-store';
 
 const key = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
-const aad = 'tenant|shopify|bizfurniz|z6w01w-xs.myshopify.com|gid://shopify/Shop/1|v1';
+const aad = 'tenant|shopify|bizfurniz|fixture-bizfurniz-canonical.myshopify.com|gid://shopify/Shop/1|v1';
 
 describe('Shopify 凭证加密', () => {
   it('使用 AES-GCM 往返保存且不在密文中暴露原值', async () => {

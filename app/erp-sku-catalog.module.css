@@ -1,0 +1,110 @@
+.toolbar,
+.filters,
+.actions,
+.resultBar,
+.pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.toolbar,
+.resultBar,
+.pagination {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line, #e2e8f0);
+}
+
+.toolbar,
+.resultBar {
+  justify-content: space-between;
+}
+
+.resultBar,
+.pagination {
+  color: var(--muted, #5b687c);
+  font-size: 13px;
+}
+
+.resultBar a {
+  text-decoration: none;
+}
+
+.statusFilter {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted, #5b687c);
+  font-size: 13px;
+}
+
+.filters input,
+.filters select {
+  min-height: 34px;
+  padding: 4px 8px;
+  border: 1px solid var(--line, #e2e8f0);
+  border-radius: 4px;
+  background: var(--paper, #fff);
+  color: var(--ink, #17243a);
+  font: inherit;
+  font-size: 13px;
+}
+
+.search input {
+  width: min(190px, 55vw);
+}
+
+.table {
+  min-width: 840px;
+}
+
+.table td {
+  overflow-wrap: anywhere;
+}
+
+.code {
+  min-width: 100px;
+  color: var(--ink, #17243a);
+  font-weight: 600;
+}
+
+.description {
+  display: -webkit-box;
+  max-width: 240px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.table .incomplete {
+  min-width: 115px;
+  color: #895716;
+}
+
+.table .complete {
+  color: #246247;
+}
+
+.pagination {
+  justify-content: flex-end;
+  border-top: 1px solid var(--line, #e2e8f0);
+  border-bottom: 0;
+}
+
+.empty {
+  padding: 14px;
+}
+
+.empty p {
+  margin-bottom: 8px;
+}
+
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

@@ -1,0 +1,30 @@
+[Unit]
+Description=Yicang Feishu legacy continuous collection
+Wants=network-online.target
+After=network-online.target yicang.service
+ConditionPathExists=/etc/yicang/feishu-sync.env
+ConditionPathExists=/var/lib/yicang-feishu/sync-config.json
+
+[Service]
+User=yicang-feishu
+Group=yicang-feishu
+WorkingDirectory=/opt/yicang/current
+EnvironmentFile=/etc/yicang/feishu-sync.env
+Environment=HOME=/var/lib/yicang-feishu
+Environment=PATH=/opt/yicang-node/bin:/usr/local/bin:/usr/bin:/bin
+Environment=ERP_FEISHU_SYNC_STATE_DIR=/var/lib/yicang-feishu/queue
+Environment=ERP_FEISHU_SYNC_SOURCE_CONFIG=/var/lib/yicang-feishu/sync-config.json
+ExecStart=/opt/yicang-node/bin/node scripts/run-feishu-procurement-sync.mjs http://127.0.0.1:3000
+StateDirectory=yicang-feishu
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

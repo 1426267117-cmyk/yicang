@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { Miniflare } from 'miniflare';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -30,13 +30,13 @@ import { shopifyOrderFixture } from './fixtures/shopify-order';
 const tenantId = 'tenant_purchase_planning';
 const now = new Date('2026-11-02T10:10:00.000Z');
 const config: ShopifyCredentialConfig = {
-  key: 'bizfurniz', displayName: 'BizFurniz', domain: 'bizfurniz.myshopify.com',
-  expectedDomain: 'bizfurniz.myshopify.com', acceptedDomains: ['bizfurniz.myshopify.com'],
+  key: 'bizfurniz', displayName: 'BizFurniz', domain: 'fixture-bizfurniz-alias.myshopify.com',
+  expectedDomain: 'fixture-bizfurniz-alias.myshopify.com', acceptedDomains: ['fixture-bizfurniz-alias.myshopify.com'],
   environmentPrefix: 'SHOPIFY_BIZFURNIZ', authMode: 'oauth', credentialRef: 'env:test',
   adminAccessToken: null, clientId: null, clientSecret: null,
 };
 const shopContext: ShopifyShopContext = {
-  id: 'gid://shopify/Shop/9001', name: 'BizFurniz', domain: 'bizfurniz.myshopify.com',
+  id: 'gid://shopify/Shop/9001', name: 'BizFurniz', domain: 'fixture-bizfurniz-alias.myshopify.com',
   timezone: 'America/Los_Angeles', timezoneOffset: '-0700', currency: 'USD',
   scopes: new Set(['read_orders']),
 };
@@ -1144,27 +1144,10 @@ async function seedFreshRisk(db: D1Database, sales30d: number | null) {
 }
 
 async function applyMigrations(db: D1Database) {
-  for (const migration of [
-    '../drizzle/0000_wooden_deathstrike.sql',
-    '../drizzle/0001_premium_the_stranger.sql',
-    '../drizzle/0002_organic_titanium_man.sql',
-    '../drizzle/0003_fancy_jane_foster.sql',
-    '../drizzle/0004_illegal_black_panther.sql',
-    '../drizzle/0005_chilly_obadiah_stane.sql',
-    '../drizzle/0006_soft_wither.sql',
-    '../drizzle/0007_worried_stone_men.sql',
-    '../drizzle/0008_nifty_mimic.sql',
-    '../drizzle/0009_shocking_iron_lad.sql',
-    '../drizzle/0010_mute_eternity.sql',
-    '../drizzle/0011_dazzling_menace.sql',
-    '../drizzle/0012_square_slyde.sql',
-    '../drizzle/0014_clever_silvermane.sql',
-    '../drizzle/0015_true_tigra.sql',
-    '../drizzle/0016_brief_doomsday.sql',
-  ]) {
-    const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
-    for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {
-      await db.prepare(statement).run();
-    }
+  const directory = new URL('../drizzle/', import.meta.url);
+  for (const migration of readdirSync(directory).filter((name) => name.endsWith('.sql')).sort()) {
+    const sql = readFileSync(new URL(migration, directory), 'utf8');
+    const statements = sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean);
+    await db.batch(statements.map((statement) => db.prepare(statement)));
   }
 }

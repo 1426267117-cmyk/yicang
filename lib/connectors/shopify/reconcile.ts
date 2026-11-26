@@ -10,7 +10,7 @@ import {
 import { ShopifyOrderConnector } from './connector';
 import { resolveShopifyRuntimeConfig } from './credential-store';
 import { sanitizedConnectorError, ShopifyConnectorError } from './errors';
-import { runShopifyOrderSync } from './sync-service';
+import { runShopifyOrderSync, type ShopifyScheduledAuthorization } from './sync-service';
 
 const MAX_RECONCILE_TARGETS = 100;
 const MAX_RECONCILE_TENANTS = 20;
@@ -22,6 +22,7 @@ const ENVIRONMENT_CREDENTIAL_TENANT_ID = 'tenant_yicang_primary';
 type StoredReconcileTarget = {
   tenantId: string;
   storeKey: string;
+  officialStoreId?: string;
 };
 
 type ReconcileDependencies = {
@@ -32,6 +33,7 @@ type ReconcileDependencies = {
     tenantId: string;
     config: ShopifyCredentialConfig;
     maxPages: number;
+    scheduledAuthorization?: ShopifyScheduledAuthorization;
   }) => ReturnType<typeof runShopifyOrderSync>;
 };
 
@@ -107,11 +109,19 @@ export async function reconcileStoredShopifyOrders(input: {
           `${config.displayName} 尚未完成 Shopify 只读授权`,
         );
       }
+      if (target.officialStoreId && config.credentialRef !== `d1:shopify:${target.storeKey}`) {
+        throw new ShopifyConnectorError('SHOPIFY_AUTHORIZATION_REQUIRED', '该店铺的租户授权已失效，请先重新授权');
+      }
+      const initialBackfillSetting = input.runtimeEnv[`${config.environmentPrefix}_INITIAL_BACKFILL_ENABLED`];
       const result = await dependencies.runSync({
         db: input.db,
         tenantId: target.tenantId,
         config,
         maxPages: input.maxPages,
+        scheduledAuthorization: target.officialStoreId ? {
+          officialStoreId: target.officialStoreId,
+          initialBackfillEnabled: typeof initialBackfillSetting === 'string' && initialBackfillSetting.trim() === 'true',
+        } : undefined,
       });
       synced.push({
         storeKey: target.storeKey,
@@ -170,6 +180,7 @@ async function runIncrementalSync(input: {
   tenantId: string;
   config: ShopifyCredentialConfig;
   maxPages: number;
+  scheduledAuthorization?: ShopifyScheduledAuthorization;
 }) {
   const client = new ShopifyAdminClient(input.config);
   const connector = new ShopifyOrderConnector(input.config, client);
@@ -183,6 +194,7 @@ async function runIncrementalSync(input: {
     config: input.config,
     connector,
     repository,
+    scheduledAuthorization: input.scheduledAuthorization,
   });
 }
 
@@ -198,21 +210,21 @@ async function loadStoredReconcileTargets(db: D1Database, tenantIds?: string[]) 
     ? `AND tenant_id IN (${tenantIds.map(() => '?').join(', ')})`
     : '';
   const rows = await db.prepare(`
-    SELECT tenant_id, store_key
+    SELECT tenant_id, store_key, official_store_id
     FROM connector_credentials
     WHERE platform = 'shopify'
       ${tenantClause}
     ORDER BY store_key, tenant_id
     LIMIT ?
   `).bind(...(tenantIds ?? []), MAX_RECONCILE_TARGETS + 1)
-    .all<{ tenant_id: string; store_key: string }>();
+    .all<{ tenant_id: string; store_key: string; official_store_id: string }>();
   if (rows.results.length > MAX_RECONCILE_TARGETS) {
     throw new ShopifyConnectorError(
       'SHOPIFY_RECONCILE_TARGET_LIMIT',
       '已授权的 Shopify 店铺数量超过单次任务安全上限',
     );
   }
-  return rows.results.map((row) => ({ tenantId: row.tenant_id, storeKey: row.store_key }));
+  return rows.results.map((row) => ({ tenantId: row.tenant_id, storeKey: row.store_key, officialStoreId: row.official_store_id }));
 }
 
 function assertUnambiguousTargets(targets: StoredReconcileTarget[]) {

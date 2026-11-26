@@ -5,9 +5,9 @@ import { ShopifyOrderConnector } from '../lib/connectors/shopify/connector';
 import { money } from './fixtures/shopify-order';
 
 const config: ShopifyCredentialConfig = {
-  key: 'zimasya', displayName: 'ZIMASYA', domain: '346c85.myshopify.com',
-  expectedDomain: '346c85.myshopify.com', environmentPrefix: 'SHOPIFY_ZIMASYA',
-  acceptedDomains: ['346c85.myshopify.com'], authMode: 'oauth', credentialRef: 'env:SHOPIFY_ZIMASYA',
+  key: 'zimasya', displayName: 'ZIMASYA', domain: 'fixture-zimasya.myshopify.com',
+  expectedDomain: 'fixture-zimasya.myshopify.com', environmentPrefix: 'SHOPIFY_ZIMASYA',
+  acceptedDomains: ['fixture-zimasya.myshopify.com'], authMode: 'oauth', credentialRef: 'env:SHOPIFY_ZIMASYA',
   adminAccessToken: 'test-only-token', clientId: null, clientSecret: null,
 };
 
@@ -76,7 +76,7 @@ describe('Shopify 多层分页', () => {
 
 function responseFor(operation: string, variables: Record<string, unknown>): Record<string, unknown> {
   if (operation === 'ErpShopContext') return {
-    shop: { id: 'gid://shopify/Shop/1', name: 'ZIMASYA', myshopifyDomain: '346c85.myshopify.com', ianaTimezone: 'America/Los_Angeles', timezoneOffset: '-0700', currencyCode: 'USD' },
+    shop: { id: 'gid://shopify/Shop/1', name: 'ZIMASYA', myshopifyDomain: 'fixture-zimasya.myshopify.com', ianaTimezone: 'America/Los_Angeles', timezoneOffset: '-0700', currencyCode: 'USD' },
     currentAppInstallation: { accessScopes: [{ handle: 'read_orders' }, { handle: 'read_all_orders' }] },
   };
   if (operation === 'ErpOrderDetails') return { order: baseOrder() };

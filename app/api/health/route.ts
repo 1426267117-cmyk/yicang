@@ -10,13 +10,16 @@ export async function handleHealthRequest(
   getContext: typeof requestContext = requestContext,
 ) {
   try {
-    const { db } = await getContext(request);
-    const result = await db.prepare('SELECT COUNT(*) AS count FROM orders').first<{ count: number }>();
+    const { db, user } = await getContext(request);
+    const canReadOrders = !user.channelScope && user.permissions.includes('orders:read');
+    const result = canReadOrders
+      ? await db.prepare('SELECT COUNT(*) AS count FROM orders WHERE tenant_id = ?').bind(user.tenantId).first<{ count: number }>()
+      : null;
     return Response.json({
       ok: true,
       database: 'ready',
       schemaReadiness: DATABASE_SCHEMA_READINESS,
-      orders: Number(result?.count ?? 0),
+      ...(canReadOrders ? { orders: Number(result?.count ?? 0) } : {}),
     }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (error) {
     const response = jsonError(error);

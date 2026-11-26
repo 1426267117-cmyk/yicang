@@ -1,0 +1,129 @@
+.dialog {
+  width: min(920px, calc(100% - 24px));
+  max-height: calc(100vh - 36px);
+  overflow: auto;
+  margin: auto;
+}
+
+.dialog::backdrop {
+  background: rgba(19, 39, 30, 0.45);
+}
+
+.body {
+  display: grid;
+  gap: 14px;
+  padding: 16px 20px 22px;
+  font-size: 13px;
+}
+
+.body p {
+  margin: 0;
+}
+
+.summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: #edf5f0;
+  color: #28523d;
+}
+
+.summary p {
+  flex-basis: 100%;
+}
+
+.error,
+.success {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #fff3e0;
+  color: #724716;
+}
+
+.success {
+  background: #edf5f0;
+  color: #28523d;
+}
+
+.fields {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr));
+  gap: 8px;
+  border: 0;
+}
+
+.fields legend {
+  margin-bottom: 8px;
+  font-weight: 700;
+}
+
+.fields label {
+  display: grid;
+  gap: 4px;
+}
+
+.fields input,
+.fields textarea {
+  min-width: 0;
+  width: 100%;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: #213c2e;
+  font: inherit;
+}
+
+.table {
+  grid-column: 1 / -1;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.table table {
+  min-width: 545px;
+  margin: 0;
+}
+
+.table th,
+.table td {
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.note {
+  grid-column: 1 / -1;
+  color: #566c60;
+}
+
+.buttons {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 9px;
+}
+
+.history h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.history details {
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.history summary {
+  cursor: pointer;
+}
+
+.history summary span {
+  margin-left: 8px;
+  color: #566c60;
+}

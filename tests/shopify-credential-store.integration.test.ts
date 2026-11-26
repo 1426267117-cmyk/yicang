@@ -36,8 +36,8 @@ describe('Shopify OAuth 凭证 D1 存储', () => {
       tenantId,
       runtimeEnv: { ERP_CONNECTOR_CREDENTIALS_KEY: encryptionKey },
       storeKey: 'bizfurniz',
-      shopDomain: 'z6w01w-xs.myshopify.com',
-      officialStoreId: 'gid://shopify/Shop/100191109201',
+      shopDomain: 'fixture-bizfurniz-canonical.myshopify.com',
+      officialStoreId: 'gid://shopify/Shop/12345678901',
       grantedScopes: 'read_orders',
       session: {
         accessToken: 'shpat_test_access_token',
@@ -65,8 +65,8 @@ describe('Shopify OAuth 凭证 D1 存储', () => {
       { ERP_CONNECTOR_CREDENTIALS_KEY: encryptionKey },
     );
     expect(stored).toMatchObject({
-      shopDomain: 'z6w01w-xs.myshopify.com',
-      officialStoreId: 'gid://shopify/Shop/100191109201',
+      shopDomain: 'fixture-bizfurniz-canonical.myshopify.com',
+      officialStoreId: 'gid://shopify/Shop/12345678901',
       accessToken: 'shpat_test_access_token',
       refreshToken: 'shprt_test_refresh_token',
     });
@@ -78,8 +78,8 @@ describe('Shopify OAuth 凭证 D1 存储', () => {
       tenantId,
       runtimeEnv: { ERP_CONNECTOR_CREDENTIALS_KEY: encryptionKey },
       storeKey: 'bizfurniz',
-      shopDomain: 'z6w01w-xs.myshopify.com',
-      officialStoreId: 'gid://shopify/Shop/100191109201',
+      shopDomain: 'fixture-bizfurniz-canonical.myshopify.com',
+      officialStoreId: 'gid://shopify/Shop/12345678901',
       grantedScopes: 'read_orders',
       session: { accessToken: 'shpat_oauth_token' },
       createdBy: 'user_test',
@@ -89,6 +89,7 @@ describe('Shopify OAuth 凭证 D1 存储', () => {
       tenantId,
       runtimeEnv: {
         ERP_CONNECTOR_CREDENTIALS_KEY: encryptionKey,
+        SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: 'fixture-bizfurniz-canonical.myshopify.com',
         SHOPIFY_BIZFURNIZ_ADMIN_ACCESS_TOKEN: 'shpat_legacy_env_token',
       },
       storeKey: 'bizfurniz',

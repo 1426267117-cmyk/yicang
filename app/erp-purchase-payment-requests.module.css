@@ -1,0 +1,206 @@
+.workspace {
+  min-width: 0;
+  padding: 0;
+}
+
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.toolbar h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.controls,
+.pagination {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: end;
+}
+
+.pagination {
+  justify-content: flex-end;
+  align-items: center;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.controls label,
+.orderSelect {
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.toolbar .controls {
+  align-items: center;
+}
+
+.toolbar input[type='search'] {
+  width: min(190px, 100%);
+}
+
+.toolbar .statusFilter {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.controls input,
+.controls select,
+.orderSelect select {
+  min-height: 34px;
+  max-width: 100%;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.table table {
+  margin-top: 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.workspace .requestList table {
+  min-width: 780px;
+}
+
+.workspace .requestList table:has(:global(.empty-cell)) {
+  min-width: min(100%, 580px);
+}
+
+.requestList :is(th, td):nth-child(4) {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.status {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: #edf1f6;
+  color: #516176;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.status[data-state='pending'],
+.status[data-state='partial'] {
+  background: #fff4de;
+  color: #795306;
+}
+
+.status[data-state='approved'],
+.status[data-state='settled'] {
+  background: #e7f4ed;
+  color: #226348;
+}
+
+.status[data-state='rejected'] {
+  background: #fcecea;
+  color: #9a3933;
+}
+
+.dialog {
+  width: min(760px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--line);
+  overflow: auto;
+}
+
+.dialog::backdrop {
+  background: rgb(17 28 47 / 44%);
+}
+
+.body {
+  display: grid;
+  gap: 12px;
+  padding: 14px 20px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.notice,
+.error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.error {
+  color: #983729;
+}
+
+.formError {
+  padding: 0 22px 12px;
+}
+
+.message {
+  padding: 10px 16px;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(136px, 100%), 1fr));
+  gap: 1px;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--line);
+}
+
+.facts > div,
+.operation,
+.summary {
+  padding: 10px 12px;
+  background: #f8fafc;
+}
+
+.operation,
+.summary {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.facts dd {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.summary {
+  overflow-wrap: anywhere;
+}
+
+.operation {
+  display: grid;
+  gap: 9px;
+}
+
+.operation > div:first-of-type {
+  padding: 0;
+}

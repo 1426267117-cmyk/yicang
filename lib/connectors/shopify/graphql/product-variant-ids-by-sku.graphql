@@ -1,0 +1,6 @@
+query ErpProductVariantIdsBySku($first: Int!, $after: String, $query: String!) {
+  productVariants(first: $first, after: $after, query: $query) {
+    nodes { id sku }
+    pageInfo { hasNextPage endCursor }
+  }
+}

@@ -1,0 +1,78 @@
+.form,
+.productHead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.form {
+  justify-content: flex-start;
+}
+
+.result {
+  padding: 11px 14px 14px;
+}
+
+.productHead {
+  justify-content: space-between;
+}
+
+.productHead h3,
+.productHead p {
+  margin: 0;
+}
+
+.productHead h3 {
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.productHead p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(120px, 100%), 1fr));
+  gap: 12px;
+  margin: 12px 0;
+  padding: 12px 0;
+  border-block: 1px solid var(--line);
+}
+
+.facts dt,
+.copyNotice {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.facts dd {
+  margin: 4px 0 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.description summary {
+  width: fit-content;
+  color: var(--erp-blue-dark);
+  cursor: pointer;
+}
+
+.description p {
+  margin: 7px 0 0;
+  max-width: 800px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.error {
+  margin: 0;
+  padding: 9px 14px;
+  background: #fff5f4;
+  color: #9b3029;
+  font-size: 13px;
+}

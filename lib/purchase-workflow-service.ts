@@ -1,4 +1,5 @@
 import type {
+  CreateManualPurchaseRequestInput,
   CreatePurchaseRequestInput,
   PurchaseRequestActionInput,
 } from './contracts';
@@ -8,9 +9,19 @@ import {
   type UserContext,
 } from './db';
 import { getPurchaseDemands } from './purchase-demand-service';
-import { getProcurementWorkspaceData } from './purchase-order-service';
+import {
+  getProcurementWorkspaceData,
+  getPurchaseOrderForApproval,
+  prepareApprovedPurchaseOrderDraft,
+} from './purchase-order-service';
 import { ROLE_PERMISSIONS, type Role } from './domain';
 import type { PurchasePlanningEvidence } from './purchase-planning-service';
+import { mapPurchaseSku, type PurchaseSkuRow } from './purchase-sku-service';
+import {
+  parsePurchaseProductDetails,
+  resolvePurchaseProductDetails,
+  type PurchaseProductDetails,
+} from './purchase-product-details';
 
 export type PurchaseRequestStatus =
   | 'draft'
@@ -19,12 +30,15 @@ export type PurchaseRequestStatus =
   | 'rejected'
   | 'cancelled';
 
+export type PurchaseRequestSource = 'legacy' | 'planning' | 'manual';
+
 type PurchaseRequestAction = PurchaseRequestActionInput['action'];
 
 type PurchaseRequestRow = {
   id: string;
   request_no: string;
   status: PurchaseRequestStatus;
+  source: PurchaseRequestSource;
   purchaser_member_id: string;
   purchaser_name: string;
   purchaser_role: string;
@@ -49,22 +63,27 @@ type PurchaseRequestRow = {
 type PurchaseRequestLineRow = {
   id: string;
   request_id: string;
-  purchase_demand_id: string;
+  purchase_demand_id: string | null;
   sku_id: string;
   sku_code: string;
   sku_name: string;
+  sku_specification: string | null;
+  sku_dimensions: string | null;
+  sku_image_url: string | null;
+  sku_description: string | null;
+  product_details_json: string | null;
   requested_quantity: number;
-  source_required_quantity: number;
-  source_updated_at: string;
+  source_required_quantity: number | null;
+  source_updated_at: string | null;
   active: number;
-  current_status: string;
-  current_required_quantity: number;
+  current_status: string | null;
+  current_required_quantity: number | null;
   current_mapped_sku_id: string | null;
-  current_source_updated_at: string;
-  store_name: string;
+  current_source_updated_at: string | null;
+  store_name: string | null;
   source_order_name: string | null;
-  source_order_id: string;
-  source_order_line_id: string;
+  source_order_id: string | null;
+  source_order_line_id: string | null;
   raw_sku: string | null;
   title: string | null;
 };
@@ -82,6 +101,7 @@ type CreateDemandRow = {
 type CurrentRequestRow = {
   id: string;
   status: PurchaseRequestStatus;
+  source: PurchaseRequestSource;
   version: number;
   purchaser_member_id: string;
   reviewer_member_id: string;
@@ -90,6 +110,7 @@ type CurrentRequestRow = {
 
 export type PurchaseWorkflowOptions = {
   developmentOpenAccess?: boolean;
+  createOrderDraftOnApproval?: boolean;
   now?: Date;
   maxAgeMinutes?: number;
   sourceMaxAgeMinutes?: number;
@@ -219,7 +240,7 @@ export async function getPurchaseWorkspace(
         COALESCE(SUM(CASE WHEN pr.status = 'approved' THEN 1 ELSE 0 END), 0) AS approved,
         COALESCE(SUM(CASE WHEN pr.status = 'rejected' THEN 1 ELSE 0 END), 0) AS rejected,
         COALESCE(SUM(CASE WHEN pr.status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled,
-        COALESCE(SUM(CASE WHEN pr.status = 'approved' AND EXISTS (
+        COALESCE(SUM(CASE WHEN pr.status = 'approved' AND pr.source <> 'manual' AND EXISTS (
           SELECT 1
           FROM purchase_request_lines summary_line
           LEFT JOIN purchase_demands summary_demand
@@ -257,12 +278,12 @@ export async function getPurchaseWorkspace(
       id: string; auth_user_id: string; display_name: string; role: string;
     }>(),
     db.prepare(`
-      SELECT id, code, name
+      SELECT id, code, name, specification, dimensions, image_url, description
       FROM skus
       WHERE tenant_id = ? AND active = 1
       ORDER BY code
       LIMIT 1000
-    `).bind(user.tenantId).all<{ id: string; code: string; name: string }>(),
+    `).bind(user.tenantId).all<PurchaseSkuRow>(),
     db.prepare(`
       WITH allocated AS (
         SELECT purchase_demand_id, SUM(requested_quantity) AS quantity
@@ -350,7 +371,7 @@ export async function getPurchaseWorkspace(
     })),
     currentMemberId: members.results.find((member) => member.auth_user_id === user.id)?.id ?? null,
     developmentOpenAccess: options.developmentOpenAccess === true,
-    skuOptions: skuOptions.results.map((sku) => ({ id: sku.id, code: sku.code, name: sku.name })),
+    skuOptions: skuOptions.results.map(mapPurchaseSku),
     ...procurement,
     readOnly: false as const,
   };
@@ -377,6 +398,7 @@ export async function createPurchaseRequest(
       requestedQuantity: null,
     })),
     requestHashInput: normalizedInput,
+    source: 'legacy',
     auditAction: 'CREATE_PURCHASE_REQUEST',
     auditContext: null,
   }, idempotencyKey, options);
@@ -415,6 +437,7 @@ export async function createPurchaseRequestFromAllocations(
       requestedQuantity: allocation.requestedQuantity,
     })),
     requestHashInput: normalizedInput,
+    source: 'planning',
     auditAction: 'CREATE_PURCHASE_REQUEST_FROM_PLAN',
     auditContext: {
       recommendationVersions: normalizedInput.recommendationVersions,
@@ -424,100 +447,188 @@ export async function createPurchaseRequestFromAllocations(
   }, idempotencyKey, options);
 }
 
+type PurchaseRequestDraftInput = {
+  purchaserMemberId: string;
+  reviewerMemberId: string;
+  note: string | null;
+  source: PurchaseRequestSource;
+  requestHashInput: unknown;
+  auditAction: string;
+  auditContext: Record<string, unknown> | null;
+  submitImmediately?: boolean;
+};
+
+type PurchaseRequestDraftLine = {
+  demandId: string | null;
+  skuId: string;
+  requestedQuantity: number;
+  sourceRequiredQuantity: number | null;
+  sourceUpdatedAt: string | null;
+  productDetails?: PurchaseProductDetails;
+};
+
+export async function createManualPurchaseRequest(
+  db: D1Database,
+  user: UserContext,
+  input: CreateManualPurchaseRequestInput & { intent?: 'draft' | 'submit' },
+  idempotencyKey: string,
+  options: Pick<PurchaseWorkflowOptions, 'developmentOpenAccess'> = {},
+) {
+  const note = input.note.trim();
+  const submitImmediately = input.intent === 'submit';
+  const lines = input.lines
+    .map((line) => ({
+      skuId: line.skuId.trim(),
+      quantity: line.quantity,
+      ...(line.productDetails === undefined ? {} : {
+        productDetails: parsePurchaseProductDetails(JSON.stringify(line.productDetails)),
+      }),
+    }))
+    .sort((left, right) => left.skuId.localeCompare(right.skuId));
+  return createPurchaseRequestDraft(db, user, {
+    purchaserMemberId: input.purchaserMemberId,
+    reviewerMemberId: input.reviewerMemberId,
+    note,
+    source: 'manual',
+    requestHashInput: {
+      source: 'manual',
+      purchaserMemberId: input.purchaserMemberId,
+      reviewerMemberId: input.reviewerMemberId,
+      note,
+      lines,
+      ...(submitImmediately ? { intent: 'submit' } : {}),
+    },
+    auditAction: 'CREATE_MANUAL_PURCHASE_REQUEST',
+    auditContext: { note },
+    submitImmediately,
+  }, idempotencyKey, options, async () => {
+    const skuIds = lines.map((line) => line.skuId);
+    if (!note || note.length > 500 || skuIds.length < 1 || skuIds.length > 100
+      || lines.some((line) => !line.skuId || !Number.isSafeInteger(line.quantity)
+        || line.quantity <= 0 || line.quantity > 100_000_000)) {
+      throw new HttpError(400, '请填写采购原因和有效的 SKU 数量', 'INVALID_MANUAL_PURCHASE_REQUEST');
+    }
+    if (new Set(skuIds).size !== skuIds.length) {
+      throw new HttpError(400, '采购申请中的 SKU 不能重复', 'PURCHASE_SKU_DUPLICATE');
+    }
+    const available = await db.prepare(`
+      SELECT id, code, name, specification, dimensions, image_url, description
+      FROM skus
+      WHERE tenant_id = ? AND active = 1 AND id IN (SELECT value FROM json_each(?))
+    `).bind(user.tenantId, JSON.stringify(skuIds)).all<PurchaseSkuRow>();
+    if (available.results.length !== skuIds.length) {
+      throw new HttpError(409, '申请包含不存在、已停用或不在当前工作区的 SKU', 'PURCHASE_SKU_UNAVAILABLE');
+    }
+    const detailsBySku = new Map(available.results.map((row) => [row.id, mapPurchaseSku(row).productDetails]));
+    return lines.map((line) => ({
+      demandId: null,
+      skuId: line.skuId,
+      requestedQuantity: line.quantity,
+      sourceRequiredQuantity: null,
+      sourceUpdatedAt: null,
+      productDetails: resolvePurchaseProductDetails(detailsBySku.get(line.skuId) ?? null, line.productDetails),
+    }));
+  });
+}
+
 async function createPurchaseRequestWithAllocations(
   db: D1Database,
   user: UserContext,
-  input: {
-    purchaserMemberId: string;
-    reviewerMemberId: string;
-    note: string | null;
+  input: PurchaseRequestDraftInput & {
     allocations: Array<{ demandId: string; requestedQuantity: number | null }>;
-    requestHashInput: unknown;
-    auditAction: string;
-    auditContext: Record<string, unknown> | null;
   },
   idempotencyKey: string,
   options: Pick<PurchaseWorkflowOptions, 'developmentOpenAccess'> = {},
 ) {
+  const demandIds = input.allocations.map((allocation) => allocation.demandId);
+  return createPurchaseRequestDraft(db, user, input, idempotencyKey, options, async () => {
+    if (demandIds.length === 0) {
+      throw new HttpError(400, '采购申请至少需要一条需求', 'PURCHASE_REQUEST_EMPTY');
+    }
+    if (new Set(demandIds).size !== demandIds.length) {
+      throw new HttpError(400, '采购需求不能重复选择', 'PURCHASE_DEMAND_DUPLICATE');
+    }
+    const demands = await loadCreateDemands(db, user.tenantId, demandIds);
+    validateCreateDemands(demandIds, demands);
+    const demandById = new Map(demands.map((demand) => [demand.id, demand]));
+    return input.allocations.map((allocation) => {
+      const demand = demandById.get(allocation.demandId)!;
+      const availableQuantity = Math.max(
+        0,
+        Number(demand.required_quantity) - Number(demand.closed_received_quantity),
+      );
+      const requestedQuantity = allocation.requestedQuantity ?? availableQuantity;
+      if (!Number.isSafeInteger(requestedQuantity) || requestedQuantity <= 0
+        || requestedQuantity > availableQuantity) {
+        throw new HttpError(
+          409,
+          '采购建议分配量已超过当前订单需求，请刷新后重试',
+          'PURCHASE_ALLOCATION_INVALID',
+        );
+      }
+      return {
+        demandId: demand.id,
+        skuId: demand.mapped_sku_id!,
+        requestedQuantity,
+        sourceRequiredQuantity: demand.required_quantity,
+        sourceUpdatedAt: demand.source_updated_at,
+      };
+    });
+  });
+}
+
+async function createPurchaseRequestDraft(
+  db: D1Database,
+  user: UserContext,
+  input: PurchaseRequestDraftInput,
+  idempotencyKey: string,
+  options: Pick<PurchaseWorkflowOptions, 'developmentOpenAccess'>,
+  resolveLines: () => Promise<PurchaseRequestDraftLine[]>,
+) {
   requirePermission(user, 'purchase:create');
   validateIdempotencyKey(idempotencyKey);
-  if (input.allocations.length === 0) {
-    throw new HttpError(400, '采购申请至少需要一条需求', 'PURCHASE_REQUEST_EMPTY');
-  }
-  const demandIds = input.allocations.map((allocation) => allocation.demandId);
-  if (new Set(demandIds).size !== demandIds.length) {
-    throw new HttpError(400, '采购需求不能重复选择', 'PURCHASE_DEMAND_DUPLICATE');
+  const submit = ACTION_TRANSITIONS.submit;
+  let submittingMemberId: string | undefined;
+  if (input.submitImmediately) {
+    requirePermission(user, submit.permission);
+    submittingMemberId = await resolveActorMemberId(db, user);
+    if (options.developmentOpenAccess !== true) {
+      assertAssignedActor({ purchaser_member_id: input.purchaserMemberId, reviewer_member_id: input.reviewerMemberId },
+        submittingMemberId, 'submit');
+    }
   }
   const requestHash = await hashPayload(input.requestHashInput);
-  const existing = await db.prepare(`
-    SELECT id, request_hash
-    FROM purchase_requests
-    WHERE tenant_id = ? AND idempotency_key = ?
-    LIMIT 1
-  `).bind(user.tenantId, idempotencyKey).first<{ id: string; request_hash: string }>();
-  if (existing) {
-    if (existing.request_hash !== requestHash) {
-      throw new HttpError(409, '同一幂等键不能用于不同采购申请', 'IDEMPOTENCY_CONFLICT');
-    }
-    return { request: await getPurchaseRequest(db, user.tenantId, existing.id), replayed: true };
-  }
-
-  const createdByMemberId = await resolveActorMemberId(db, user);
-  await validateAssignedMembers(
-    db,
-    user.tenantId,
-    input.purchaserMemberId,
-    input.reviewerMemberId,
-  );
-  assertReviewerSeparation(
-    input.purchaserMemberId,
-    input.reviewerMemberId,
-    options.developmentOpenAccess === true,
-  );
-  const demands = await loadCreateDemands(db, user.tenantId, demandIds);
-  validateCreateDemands(demandIds, demands);
-  const demandById = new Map(demands.map((demand) => [demand.id, demand]));
-  const resolvedAllocations = input.allocations.map((allocation) => {
-    const demand = demandById.get(allocation.demandId)!;
-    const availableQuantity = Math.max(
-      0,
-      Number(demand.required_quantity) - Number(demand.closed_received_quantity),
-    );
-    const requestedQuantity = allocation.requestedQuantity ?? availableQuantity;
-    if (!Number.isSafeInteger(requestedQuantity) || requestedQuantity <= 0
-      || requestedQuantity > availableQuantity) {
-      throw new HttpError(
-        409,
-        '采购建议分配量已超过当前订单需求，请刷新后重试',
-        'PURCHASE_ALLOCATION_INVALID',
-      );
-    }
-    return { demand, requestedQuantity };
-  });
-
+  const existing = await readDraftReplay(db, user.tenantId, idempotencyKey, requestHash);
+  if (existing) return existing;
+  const createdByMemberId = submittingMemberId ?? await resolveActorMemberId(db, user);
+  await validateAssignedMembers(db, user.tenantId, input.purchaserMemberId, input.reviewerMemberId);
+  assertReviewerSeparation(input.purchaserMemberId, input.reviewerMemberId, options.developmentOpenAccess === true);
+  const lines = await resolveLines();
   const now = new Date().toISOString();
   const requestId = crypto.randomUUID();
   const requestNo = createPurchaseRequestNumber();
   const auditAfter = JSON.stringify({
     status: 'draft',
+    source: input.source,
     requestNo,
     purchaserMemberId: input.purchaserMemberId,
     reviewerMemberId: input.reviewerMemberId,
-    lineCount: demands.length,
-    totalQuantity: resolvedAllocations.reduce((sum, allocation) => sum + allocation.requestedQuantity, 0),
+    lineCount: lines.length,
+    totalQuantity: lines.reduce((sum, line) => sum + line.requestedQuantity, 0),
     ...(input.auditContext ?? {}),
   });
   const statements: D1PreparedStatement[] = [
     db.prepare(`
       INSERT INTO purchase_requests (
-        id, tenant_id, request_no, status, purchaser_member_id, reviewer_member_id,
+        id, tenant_id, request_no, status, source, purchaser_member_id, reviewer_member_id,
         created_by_member_id, note, review_note, version, idempotency_key, request_hash,
         last_action_key, submitted_at, reviewed_at, created_at, updated_at
-      ) VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, NULL, 1, ?, ?, ?, NULL, NULL, ?, ?)
+      ) VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?, NULL, 1, ?, ?, ?, NULL, NULL, ?, ?)
     `).bind(
       requestId,
       user.tenantId,
       requestNo,
+      input.source,
       input.purchaserMemberId,
       input.reviewerMemberId,
       createdByMemberId,
@@ -528,41 +639,68 @@ async function createPurchaseRequestWithAllocations(
       now,
       now,
     ),
-  ];
-  for (const { demand, requestedQuantity } of resolvedAllocations) {
-    statements.push(db.prepare(`
+    db.prepare(`
       INSERT INTO purchase_request_lines (
         id, tenant_id, request_id, purchase_demand_id, sku_id, requested_quantity,
-        source_required_quantity, source_updated_at, active, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-    `).bind(
-      crypto.randomUUID(),
-      user.tenantId,
-      requestId,
-      demand.id,
-      demand.mapped_sku_id,
-      requestedQuantity,
-      demand.required_quantity,
-      demand.source_updated_at,
+        source_required_quantity, source_updated_at, product_details_json, active, created_at
+      )
+      SELECT json_extract(value, '$.id'), ?, ?, json_extract(value, '$.demandId'),
+        json_extract(value, '$.skuId'), json_extract(value, '$.requestedQuantity'),
+        json_extract(value, '$.sourceRequiredQuantity'), json_extract(value, '$.sourceUpdatedAt'),
+        json_extract(value, '$.productDetails'), 1, ?
+      FROM json_each(?)
+    `).bind(user.tenantId, requestId, now, JSON.stringify(lines.map((line) => ({ ...line, id: crypto.randomUUID() })))),
+    auditInsertStatement(db, {
+      user,
+      action: input.auditAction,
+      entityId: requestId,
+      beforeJson: null,
+      afterJson: auditAfter,
+      idempotencyKey,
       now,
-    ));
+    }),
+  ];
+
+  if (input.submitImmediately) {
+    const submitKey = crypto.randomUUID();
+    statements.push(
+      db.prepare(`
+        UPDATE purchase_requests
+        SET status = ?, submitted_at = ?, version = version + 1, last_action_key = ?, updated_at = ?
+        WHERE id = ? AND tenant_id = ? AND status = ? AND version = 1
+      `).bind(submit.to, now, submitKey, now, requestId, user.tenantId, submit.from),
+      auditInsertStatement(db, {
+        user,
+        action: submit.auditAction,
+        entityId: requestId,
+        beforeJson: JSON.stringify({ status: submit.from, version: 1 }),
+        afterJson: JSON.stringify({ status: submit.to, version: 2, note: null }),
+        idempotencyKey: submitKey,
+        now,
+      }),
+    );
   }
-  statements.push(auditInsertStatement(db, {
-    user,
-    action: input.auditAction,
-    entityId: requestId,
-    beforeJson: null,
-    afterJson: auditAfter,
-    idempotencyKey,
-    now,
-  }));
 
   try {
     await db.batch(statements);
   } catch (error) {
-    throw translatePurchaseDatabaseError(error);
+    const replay = await readDraftReplay(db, user.tenantId, idempotencyKey, requestHash);
+    if (replay) return replay;
+    throw translatePurchaseDatabaseError(error, input.source);
   }
   return { request: await getPurchaseRequest(db, user.tenantId, requestId), replayed: false };
+}
+
+async function readDraftReplay(db: D1Database, tenantId: string, idempotencyKey: string, requestHash: string) {
+  const existing = await db.prepare(`
+    SELECT id, request_hash FROM purchase_requests
+    WHERE tenant_id = ? AND idempotency_key = ? LIMIT 1
+  `).bind(tenantId, idempotencyKey).first<{ id: string; request_hash: string }>();
+  if (!existing) return null;
+  if (existing.request_hash !== requestHash) {
+    throw new HttpError(409, '同一幂等键不能用于不同采购申请', 'IDEMPOTENCY_CONFLICT');
+  }
+  return { request: await getPurchaseRequest(db, tenantId, existing.id), replayed: true };
 }
 
 export async function executePurchaseRequestAction(
@@ -576,6 +714,7 @@ export async function executePurchaseRequestAction(
   validateIdempotencyKey(idempotencyKey);
   const transition = ACTION_TRANSITIONS[input.action];
   requirePermission(user, transition.permission);
+  const createsOrder = input.action === 'approve' && options.createOrderDraftOnApproval === true;
 
   const current = await getCurrentPurchaseRequest(db, user.tenantId, purchaseRequestId);
   const actorMemberId = await resolveActorMemberId(db, user);
@@ -591,28 +730,42 @@ export async function executePurchaseRequestAction(
     );
   }
 
-  const receipt = await db.prepare(`
-    SELECT entity_id, action
-    FROM audit_logs
-    WHERE tenant_id = ? AND idempotency_key = ?
-    LIMIT 1
-  `).bind(user.tenantId, idempotencyKey).first<{ entity_id: string; action: string }>();
-  if (receipt) {
+  async function readOutcome(replayed: boolean) {
+    const [request, purchaseOrder] = await Promise.all([
+      getPurchaseRequest(db, user.tenantId, purchaseRequestId),
+      createsOrder ? getPurchaseOrderForApproval(db, user.tenantId, purchaseRequestId, idempotencyKey) : null,
+    ]);
+    return { request, replayed, ...(createsOrder ? { purchaseOrder } : {}) };
+  }
+
+  async function readReplay() {
+    const receipt = await db.prepare(`
+      SELECT entity_id, action
+      FROM audit_logs
+      WHERE tenant_id = ? AND idempotency_key = ?
+      LIMIT 1
+    `).bind(user.tenantId, idempotencyKey).first<{ entity_id: string; action: string }>();
+    if (!receipt) return null;
     if (receipt.entity_id !== purchaseRequestId || receipt.action !== transition.auditAction) {
       throw new HttpError(409, '该幂等键已用于另一项业务操作', 'IDEMPOTENCY_CONFLICT');
     }
-    return {
-      request: await getPurchaseRequest(db, user.tenantId, purchaseRequestId),
-      replayed: true,
-    };
+    return readOutcome(true);
   }
+
+  const replay = await readReplay();
+  if (replay) return replay;
 
   if (current.status !== transition.from) {
     throw new HttpError(409, '当前采购申请状态不允许执行该操作', 'INVALID_PURCHASE_REQUEST_TRANSITION');
   }
-  if (input.action === 'submit' || input.action === 'approve') {
-    await assertRequestDemandsStillValid(db, user.tenantId, purchaseRequestId);
-    await assertRequestPlanningStillValid(db, user, current, options);
+  const reviewing = input.action === 'submit' || input.action === 'approve';
+  if (reviewing) {
+    if (current.source === 'manual') {
+      await assertManualRequestLinesStillValid(db, user.tenantId, purchaseRequestId);
+    } else {
+      await assertRequestDemandsStillValid(db, user.tenantId, purchaseRequestId);
+      await assertRequestPlanningStillValid(db, user, current, options);
+    }
   }
   if (input.action === 'withdraw') {
     await assertNoActivePurchaseOrder(db, user.tenantId, purchaseRequestId);
@@ -629,7 +782,7 @@ export async function executePurchaseRequestAction(
   const releaseLines = input.action === 'reject'
     || input.action === 'cancel'
     || input.action === 'withdraw';
-  const refreshSnapshots = input.action === 'submit' || input.action === 'approve';
+  const refreshSnapshots = reviewing && current.source !== 'manual';
   const activeOrderGuard = input.action === 'withdraw'
     ? `AND NOT EXISTS (
         SELECT 1 FROM purchase_orders po
@@ -727,23 +880,34 @@ export async function executePurchaseRequestAction(
     transition.to,
   ));
 
+  if (createsOrder) {
+    statements.push(...await prepareApprovedPurchaseOrderDraft(db, user, {
+      purchaseRequestId,
+      approvedVersion: current.version + 1,
+      approvalIdempotencyKey: idempotencyKey,
+      actorMemberId,
+      now,
+    }));
+  }
+
   let results: D1Result<unknown>[];
   try {
     results = await db.batch(statements);
   } catch (error) {
-    throw translatePurchaseDatabaseError(error);
+    const concurrentReplay = await readReplay();
+    if (concurrentReplay) return concurrentReplay;
+    throw translatePurchaseDatabaseError(error, current.source);
   }
   const updateResultIndex = refreshSnapshots ? 1 : 0;
   if (Number(results[updateResultIndex]?.meta?.changes ?? 0) !== 1) {
+    const concurrentReplay = await readReplay();
+    if (concurrentReplay) return concurrentReplay;
     if (input.action === 'withdraw') {
       await assertNoActivePurchaseOrder(db, user.tenantId, purchaseRequestId);
     }
     throw new HttpError(409, '采购申请已被其他操作更新，请刷新后重试', 'CONCURRENT_UPDATE');
   }
-  return {
-    request: await getPurchaseRequest(db, user.tenantId, purchaseRequestId),
-    replayed: false,
-  };
+  return readOutcome(false);
 }
 
 export async function getPurchaseRequest(db: D1Database, tenantId: string, id: string) {
@@ -765,6 +929,7 @@ const PURCHASE_REQUEST_SELECT = `
     pr.id,
     pr.request_no,
     pr.status,
+    pr.source,
     pr.purchaser_member_id,
     purchaser.display_name AS purchaser_name,
     purchaser.role AS purchaser_role,
@@ -783,7 +948,7 @@ const PURCHASE_REQUEST_SELECT = `
     pr.updated_at,
     COUNT(line.id) AS line_count,
     COALESCE(SUM(line.requested_quantity), 0) AS total_quantity,
-    COALESCE(MAX(CASE WHEN pr.status = 'approved' AND line.active = 1 AND (
+    COALESCE(MAX(CASE WHEN pr.status = 'approved' AND pr.source <> 'manual' AND line.active = 1 AND (
       pd.id IS NULL OR pd.status <> 'open' OR pd.mapped_sku_id <> line.sku_id
       OR pd.required_quantity < line.requested_quantity
       OR pd.source_updated_at <> line.source_updated_at
@@ -804,6 +969,11 @@ const PURCHASE_REQUEST_LINE_SELECT = `
     line.sku_id,
     sku.code AS sku_code,
     sku.name AS sku_name,
+    sku.specification AS sku_specification,
+    sku.dimensions AS sku_dimensions,
+    sku.image_url AS sku_image_url,
+    sku.description AS sku_description,
+    line.product_details_json,
     line.requested_quantity,
     line.source_required_quantity,
     line.source_updated_at,
@@ -820,11 +990,11 @@ const PURCHASE_REQUEST_LINE_SELECT = `
     pol.title
   FROM purchase_request_lines line
   JOIN purchase_requests pr ON pr.id = line.request_id AND pr.tenant_id = line.tenant_id
-  JOIN purchase_demands pd ON pd.id = line.purchase_demand_id AND pd.tenant_id = line.tenant_id
   JOIN skus sku ON sku.id = line.sku_id AND sku.tenant_id = line.tenant_id
-  JOIN platform_stores store ON store.id = pd.platform_store_id AND store.tenant_id = pd.tenant_id
-  JOIN platform_orders po ON po.id = pd.order_id AND po.tenant_id = pd.tenant_id
-  JOIN platform_order_lines pol ON pol.id = pd.order_line_id AND pol.tenant_id = pd.tenant_id
+  LEFT JOIN purchase_demands pd ON pd.id = line.purchase_demand_id AND pd.tenant_id = line.tenant_id
+  LEFT JOIN platform_stores store ON store.id = pd.platform_store_id AND store.tenant_id = pd.tenant_id
+  LEFT JOIN platform_orders po ON po.id = pd.order_id AND po.tenant_id = pd.tenant_id
+  LEFT JOIN platform_order_lines pol ON pol.id = pd.order_line_id AND pol.tenant_id = pd.tenant_id
 `;
 
 function mapRequest(row: PurchaseRequestRow, lines: ReturnType<typeof mapRequestLine>[]) {
@@ -832,6 +1002,7 @@ function mapRequest(row: PurchaseRequestRow, lines: ReturnType<typeof mapRequest
     id: row.id,
     requestNo: row.request_no,
     status: row.status,
+    source: row.source,
     purchaser: {
       id: row.purchaser_member_id,
       displayName: row.purchaser_name,
@@ -862,6 +1033,7 @@ function mapRequest(row: PurchaseRequestRow, lines: ReturnType<typeof mapRequest
 }
 
 function mapRequestLine(row: PurchaseRequestLineRow) {
+  const snapshot = parsePurchaseProductDetails(row.product_details_json);
   return {
     id: row.id,
     demandId: row.purchase_demand_id,
@@ -869,14 +1041,21 @@ function mapRequestLine(row: PurchaseRequestLineRow) {
     skuId: row.sku_id,
     skuCode: row.sku_code,
     skuName: row.sku_name,
+    productDetails: resolvePurchaseProductDetails({
+      name: row.sku_name,
+      specification: row.sku_specification,
+      dimensions: row.sku_dimensions,
+      imageUrl: row.sku_image_url,
+      description: snapshot ? null : row.sku_description,
+    }, snapshot),
     requestedQuantity: Number(row.requested_quantity),
-    sourceRequiredQuantity: Number(row.source_required_quantity),
+    sourceRequiredQuantity: row.source_required_quantity === null ? null : Number(row.source_required_quantity),
     sourceUpdatedAt: row.source_updated_at,
     active: Boolean(row.active),
     currentStatus: row.current_status,
-    currentRequiredQuantity: Number(row.current_required_quantity),
+    currentRequiredQuantity: row.current_required_quantity === null ? null : Number(row.current_required_quantity),
     currentSourceUpdatedAt: row.current_source_updated_at,
-    needsAttention: row.active === 1 && (
+    needsAttention: row.active === 1 && row.purchase_demand_id !== null && (
       row.current_status !== 'open'
       || row.current_mapped_sku_id !== row.sku_id
       || Number(row.current_required_quantity) < Number(row.requested_quantity)
@@ -1041,6 +1220,7 @@ async function getCurrentPurchaseRequest(db: D1Database, tenantId: string, id: s
     SELECT
       pr.id,
       pr.status,
+      pr.source,
       pr.version,
       pr.purchaser_member_id,
       pr.reviewer_member_id,
@@ -1135,6 +1315,21 @@ async function assertRequestDemandsStillValid(db: D1Database, tenantId: string, 
   }
 }
 
+async function assertManualRequestLinesStillValid(db: D1Database, tenantId: string, requestId: string) {
+  const lines = await db.prepare(`
+    SELECT COUNT(*) AS total_lines, COUNT(sku.id) AS valid_lines
+    FROM purchase_request_lines line
+    LEFT JOIN skus sku ON sku.id = line.sku_id AND sku.tenant_id = line.tenant_id AND sku.active = 1
+      AND line.purchase_demand_id IS NULL
+      AND line.source_required_quantity IS NULL
+      AND line.source_updated_at IS NULL
+    WHERE line.tenant_id = ? AND line.request_id = ? AND line.active = 1
+  `).bind(tenantId, requestId).first<{ total_lines: number; valid_lines: number }>();
+  if (!lines || Number(lines.total_lines) === 0 || Number(lines.valid_lines) !== Number(lines.total_lines)) {
+    throw new HttpError(409, '手工采购申请缺少有效的在用 SKU，请重新建单', 'PURCHASE_SKU_UNAVAILABLE');
+  }
+}
+
 function auditInsertStatement(db: D1Database, input: {
   user: UserContext;
   action: string;
@@ -1182,9 +1377,15 @@ function createPurchaseRequestNumber() {
   return `CG${date}-${suffix}`;
 }
 
-function translatePurchaseDatabaseError(error: unknown) {
+function translatePurchaseDatabaseError(error: unknown, source: PurchaseRequestSource) {
   const message = error instanceof Error ? error.message : String(error);
+  if (message.includes('audit_logs.tenant_id, audit_logs.idempotency_key')) {
+    return new HttpError(409, '该幂等键已用于另一项业务操作', 'IDEMPOTENCY_CONFLICT');
+  }
   if (message.includes('INVALID_PURCHASE_DEMAND') || message.includes('PURCHASE_DEMAND_CHANGED')) {
+    if (source === 'manual') {
+      return new HttpError(409, '手工采购明细的 SKU 已不可用，请刷新后重试', 'PURCHASE_SKU_UNAVAILABLE');
+    }
     return new HttpError(409, '订单需求已变化，请刷新后重试', 'PURCHASE_DEMAND_CHANGED');
   }
   if (message.includes('INVALID_PURCHASE_REQUEST_TRANSITION')) {

@@ -3,27 +3,25 @@ import { ShopifyAdminClient } from '../../../../../../../lib/connectors/shopify/
 import {
   hasShopifyAppCredentials,
   isShopifyStoreKey,
+  missingShopifyReadScopes,
   resolveShopifyStoreConfig,
   shopifyDomainAccepted,
   withShopifyAdminAccessToken,
 } from '../../../../../../../lib/connectors/shopify/config';
 import { ShopifyOrderConnector } from '../../../../../../../lib/connectors/shopify/connector';
 import { saveShopifyOAuthCredential } from '../../../../../../../lib/connectors/shopify/credential-store';
+import { shopifyPublicOrigin } from '../../../../../../../lib/connectors/shopify/public-origin';
 import { sanitizedConnectorError, ShopifyConnectorError } from '../../../../../../../lib/connectors/shopify/errors';
 import { ensureShopifyOrderWebhookSubscriptions } from '../../../../../../../lib/connectors/shopify/webhook-registration';
 import {
   classifyShopifyOAuthFailure,
   type ShopifyOAuthStage,
 } from '../../../../../../../lib/connectors/shopify/oauth-failure';
-import {
-  createShopifyOAuthApi,
-  SHOPIFY_REQUIRED_ORDER_READ_SCOPES,
-} from '../../../../../../../lib/connectors/shopify/oauth';
+import { createShopifyOAuthApi } from '../../../../../../../lib/connectors/shopify/oauth';
 import {
   HttpError,
   requestContext,
-  requirePermission,
-  requireProductionAccessPolicy,
+  requireShopifyConnectorOperator,
 } from '../../../../../../../lib/db';
 
 export const dynamic = 'force-dynamic';
@@ -39,9 +37,8 @@ export async function GET(
     callbackStoreKey = storeKey;
     stage = 'request_context';
     const { db, user } = await requestContext(request);
-    requirePermission(user, 'connectors:sync');
     const runtimeEnv = env as unknown as Record<string, unknown>;
-    requireProductionAccessPolicy(runtimeEnv, user.email);
+    requireShopifyConnectorOperator(runtimeEnv, user);
     if (!isShopifyStoreKey(storeKey)) {
       throw new HttpError(404, '未找到该 Shopify 店铺配置', 'UNKNOWN_SHOPIFY_STORE');
     }
@@ -54,7 +51,8 @@ export async function GET(
         'SHOPIFY_APP_CREDENTIALS_MISSING',
       );
     }
-    const api = createShopifyOAuthApi(config, request.url);
+    const publicOrigin = shopifyPublicOrigin(runtimeEnv, request.url);
+    const api = createShopifyOAuthApi(config, publicOrigin);
     stage = 'token_exchange';
     const callback = await api.auth.callback<Headers>({ rawRequest: request, expiring: true });
     stage = 'identity';
@@ -77,11 +75,17 @@ export async function GET(
     stage = 'shop_context';
     const shop = await connector.getShopContext();
     stage = 'scope_check';
-    const missingScopes = SHOPIFY_REQUIRED_ORDER_READ_SCOPES.filter((scope) => !shop.scopes.has(scope));
-    if (missingScopes.length) {
+    if ([...shop.scopes].some((scope) => scope.startsWith('write_'))) {
+      throw new ShopifyConnectorError(
+        'SHOPIFY_AUTH_WRITABLE_SCOPE',
+        `${config.displayName} 的应用包含写入权限，请使用广州 ERP 的只读应用`,
+      );
+    }
+    const missingScopes = missingShopifyReadScopes(config, shop.scopes);
+    if (missingScopes.includes('read_orders')) {
       throw new ShopifyConnectorError(
         'SHOPIFY_REQUIRED_SCOPE_MISSING',
-        `${config.displayName} 缺少 ERP 订单只读所需权限，已停止保存`,
+        `${config.displayName} 缺少订单只读权限，未保存本次授权`,
       );
     }
     stage = 'credential_save';
@@ -99,7 +103,7 @@ export async function GET(
     waitUntil(ensureShopifyOrderWebhookSubscriptions({
         client,
         storeKey,
-        requestUrl: request.url,
+        requestUrl: publicOrigin,
       }).then((registration) => {
         console.info('shopify_webhook_subscriptions_ready', JSON.stringify({
           storeKey,
@@ -116,7 +120,9 @@ export async function GET(
         }));
       }));
     const headers = new Headers(callback.headers);
-    headers.set('Location', `/?shopify_oauth=${encodeURIComponent(storeKey)}&status=connected`);
+    const status = new URLSearchParams({ shopify_oauth: storeKey, status: 'connected' });
+    if (missingScopes.length) status.set('catalog', 'pending');
+    headers.set('Location', `/?${status}`);
     headers.set('Cache-Control', 'no-store');
     headers.set('Referrer-Policy', 'no-referrer');
     return new Response(null, { status: 303, headers });
@@ -168,15 +174,16 @@ export async function GET(
       shopifyRequestId: failure.shopifyRequestId,
     }));
 
-    const redirect = new URL('/', request.url);
-    redirect.searchParams.set('shopify_oauth', callbackStoreKey);
-    redirect.searchParams.set('status', 'error');
-    redirect.searchParams.set('code', failure.code);
-    redirect.searchParams.set('stage', stage);
+    const status = new URLSearchParams({
+      shopify_oauth: callbackStoreKey,
+      status: 'error',
+      code: failure.code,
+      stage,
+    });
     return new Response(null, {
       status: 303,
       headers: {
-        Location: redirect.toString(),
+        Location: `/?${status}`,
         'Cache-Control': 'no-store',
         'Referrer-Policy': 'no-referrer',
       },

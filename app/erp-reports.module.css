@@ -1,0 +1,186 @@
+.reports {
+  min-width: 0;
+}
+
+.controls {
+  margin-bottom: 14px;
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 12px;
+  border-bottom: 1px solid var(--line);
+  padding: 0 14px;
+}
+
+.tabs button {
+  min-height: 42px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  padding: 0 8px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.tabs button:hover,
+.tabs button[aria-pressed='true'] {
+  color: var(--erp-blue-dark);
+}
+
+.tabs button[aria-pressed='true'] {
+  border-bottom-color: var(--erp-blue);
+  font-weight: 650;
+}
+
+.tabs button:focus-visible {
+  outline-offset: -3px;
+}
+
+.toolbar,
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px 14px;
+}
+
+.toolbar {
+  padding: 12px 16px;
+}
+
+.filters {
+  align-items: center;
+}
+
+.filters label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.filters :is(input, select) {
+  min-height: 34px;
+  max-width: 100%;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+}
+
+.method {
+  flex: 1 1 200px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.method summary {
+  width: fit-content;
+  margin-left: auto;
+  padding: 8px 2px;
+  color: var(--erp-blue-dark);
+  cursor: pointer;
+}
+
+.method p {
+  margin: 0;
+  padding: 4px 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
+  gap: 1px;
+  margin: 0 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.metrics div {
+  min-width: 0;
+  padding: 11px 14px;
+  background: var(--paper);
+}
+
+.metrics dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.metrics dd {
+  margin: 3px 0 0;
+  color: var(--ink);
+  font-weight: 650;
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tableHeader {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px 14px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.tableHeader h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.tableHeader p,
+.loading,
+.error {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.resultsTable table {
+  min-width: 680px;
+}
+
+.resultsTable table:has(:global(.empty-cell)) {
+  min-width: min(100%, 680px);
+}
+
+.resultsTable [data-numeric='true'] {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.loading,
+.error {
+  padding: 12px 16px;
+  border-radius: 6px;
+}
+
+.loading {
+  border: 1px solid var(--line);
+  background: var(--paper);
+}
+
+.error {
+  border: 1px solid #f2ccc7;
+  color: #932c25;
+  background: #fff4f2;
+}
+
+@media (max-width: 650px) {
+  .method summary {
+    margin-left: 0;
+  }
+}

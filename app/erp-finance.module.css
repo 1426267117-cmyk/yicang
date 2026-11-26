@@ -1,0 +1,323 @@
+.content {
+  min-width: 0;
+}
+
+.content .pageHeader {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.pageHeader h1 {
+  margin: 0;
+}
+
+.reconciliation {
+  min-width: 0;
+  padding: 0;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.filters label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.filters :is(input, select) {
+  width: 100%;
+  min-width: 132px;
+  min-height: 34px;
+  padding: 0 9px;
+  background: #fff;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  font-weight: 400;
+}
+
+.filters input {
+  min-width: 218px;
+}
+
+.filters > button {
+  flex: none;
+}
+
+.accountingBasis {
+  margin-left: auto;
+  align-self: center;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.accountingBasis[open] {
+  flex: 1 0 100%;
+  text-align: left;
+}
+
+.accountingBasis summary {
+  cursor: pointer;
+}
+
+.accountingBasis p {
+  margin: 6px 0 0;
+  max-width: 680px;
+  line-height: 1.55;
+}
+
+.sectionTitle,
+.detailHeading {
+  margin: 0;
+  padding: 12px 16px 8px;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.detailHeading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px 14px;
+}
+
+.detailHeading h2 {
+  margin: 0;
+  font: inherit;
+}
+
+.summary table,
+.orders table,
+.ledgerBody table {
+  font-variant-numeric: tabular-nums;
+}
+
+.reconciliation .summary table {
+  min-width: 600px;
+}
+
+.reconciliation .orders table {
+  min-width: 845px;
+}
+
+.dialog .ledgerBody table {
+  min-width: 720px;
+}
+
+.reconciliation .orders table:has(:global(.empty-cell)) {
+  min-width: min(100%, 600px);
+}
+
+.summary thead th:nth-child(n+2),
+.summary tbody td,
+.orders :is(th, td):nth-child(n+4):nth-child(-n+8),
+.ledgerBody table :is(th, td):nth-child(3) {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.summary tbody th {
+  color: var(--ink);
+}
+
+.content .reconciliation .orders .overpaid,
+.dialog .ledgerAmounts .overpaid {
+  color: #96352e;
+}
+
+.orders td:first-child :global(.cell-sub),
+.ledgerBody table td:first-child {
+  white-space: nowrap;
+}
+
+.pages,
+.ledgerToolbar,
+.formActions,
+.problem {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+}
+
+.pages {
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.reconciliation .pages {
+  margin-top: 0;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.dialog {
+  width: min(910px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--line);
+  overflow: auto;
+}
+
+.dialog::backdrop {
+  background: rgb(17 28 47 / 44%);
+}
+
+.ledgerBody {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  padding: 14px 20px;
+}
+
+.ledgerAmounts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
+  gap: 1px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--line);
+}
+
+.ledgerAmounts > div,
+.ledgerToolbar > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.ledgerAmounts > div {
+  padding: 11px 12px;
+  background: #f8fafc;
+}
+
+.ledgerAmounts span,
+.ledgerToolbar span,
+.detailHeading > span,
+.pages > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.ledgerAmounts strong,
+.ledgerToolbar strong {
+  color: var(--ink);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.ledgerToolbar,
+.problem {
+  justify-content: space-between;
+}
+
+.ledgerTabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 0;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.ledgerTabs button {
+  min-height: 40px;
+  padding: 0 6px;
+  border: 0;
+  box-shadow: inset 0 -2px transparent;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ledgerTabs button[aria-pressed='true'] {
+  color: #2456a6;
+  box-shadow: inset 0 -2px #285fb9;
+  font-weight: 650;
+}
+
+.ledgerTabs button:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.paymentForm {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.paymentForm h3,
+.paymentForm p {
+  margin: 0 0 8px;
+}
+
+.paymentForm p {
+  font-size: 12px;
+}
+
+.paymentForm > div:first-of-type {
+  padding: 8px 0 12px;
+}
+
+.formActions {
+  justify-content: flex-end;
+}
+
+.problem,
+.error,
+.notice,
+.empty {
+  margin: 0;
+  font-size: 13px;
+  padding: 12px 16px;
+}
+
+.problem,
+.error {
+  color: #922e21;
+}
+
+.notice {
+  color: #17694e;
+}
+
+.empty {
+  color: var(--muted);
+}
+
+@media (max-width: 560px) {
+  .filters label {
+    flex: 1 1 132px;
+    min-width: 0;
+  }
+
+  .filters :is(input, select) {
+    min-width: 0;
+  }
+
+  .paymentForm > div:first-of-type {
+    grid-template-columns: 1fr;
+  }
+}

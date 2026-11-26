@@ -9,15 +9,15 @@ ERP 在 `/mcp` 暴露一个无状态、JSON-RPC 2.0 的 Site MCP server，协议
 
 刷新工具会重复使用现有幂等、增量游标、重叠窗口和失败保留旧有效数据的逻辑。它不会修改 Shopify 订单、库存、付款或发货状态，也不会写入 MUKU 看板或共享盘。
 
-## 写工具权限
+## 工具权限
 
-Sites 会在 MCP 请求中转发已验证的 `oai-authenticated-user-email`。刷新工具还会将该邮箱与部署环境中的非秘密变量进行精确匹配：
+Sites 会在 MCP 请求中转发已验证的 `oai-authenticated-user-email`。两个工具都要求该邮箱与部署环境中的非秘密变量精确匹配。
 
 ```dotenv
 ERP_AUTOMATION_ALLOWED_EMAILS=owner@example.com,operator@example.com
 ```
 
-变量缺失、为空、邮箱头缺失或调用者不在白名单时，刷新工具均会失败关闭。`ERP_DEV_OPEN_ACCESS=true` 不能绕过这项检查。不要把 Token、Cookie、App Secret 或 API Key 写进这个变量或计划任务提示词。
+变量缺失、为空、邮箱头缺失或调用者不在名单内时，工具拒绝访问。`ERP_DEV_OPEN_ACCESS=true` 不能绕过这项检查。名单仅配置需要访问多工作区采购时效数据的自动化账号。
 
 托管计划任务已经实际保存并验证后，再设置以下非秘密状态变量：
 

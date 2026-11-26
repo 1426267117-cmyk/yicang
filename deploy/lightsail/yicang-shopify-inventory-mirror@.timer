@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh read-only Shopify stock for Yicang store %i
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=90s
+AccuracySec=15s
+RandomizedDelaySec=20s
+
+[Install]
+WantedBy=timers.target

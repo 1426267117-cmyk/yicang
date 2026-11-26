@@ -1,5 +1,5 @@
 import { env, waitUntil } from 'cloudflare:workers';
-import { requestContext } from '../../../../../lib/db';
+import { requestContext, requirePermission } from '../../../../../lib/db';
 import {
   evaluateMukuFreshness,
   refreshMukuIfDue,
@@ -21,6 +21,7 @@ export const dynamic = 'force-dynamic';
 export async function GET(request: Request) {
   try {
     const { db, user } = await requestContext(request);
+    requirePermission(user, 'connectors:read');
     const runtimeEnv = env as unknown as Record<string, unknown>;
     const configured = hasMukuConfiguration();
     const internalJobAuthConfigured = hasSecureInternalJobToken(runtimeEnv);

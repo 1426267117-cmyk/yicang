@@ -1,0 +1,142 @@
+.book {
+  display: grid;
+  gap: 14px;
+}
+
+.book > header {
+  align-items: center;
+  gap: 10px;
+}
+
+.filters,
+.controls,
+.filterForm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+}
+
+.filters > label {
+  flex: 1 1 230px;
+  max-width: 450px;
+}
+
+.filters label {
+  display: grid;
+  gap: 6px;
+  color: #53635b;
+  font-size: 12px;
+}
+
+.filters input,
+.filters select {
+  min-width: 124px;
+  width: 100%;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid #dfe5e1;
+  border-radius: 8px;
+  background: #fbfcfb;
+  color: #314239;
+  font-size: 12px;
+}
+
+.filters input[type='number'] {
+  width: 120px;
+}
+
+.notice,
+.error {
+  margin: 0;
+  color: #52615b;
+  font-size: 12px;
+}
+
+.error {
+  color: #943c2d;
+}
+
+.table table,
+.dialogBody table {
+  margin-top: 0;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+.table :is(th, td),
+.dialogBody :is(th, td) {
+  padding-top: 9px;
+  padding-bottom: 9px;
+  vertical-align: top;
+}
+
+.tiers {
+  padding: 0 0 0 14px;
+  margin: 6px 0 0;
+}
+
+.tiers li {
+  line-height: 1.6;
+}
+
+.dialog {
+  width: min(790px, calc(100% - 22px));
+  max-height: calc(100% - 22px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--line);
+  overflow: auto;
+}
+
+.dialog::backdrop {
+  background: rgb(13 29 23 / 45%);
+}
+
+.dialogBody,
+.dialog form > .error {
+  padding: 18px 22px;
+}
+
+.tierEditor {
+  margin: 0 22px 16px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #f8faf9;
+  color: #344a3f;
+}
+
+.tierRow {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+  padding: 10px 0;
+}
+
+.apply {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.apply small {
+  color: #52615b;
+  font-size: 11px;
+}
+
+@media (max-width: 560px) {
+  .book > header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .filterForm,
+  .filters > label {
+    width: 100%;
+  }
+
+  .filterForm > label {
+    flex: 1;
+  }
+}

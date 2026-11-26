@@ -41,6 +41,7 @@ describe('ERP 请求访问边界', () => {
         email TEXT NOT NULL,
         display_name TEXT NOT NULL,
         role TEXT NOT NULL,
+        access_profile TEXT,
         created_at TEXT NOT NULL,
         FOREIGN KEY (tenant_id) REFERENCES tenants(id)
       )
@@ -60,6 +61,68 @@ describe('ERP 请求访问边界', () => {
       code: 'AUTH_REQUIRED',
     });
     expect(await memberCount()).toBe(0);
+  });
+
+  it('AWS 使用已验证身份，并拒绝外站提交业务操作', async () => {
+    runtimeEnv.ERP_HOST_RUNTIME = 'aws';
+    runtimeEnv.ERP_DEV_OPEN_ACCESS = 'true';
+    runtimeEnv.ERP_ALLOWED_EMAILS = 'owner@example.com';
+    runtimeEnv.ERP_PUBLIC_ORIGIN = 'https://erp.example.com';
+    runtimeEnv.ERP_WORKSPACE_NAME = '广州易仓';
+    runtimeEnv.verifyRequestIdentity = async () => null;
+    await expect(requestContext(erpRequest('owner-id', 'owner@example.com'))).rejects.toMatchObject({
+      status: 401, code: 'AUTH_REQUIRED',
+    });
+
+    runtimeEnv.verifyRequestIdentity = async () => ({
+      id: 'alb-owner', email: 'owner@example.com', displayName: 'ERP 管理员',
+    });
+    const write = (origin: string) => new Request('https://erp.example.com/api/purchase/skus', {
+      method: 'POST', headers: { origin },
+    });
+    await expect(requestContext(write('https://another.example.com'))).rejects.toMatchObject({
+      status: 403, code: 'ERP_REQUEST_ORIGIN_NOT_ALLOWED',
+    });
+    expect(await memberCount()).toBe(0);
+    await expect(requestContext(write('https://erp.example.com'))).resolves.toMatchObject({
+      user: { id: 'alb-owner', role: 'admin', tenantName: '广州易仓' },
+    });
+  });
+
+  it('飞书首次登录待授权，电邮相同也不会继承恢复管理员身份，岗位变更即时生效', async () => {
+    runtimeEnv.ERP_HOST_RUNTIME = 'aws';
+    runtimeEnv.ERP_ALLOWED_EMAILS = 'owner@example.com';
+    const id = 'feishu:valid-test-subject';
+    runtimeEnv.verifyRequestIdentity = async () => ({
+      id, email: 'owner@example.com', displayName: '飞书员工', provider: 'feishu',
+    });
+    await expect(requestContext(erpRequest())).rejects.toMatchObject({ code: 'ERP_ADMIN_BOOTSTRAP_EMAIL_REQUIRED' });
+    expect(await memberCount()).toBe(0);
+    await seedMember('recovery-owner', 'owner@example.com', 'admin');
+    expect((await requestContext(erpRequest())).user).toMatchObject({
+      id, authProvider: 'feishu', role: 'viewer', accessProfile: 'pending', permissions: [], channelScope: null,
+    });
+    await db.prepare("UPDATE members SET access_profile = 'amazon' WHERE auth_user_id = ?").bind(id).run();
+    expect((await requestContext(erpRequest())).user).toMatchObject({
+      accessProfile: 'amazon', permissions: ['channels:read'], channelScope: 'amazon',
+    });
+    await db.prepare("UPDATE members SET access_profile = 'finance' WHERE auth_user_id = ?").bind(id).run();
+    expect((await requestContext(erpRequest())).user).toMatchObject({
+      accessProfile: 'finance', permissions: ['finance:read', 'finance:review', 'finance:write'], channelScope: null,
+    });
+    expect(await storedRole('recovery-owner')).toBe('admin');
+  });
+
+  it('开启飞书专用模式后保留负责人恢复入口，阻止旧登录员工访问', async () => {
+    runtimeEnv.ERP_HOST_RUNTIME = 'aws';
+    runtimeEnv.ERP_ALLOWED_EMAILS = 'owner@example.com,staff@example.com';
+    runtimeEnv.ERP_FEISHU_LOGIN_REQUIRED = 'true';
+    runtimeEnv.isFeishuLoginConfigured = true;
+    runtimeEnv.verifyRequestIdentity = async () => ({ id: 'recovery-owner', email: 'owner@example.com', displayName: '负责人' });
+    expect((await requestContext(erpRequest())).user).toMatchObject({ role: 'admin', authProvider: 'existing' });
+    runtimeEnv.verifyRequestIdentity = async () => ({ id: 'old-staff', email: 'staff@example.com', displayName: '旧员工账号' });
+    await expect(requestContext(erpRequest())).rejects.toMatchObject({ status: 401, code: 'AUTH_REQUIRED' });
+    expect(await memberCount()).toBe(1);
   });
 
   it('正式模式空访问名单时失败关闭', async () => {

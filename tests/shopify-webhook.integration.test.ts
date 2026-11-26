@@ -9,8 +9,9 @@ import {
 } from '../lib/connectors/shopify/webhook';
 
 const tenantId = 'tenant_webhook_test';
-const shopDomain = 'z6w01w-xs.myshopify.com';
+const shopDomain = 'fixture-bizfurniz-canonical.myshopify.com';
 const clientSecret = 'test_webhook_client_secret';
+const runtimeEnv = { SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: shopDomain, SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret };
 
 describe('Shopify webhook 安全接收', () => {
   let mf: Miniflare;
@@ -62,7 +63,7 @@ describe('Shopify webhook 安全接收', () => {
 
     const first = await receiveShopifyOrderWebhook({
       db,
-      runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      runtimeEnv,
       storeKey: 'bizfurniz',
       headers,
       rawBody,
@@ -70,7 +71,7 @@ describe('Shopify webhook 安全接收', () => {
     });
     const duplicate = await receiveShopifyOrderWebhook({
       db,
-      runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      runtimeEnv,
       storeKey: 'bizfurniz',
       headers,
       rawBody,
@@ -110,7 +111,7 @@ describe('Shopify webhook 安全接收', () => {
 
     await expect(receiveShopifyOrderWebhook({
       db,
-      runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      runtimeEnv,
       storeKey: 'bizfurniz',
       headers,
       rawBody: tampered,
@@ -140,7 +141,7 @@ describe('Shopify webhook 安全接收', () => {
     const body = new TextEncoder().encode('{"id":9001,"admin_graphql_api_id":"gid://shopify/Order/9001"}');
     await expect(receiveShopifyOrderWebhook({
       db,
-      runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      runtimeEnv,
       storeKey: 'bizfurniz',
       headers: await signedHeaders(body, { topic: 'orders/create', webhookId: 'ambiguous' }),
       rawBody: body,
@@ -153,20 +154,20 @@ describe('Shopify webhook 安全接收', () => {
     const wrongDomain = await signedHeaders(body, { topic: 'orders/create', webhookId: 'wrong-domain' });
     wrongDomain.set('X-Shopify-Shop-Domain', 'other-store.myshopify.com');
     await expect(receiveShopifyOrderWebhook({
-      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      db, runtimeEnv,
       storeKey: 'bizfurniz', headers: wrongDomain, rawBody: body,
     })).rejects.toMatchObject({ code: 'SHOPIFY_WEBHOOK_SHOP_MISMATCH', status: 401 });
 
     const missingHeader = await signedHeaders(body, { topic: 'orders/create', webhookId: 'missing-header' });
     missingHeader.delete('X-Shopify-Topic');
     await expect(receiveShopifyOrderWebhook({
-      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      db, runtimeEnv,
       storeKey: 'bizfurniz', headers: missingHeader, rawBody: body,
     })).rejects.toMatchObject({ code: 'SHOPIFY_WEBHOOK_HEADER_MISSING', status: 400 });
 
     await db.prepare('DELETE FROM connector_credentials').run();
     await expect(receiveShopifyOrderWebhook({
-      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      db, runtimeEnv,
       storeKey: 'bizfurniz',
       headers: await signedHeaders(body, { topic: 'orders/create', webhookId: 'unauthorized' }),
       rawBody: body,
@@ -176,13 +177,13 @@ describe('Shopify webhook 安全接收', () => {
   it('超限请求拒绝，缺少订单标识的已验签事件安全标记 ignored', async () => {
     const oversized = new Uint8Array(SHOPIFY_WEBHOOK_MAX_BODY_BYTES + 1);
     await expect(receiveShopifyOrderWebhook({
-      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      db, runtimeEnv,
       storeKey: 'bizfurniz', headers: new Headers(), rawBody: oversized,
     })).rejects.toMatchObject({ code: 'SHOPIFY_WEBHOOK_TOO_LARGE', status: 413 });
 
     const missingOrder = new TextEncoder().encode('{"note":"no order id"}');
     const result = await receiveShopifyOrderWebhook({
-      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      db, runtimeEnv,
       storeKey: 'bizfurniz',
       headers: await signedHeaders(missingOrder, { topic: 'orders/updated', webhookId: 'missing-order' }),
       rawBody: missingOrder,
@@ -197,7 +198,7 @@ describe('Shopify webhook 安全接收', () => {
     const body = new TextEncoder().encode('{"id":9001,"admin_graphql_api_id":"gid://shopify/Order/9001"}');
     const result = await receiveShopifyOrderWebhook({
       db,
-      runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret },
+      runtimeEnv,
       storeKey: 'bizfurniz',
       headers: await signedHeaders(body, { topic: 'orders/delete', webhookId: 'order-delete' }),
       rawBody: body,

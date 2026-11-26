@@ -52,8 +52,8 @@ describe('Shopify 过期访问令牌自动刷新', () => {
       tenantId,
       runtimeEnv: { ERP_CONNECTOR_CREDENTIALS_KEY: encryptionKey },
       storeKey: 'bizfurniz',
-      shopDomain: 'z6w01w-xs.myshopify.com',
-      officialStoreId: 'gid://shopify/Shop/100191109201',
+      shopDomain: 'fixture-bizfurniz-canonical.myshopify.com',
+      officialStoreId: 'gid://shopify/Shop/12345678901',
       grantedScopes: 'read_orders',
       session: {
         accessToken: oldAccessToken,
@@ -79,6 +79,7 @@ describe('Shopify 过期访问令牌自动刷新', () => {
       tenantId,
       runtimeEnv: {
         ERP_CONNECTOR_CREDENTIALS_KEY: encryptionKey,
+        SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: 'fixture-bizfurniz-canonical.myshopify.com',
         SHOPIFY_BIZFURNIZ_CLIENT_ID: 'test-client-id',
         SHOPIFY_BIZFURNIZ_CLIENT_SECRET: 'test-client-secret',
       },
@@ -88,7 +89,7 @@ describe('Shopify 过期访问令牌自动刷新', () => {
     });
 
     expect(oauthMocks.refreshToken).toHaveBeenCalledWith({
-      shop: 'z6w01w-xs.myshopify.com',
+      shop: 'fixture-bizfurniz-canonical.myshopify.com',
       refreshToken: oldRefreshToken,
     });
     expect(resolved.adminAccessToken).toBe(newAccessToken);

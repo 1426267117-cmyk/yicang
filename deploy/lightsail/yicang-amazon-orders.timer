@@ -1,0 +1,10 @@
+[Unit]
+Description=Reconcile Yicang Amazon order windows after first import
+
+[Timer]
+OnActiveSec=10min
+OnUnitInactiveSec=30min
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

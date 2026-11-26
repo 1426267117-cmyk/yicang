@@ -86,8 +86,10 @@ export type CanonicalFulfillment = {
   raw: unknown;
 };
 
-export type CanonicalOrderGraph = {
-  platform: 'shopify';
+export type OrderConnectorPlatform = 'shopify' | 'amazon';
+
+export type CanonicalOrderGraph<Platform extends OrderConnectorPlatform = 'shopify'> = {
+  platform: Platform;
   sourceOrderId: string;
   sourceOrderName: string | null;
   sourceCreatedAt: string;

@@ -1,0 +1,11 @@
+[Unit]
+Description=Drain Yicang Shopify order webhooks
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=true
+Unit=yicang-shopify-order-job@webhook.service
+
+[Install]
+WantedBy=timers.target

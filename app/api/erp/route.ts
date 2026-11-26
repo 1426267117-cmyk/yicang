@@ -6,7 +6,8 @@ export const dynamic = 'force-dynamic';
 export async function GET(request: Request) {
   try {
     const { db, user } = await requestContext(request);
-    return Response.json(await getErpPayload(db, user), {
+    const includePlatformPreview = new URL(request.url).searchParams.get('compact') !== '1';
+    return Response.json(await getErpPayload(db, user, { includePlatformPreview }), {
       headers: { 'Cache-Control': 'no-store' },
     });
   } catch (error) {

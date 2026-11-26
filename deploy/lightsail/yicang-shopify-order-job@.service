@@ -1,0 +1,21 @@
+[Unit]
+Description=Yicang Shopify orders %i
+Requisite=yicang.service
+After=yicang.service
+PartOf=yicang.service
+ConditionPathExists=/etc/yicang/shopify-jobs.env
+
+[Service]
+Type=oneshot
+User=yicang
+Group=yicang
+WorkingDirectory=/opt/yicang/current
+EnvironmentFile=/etc/yicang/shopify-jobs.env
+ExecStart=/opt/yicang-node/bin/node scripts/run-shopify-order-job.mjs %i http://127.0.0.1:3000
+TimeoutStartSec=10min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+IPAddressDeny=any
+IPAddressAllow=localhost

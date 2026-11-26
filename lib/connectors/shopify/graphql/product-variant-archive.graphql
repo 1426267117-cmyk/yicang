@@ -1,0 +1,28 @@
+query ErpProductVariantArchive($id: ID!) {
+  productVariant(id: $id) {
+    id
+    sku
+    title
+    selectedOptions { name value }
+    media(first: 6) {
+      nodes { ...ErpProductArchiveImage }
+    }
+    product {
+      id
+      title
+      description
+      status
+      media(first: 6) {
+        nodes { ...ErpProductArchiveImage }
+      }
+    }
+  }
+}
+
+fragment ErpProductArchiveImage on Media {
+  __typename
+  ... on MediaImage {
+    status
+    image { url }
+  }
+}

@@ -1,4 +1,5 @@
 import { HttpError, jsonError, requestContext } from '../../../../../../lib/db';
+import { toWarehousePurchaseOrder } from '../../../../../../lib/purchase-order-service';
 import {
   createPurchaseReceiptCorrection,
   createPurchaseReceiptCorrectionSchema,
@@ -39,7 +40,9 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       parsed.data,
       request.headers.get('Idempotency-Key') ?? '',
     );
-    return Response.json({ ok: true, ...result }, {
+    const purchaseOrder = user.permissions.includes('purchase:read') || !result.purchaseOrder
+      ? result.purchaseOrder : toWarehousePurchaseOrder(result.purchaseOrder);
+    return Response.json({ ok: true, ...result, purchaseOrder }, {
       status: result.replayed ? 200 : 201,
       headers: { 'Cache-Control': 'no-store' },
     });

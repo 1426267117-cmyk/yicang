@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile Yicang Shopify orders
+
+[Timer]
+OnCalendar=*-*-* *:03,18,33,48:00
+AccuracySec=15s
+Persistent=true
+Unit=yicang-shopify-order-job@reconcile.service
+
+[Install]
+WantedBy=timers.target

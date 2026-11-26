@@ -142,6 +142,7 @@ async function dispatchJsonRpc(
   try {
     const callerEmail = requireAuthenticatedEmail(request.headers);
     if (call.name === GET_FRESHNESS_TOOL) {
+      requireAutomationCaller(callerEmail, runtimeEnv);
       const result = await getProcurementFreshness(runtimeEnv, dependencies);
       return toolResult(result);
     }
@@ -544,7 +545,7 @@ function requireAutomationCaller(email: string, runtimeEnv: RuntimeEnv) {
   if (allowed.size === 0) {
     throw new SiteMcpToolError(
       'AUTOMATION_ALLOWLIST_NOT_CONFIGURED',
-      '尚未配置采购自动化允许邮箱，刷新任务已拒绝执行',
+      '尚未配置采购自动化允许邮箱，任务已拒绝执行',
     );
   }
   if (!allowed.has(email)) {

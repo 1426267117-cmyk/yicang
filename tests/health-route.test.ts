@@ -12,10 +12,9 @@ describe('ERP 健康检查', () => {
       new Request('https://erp.example/api/health'),
       (async () => ({
         db: {
-          prepare: () => ({
-            first: async () => ({ count: 7 }),
-          }),
+          prepare: () => ({ bind: () => ({ first: async () => ({ count: 7 }) }) }),
         } as unknown as D1Database,
+        user: { permissions: ['orders:read'], tenantId: 'guangzhou' },
       })) as unknown as typeof requestContext,
     );
     const body = await response.json() as Record<string, unknown>;
@@ -28,6 +27,17 @@ describe('ERP 健康检查', () => {
       schemaReadiness: DATABASE_SCHEMA_READINESS,
       orders: 7,
     });
+  });
+
+  it('渠道岗位健康检查只呈现就绪状态', async () => {
+    const prepare = vi.fn();
+    const response = await handleHealthRequest(
+      new Request('https://erp.example/api/health'),
+      (async () => ({ db: { prepare }, user: { permissions: ['channels:read'], channelScope: 'amazon' } })) as unknown as typeof requestContext,
+    );
+    expect(response.status).toBe(200);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(await response.json()).toEqual({ ok: true, database: 'ready', schemaReadiness: DATABASE_SCHEMA_READINESS });
   });
 
   it('漏迁移时返回安全的 not-ready 响应，不泄露 SQL 细节', async () => {

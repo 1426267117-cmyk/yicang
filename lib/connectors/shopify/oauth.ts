@@ -1,11 +1,7 @@
 import { cfWorkerAdapterInitialized } from '@shopify/shopify-api/adapters/cf-worker';
 import { ApiVersion, LogSeverity, shopifyApi } from '@shopify/shopify-api';
-import type { ShopifyCredentialConfig } from './config';
+import { shopifyRequestedReadScopes, type ShopifyCredentialConfig } from './config';
 import { ShopifyConnectorError } from './errors';
-
-export const SHOPIFY_ORDER_READ_SCOPES = ['read_orders'] as const;
-
-export const SHOPIFY_REQUIRED_ORDER_READ_SCOPES = SHOPIFY_ORDER_READ_SCOPES;
 
 export function createShopifyOAuthApi(config: ShopifyCredentialConfig, requestUrl: string) {
   if (!cfWorkerAdapterInitialized) {
@@ -22,7 +18,7 @@ export function createShopifyOAuthApi(config: ShopifyCredentialConfig, requestUr
     apiKey: config.clientId,
     apiSecretKey: config.clientSecret,
     apiVersion: ApiVersion.July26,
-    scopes: [...SHOPIFY_ORDER_READ_SCOPES],
+    scopes: shopifyRequestedReadScopes(config),
     hostName: url.host,
     hostScheme: url.protocol === 'http:' ? 'http' : 'https',
     isEmbeddedApp: false,

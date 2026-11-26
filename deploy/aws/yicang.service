@@ -1,0 +1,19 @@
+[Unit]
+Description=Yicang ERP container
+Requires=docker.service
+Wants=network-online.target
+After=docker.service network-online.target
+RequiresMountsFor=/srv/yicang-data
+
+[Service]
+EnvironmentFile=/etc/yicang/container.env
+ExecStartPre=/usr/bin/mountpoint -q /srv/yicang-data
+ExecStartPre=-/usr/bin/docker rm yicang
+ExecStart=/usr/bin/docker run --rm --name yicang --env-file /etc/yicang/erp.env --mount type=bind,src=/srv/yicang-data,dst=/data --publish 3000:3000 ${IMAGE}
+ExecStop=/usr/bin/docker stop --time 30 yicang
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

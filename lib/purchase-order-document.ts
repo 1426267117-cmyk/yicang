@@ -1,7 +1,13 @@
 import { HttpError, requirePermission, type UserContext } from './db';
 import { getPurchaseOrder } from './purchase-order-service';
+import { safePurchaseProductImageUrl } from './purchase-product-details';
 
 type PurchaseOrder = Awaited<ReturnType<typeof getPurchaseOrder>>;
+
+const reviewOnlyDocuments: Partial<Record<PurchaseOrder['status'], { title: string; notice: string }>> = {
+  draft: { title: '采购单草稿', notice: '待确认下单，仅供核对。' },
+  cancelled: { title: '已取消采购单', notice: '采购单已取消，仅供历史查阅。' },
+};
 
 export type PurchaseOrderDocument = Omit<PurchaseOrder, 'lines'> & {
   costComplete: boolean;
@@ -62,6 +68,7 @@ export function buildPurchaseOrderDocument(order: PurchaseOrder): PurchaseOrderD
 
 export function renderPurchaseOrderHtml(order: PurchaseOrderDocument) {
   const status = statusLabel(order.status);
+  const reviewOnly = reviewOnlyDocuments[order.status];
   const total = order.totalAmountMinor === null
     ? '待补齐全部单价后计算'
     : formatMinor(order.totalAmountMinor, order.currency);
@@ -69,7 +76,7 @@ export function renderPurchaseOrderHtml(order: PurchaseOrderDocument) {
         <tr>
           <td>${index + 1}</td>
           <td><strong>${escapeHtml(line.skuCode)}</strong></td>
-          <td>${escapeHtml(line.skuName)}</td>
+          <td>${renderProductDetails(line)}</td>
           <td class="number">${line.orderedQuantity}</td>
           <td class="number">${line.receivedQuantity}</td>
           <td class="number">${line.unitCostMinor === null ? '待补齐' : escapeHtml(formatMinor(line.unitCostMinor, line.currency ?? order.currency))}</td>
@@ -80,11 +87,13 @@ export function renderPurchaseOrderHtml(order: PurchaseOrderDocument) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>${escapeHtml(order.orderNo)} · 采购单</title>
+  <title>${escapeHtml(order.orderNo)} · ${reviewOnly?.title ?? '采购单'}</title>
   <style>
     :root{color-scheme:light;font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif;color:#17231f;background:#f4f7f5}
     *{box-sizing:border-box}body{margin:0;padding:28px}.sheet{max-width:1080px;margin:auto;padding:42px;background:#fff;border:1px solid #dfe8e3;border-radius:14px;box-shadow:0 12px 36px rgba(24,55,44,.08)}
     header{display:flex;justify-content:space-between;gap:24px;border-bottom:2px solid #176d53;padding-bottom:22px}h1{margin:4px 0 0;font-size:28px}header p{margin:0;color:#65746e}.badge{align-self:flex-start;padding:7px 12px;border-radius:999px;background:#e8f5ef;color:#176d53;font-weight:700}
+    .review-only{margin:18px 0 0;padding:11px 14px;border:1px solid #d8b573;border-left-width:4px;border-radius:6px;color:#5d3c0a;font-weight:700}
+    .product-main{display:flex;align-items:flex-start;gap:10px;overflow-wrap:anywhere}.product-main img{width:64px;height:64px;object-fit:contain;border-radius:4px}.product-detail{display:block;margin-top:5px;color:#465852;white-space:pre-wrap}
     .meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 26px;margin:24px 0}.meta div{border-bottom:1px solid #e7edea;padding:8px 0}.meta span{display:block;color:#75827d;font-size:12px}.meta strong{display:block;margin-top:4px;overflow-wrap:anywhere}
     table{width:100%;border-collapse:collapse;margin-top:18px;font-size:13px}th,td{border:1px solid #dce5e1;padding:10px;vertical-align:top}th{background:#edf6f2;text-align:left}.number{text-align:right;white-space:nowrap}.total{display:flex;justify-content:flex-end;gap:24px;margin-top:18px;font-size:18px}.total strong{min-width:190px;text-align:right}.note{margin-top:24px;padding:14px 16px;background:#f6f8f7;border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere}.foot{margin-top:28px;color:#74817b;font-size:11px}.actions{max-width:1080px;margin:0 auto 14px;text-align:right}.actions button{border:0;border-radius:8px;background:#176d53;color:#fff;padding:10px 18px;font-weight:700;cursor:pointer}
     @media(max-width:720px){body{padding:10px}.sheet{padding:20px}.meta{grid-template-columns:1fr}header{display:block}.badge{display:inline-block;margin-top:12px}.table-wrap{overflow:auto}}
@@ -94,13 +103,14 @@ export function renderPurchaseOrderHtml(order: PurchaseOrderDocument) {
 <body>
   <div class="actions"><button type="button" onclick="window.print()">打印 / 保存 PDF</button></div>
   <main class="sheet">
-    <header><div><p>易仓 ERP · 正式采购单</p><h1>${escapeHtml(order.orderNo)}</h1></div><span class="badge">${escapeHtml(status)}</span></header>
+    <header><div><p>易仓 ERP · ${reviewOnly?.title ?? '正式采购单'}</p><h1>${escapeHtml(order.orderNo)}</h1></div><span class="badge">${escapeHtml(status)}</span></header>
+    ${reviewOnly ? `<p class="review-only">${reviewOnly.notice}</p>` : ''}
     <section class="meta">
-      <div><span>供应商</span><strong>${escapeHtml(order.supplier.name)}（${escapeHtml(order.supplier.code)}）</strong></div>
-      <div><span>供应商联系人</span><strong>${escapeHtml(displayValue(order.supplier.contactName))}</strong></div>
-      <div><span>供应商电话</span><strong>${escapeHtml(displayValue(order.supplier.contactPhone))}</strong></div>
-      <div><span>供应商邮箱</span><strong>${escapeHtml(displayValue(order.supplier.contactEmail))}</strong></div>
-      <div><span>供应商地址</span><strong>${escapeHtml(displayValue(order.supplier.address))}</strong></div>
+      <div><span>供应商</span><strong>${escapeHtml(order.supplier ? `${order.supplier.name}（${order.supplier.code}）` : '未填写')}</strong></div>
+      <div><span>供应商联系人</span><strong>${escapeHtml(displayValue(order.supplier?.contactName))}</strong></div>
+      <div><span>供应商电话</span><strong>${escapeHtml(displayValue(order.supplier?.contactPhone))}</strong></div>
+      <div><span>供应商邮箱</span><strong>${escapeHtml(displayValue(order.supplier?.contactEmail))}</strong></div>
+      <div><span>供应商地址</span><strong>${escapeHtml(displayValue(order.supplier?.address))}</strong></div>
       <div><span>收货仓库</span><strong>${escapeHtml(order.deliveryWarehouse
         ? `${displayValue(order.deliveryWarehouse.name)}（${displayValue(order.deliveryWarehouse.code)}）`
         : '未填写')}</strong></div>
@@ -122,22 +132,28 @@ export function renderPurchaseOrderHtml(order: PurchaseOrderDocument) {
     </table></div>
     <div class="total"><span>采购单总额</span><strong>${escapeHtml(total)}</strong></div>
     <section class="note"><strong>采购备注</strong>\n${escapeHtml(order.note ?? '无')}</section>
-    <p class="foot">本单由 ERP 当前有效采购记录生成。金额缺失时保持“待补齐”，不会按 0 处理；采购单历史与状态均以 ERP 数据库为准。</p>
+    <p class="foot">采购单历史与状态以 ERP 数据库为准。金额缺失时显示“待补齐”。</p>
   </main>
 </body>
 </html>`;
 }
 
 export function renderPurchaseOrderCsv(order: PurchaseOrderDocument) {
+  const reviewOnly = reviewOnlyDocuments[order.status];
+  const hasProductDetails = order.lines.some(({ productDetails }) => Boolean(
+    productDetails?.specification || productDetails?.dimensions || safePurchaseProductImageUrl(productDetails?.imageUrl),
+  ));
+  const hasDescription = order.lines.some(({ productDetails }) => Boolean(productDetails?.description));
   const rows: Array<Array<string | number>> = [
     ['采购单号', spreadsheetText(order.orderNo)],
     ['状态', statusLabel(order.status)],
-    ['供应商编码', spreadsheetText(order.supplier.code)],
-    ['供应商名称', spreadsheetText(order.supplier.name)],
-    ['供应商联系人', spreadsheetText(displayValue(order.supplier.contactName))],
-    ['供应商电话', spreadsheetText(displayValue(order.supplier.contactPhone))],
-    ['供应商邮箱', spreadsheetText(displayValue(order.supplier.contactEmail))],
-    ['供应商地址', spreadsheetText(displayValue(order.supplier.address))],
+    ...(reviewOnly ? [['单据用途', reviewOnly.notice]] : []),
+    ['供应商编码', spreadsheetText(displayValue(order.supplier?.code))],
+    ['供应商名称', spreadsheetText(displayValue(order.supplier?.name))],
+    ['供应商联系人', spreadsheetText(displayValue(order.supplier?.contactName))],
+    ['供应商电话', spreadsheetText(displayValue(order.supplier?.contactPhone))],
+    ['供应商邮箱', spreadsheetText(displayValue(order.supplier?.contactEmail))],
+    ['供应商地址', spreadsheetText(displayValue(order.supplier?.address))],
     ['收货仓库编码', spreadsheetText(displayValue(order.deliveryWarehouse?.code))],
     ['收货仓库名称', spreadsheetText(displayValue(order.deliveryWarehouse?.name))],
     ['收货联系人', spreadsheetText(displayValue(order.deliveryWarehouse?.contactName))],
@@ -152,22 +168,44 @@ export function renderPurchaseOrderCsv(order: PurchaseOrderDocument) {
     ['确认下单时间（UTC）', formatTimestamp(order.issuedAt)],
     ['采购备注', spreadsheetText(order.note ?? '')],
     [],
-    ['序号', 'SKU', '商品名称', '采购数量', '已到数量', '未到数量', '单价（最小货币单位）', '行金额（最小货币单位）', '币种'],
+    ['序号', 'SKU', '商品名称', '采购数量', '已到数量', '未到数量', '单价（最小货币单位）', '行金额（最小货币单位）', '币种',
+      ...(hasProductDetails ? ['规格', '尺寸', '图片链接'] : []), ...(hasDescription ? ['商品介绍'] : [])],
     ...order.lines.map((line, index) => [
       index + 1,
       spreadsheetText(line.skuCode),
-      spreadsheetText(line.skuName),
+      spreadsheetText(line.productDetails?.name || line.skuName),
       line.orderedQuantity,
       line.receivedQuantity,
       line.remainingQuantity,
       line.unitCostMinor ?? '',
       line.lineAmountMinor ?? '',
       spreadsheetText(line.currency ?? order.currency ?? ''),
+      ...(hasProductDetails ? [
+        line.productDetails?.specification ?? '',
+        line.productDetails?.dimensions ?? '',
+        safePurchaseProductImageUrl(line.productDetails?.imageUrl) ?? '',
+      ] : []),
+      ...(hasDescription ? [line.productDetails?.description ?? ''] : []),
     ]),
     [],
     ['合计', '', '', order.orderedQuantity, order.receivedQuantity, Math.max(0, order.orderedQuantity - order.receivedQuantity), '', order.totalAmountMinor ?? '', spreadsheetText(order.currency ?? '')],
   ];
   return rows.map((row) => row.map(csvCell).join(',')).join('\r\n');
+}
+
+function renderProductDetails(line: PurchaseOrderDocument['lines'][number]) {
+  const details = line.productDetails;
+  const name = escapeHtml(details?.name || line.skuName);
+  const image = safePurchaseProductImageUrl(details?.imageUrl);
+  const specification = details?.specification
+    ? `<span class="product-detail">规格：${escapeHtml(details.specification)}</span>` : '';
+  const dimensions = details?.dimensions
+    ? `<span class="product-detail">尺寸：${escapeHtml(details.dimensions)}</span>` : '';
+  const description = details?.description
+    ? `<span class="product-detail">介绍：${escapeHtml(details.description)}</span>` : '';
+  if (!image && !specification && !dimensions && !description) return name;
+  return `<div class="product-main">${image ? `<img src="${escapeHtml(image)}" alt="${name}" width="64" height="64" referrerpolicy="no-referrer">` : ''}
+    <div>${name}${specification}${dimensions}${description}</div></div>`;
 }
 
 export function purchaseOrderDocumentFileName(orderNo: string, extension: 'html' | 'csv') {

@@ -9,7 +9,7 @@ import { receiveShopifyOrderWebhook } from '../lib/connectors/shopify/webhook';
 import { shopifyOrderFixture } from './fixtures/shopify-order';
 
 const tenantId = 'tenant_webhook_consumer_test';
-const shopDomain = 'z6w01w-xs.myshopify.com';
+const shopDomain = 'fixture-bizfurniz-canonical.myshopify.com';
 const clientSecret = 'test_webhook_consumer_secret';
 const config: ShopifyCredentialConfig = {
   key: 'bizfurniz', displayName: 'BizFurniz', domain: shopDomain, expectedDomain: shopDomain,
@@ -118,7 +118,7 @@ describe('Shopify webhook pending 消费者', () => {
   async function enqueue(webhookId: string) {
     const rawBody = new TextEncoder().encode(JSON.stringify({ id: 1001, admin_graphql_api_id: 'gid://shopify/Order/1001' }));
     await receiveShopifyOrderWebhook({
-      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret }, storeKey: 'bizfurniz',
+      db, runtimeEnv: { SHOPIFY_BIZFURNIZ_SHOP_DOMAIN: shopDomain, SHOPIFY_BIZFURNIZ_CLIENT_SECRET: clientSecret }, storeKey: 'bizfurniz',
       headers: new Headers({
         'X-Shopify-Hmac-Sha256': await sign(rawBody, clientSecret),
         'X-Shopify-Webhook-Id': webhookId,

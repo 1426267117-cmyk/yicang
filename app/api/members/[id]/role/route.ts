@@ -2,13 +2,15 @@ import { env } from 'cloudflare:workers';
 import { z } from 'zod';
 import { readProductionAccessPolicy } from '../../../../../lib/access-policy';
 import { HttpError, jsonError, requestContext } from '../../../../../lib/db';
+import { ACCESS_PROFILES } from '../../../../../lib/domain';
 import { updateManagedMemberRole } from '../../../../../lib/member-management-service';
 
 export const dynamic = 'force-dynamic';
 
-export const updateMemberRoleSchema = z.object({
-  role: z.enum(['admin', 'operator', 'viewer']),
-});
+export const updateMemberRoleSchema = z.union([
+  z.strictObject({ role: z.enum(['admin', 'operator', 'viewer']) }),
+  z.strictObject({ accessProfile: z.enum(ACCESS_PROFILES) }),
+]);
 
 export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
@@ -25,7 +27,7 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     const policy = readProductionAccessPolicy(env as unknown as Record<string, unknown>);
     const result = await updateManagedMemberRole(db, user, {
       memberId: id,
-      role: parsed.data.role,
+      ...parsed.data,
       bootstrapOwnerEmail: policy.bootstrapOwnerEmail,
     });
     return Response.json({ ok: true, ...result }, {

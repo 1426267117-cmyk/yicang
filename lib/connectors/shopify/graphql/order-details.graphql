@@ -29,6 +29,8 @@ query ErpOrderDetails($id: ID!, $lineItemsFirst: Int!) {
         quantity
         currentQuantity
         unfulfilledQuantity
+        requiresShipping
+        nonFulfillableQuantity
         originalUnitPriceSet { shopMoney { amount currencyCode } }
         originalTotalSet { shopMoney { amount currencyCode } }
         discountedTotalSet { shopMoney { amount currencyCode } }

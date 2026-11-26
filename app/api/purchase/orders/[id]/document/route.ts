@@ -44,7 +44,7 @@ function documentHeaders(contentType: string, fileName: string, attachment: bool
   return {
     'Cache-Control': 'private, no-store',
     'Content-Disposition': disposition,
-    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'self'; form-action 'none'",
+    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' https: http:; base-uri 'none'; frame-ancestors 'self'; form-action 'none'",
     'Content-Type': contentType,
     'Referrer-Policy': 'no-referrer',
     'X-Content-Type-Options': 'nosniff',

@@ -1,0 +1,25 @@
+[Unit]
+Description=Yicang ERP
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=yicang
+Group=yicang
+WorkingDirectory=/opt/yicang/current
+EnvironmentFile=/etc/yicang/erp.env
+EnvironmentFile=-/etc/yicang/feishu-sync.env
+EnvironmentFile=-/etc/yicang/shopify-jobs.env
+ExecStart=/usr/bin/env NODE_ENV=production HOST=127.0.0.1 PORT=3000 ERP_SQLITE_PATH=/var/lib/yicang/erp.sqlite /opt/yicang-node/bin/node server.js
+StateDirectory=yicang
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

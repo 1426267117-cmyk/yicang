@@ -3,7 +3,7 @@
 ERP 通过店铺级 HTTPS 回调接收 Shopify 订单变化：
 
 ```text
-https://yicang-erp.champztj.chatgpt.site/api/connectors/shopify/webhooks/{storeKey}
+https://erp.example.com/api/connectors/shopify/webhooks/{storeKey}
 ```
 
 BizFurniz 的 `storeKey` 为 `bizfurniz`。回调会使用该店铺应用的 Client Secret 对原始请求体做 HMAC-SHA256 验签，并校验 Shopify 店铺域名和 ERP 已保存的授权归属。
@@ -40,7 +40,7 @@ mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $subscription: Webhook
 {
   "topic": "ORDERS_CREATE",
   "subscription": {
-    "uri": "https://yicang-erp.champztj.chatgpt.site/api/connectors/shopify/webhooks/bizfurniz",
+    "uri": "https://erp.example.com/api/connectors/shopify/webhooks/bizfurniz",
     "format": "JSON",
     "includeFields": ["id", "admin_graphql_api_id"]
   }
@@ -86,8 +86,44 @@ Content-Type: application/json
 }
 ```
 
-首次同步没有完成水位时，任务会为该店返回 `SHOPIFY_INITIAL_RANGE_REQUIRED`，应先通过人工同步明确历史起始时间完成回补。已有水位后，每次定时任务按更新时间增量读取并自动重扫重叠窗口；重复运行由现有主键和内容哈希保证不重复制造订单。访问令牌临近或已经过期时，入口会复用加密刷新凭证和刷新租约自动轮换，响应、日志和文档均不得包含访问令牌或刷新令牌。
+首次同步缺少水位和断点时，默认返回 `SHOPIFY_INITIAL_RANGE_REQUIRED`，可在店铺接入页选择首次同步。需要后台完成首次回补时，可单独开启 `SHOPIFY_ZIMASYA_INITIAL_BACKFILL_ENABLED`、`SHOPIFY_KAGUYASU_INITIAL_BACKFILL_ENABLED`、`SHOPIFY_ANZ_INITIAL_BACKFILL_ENABLED` 或 `SHOPIFY_BIZFURNIZ_INITIAL_BACKFILL_ENABLED`。开启后，定时任务会核对易仓保存的店铺 OAuth 身份和 Shopify 当前的 `read_orders` 权限，按订单更新时间读取任务启动前七天（UTC）。达到页数上限或中途失败时，下次从已保存的窗口和断点继续。已有断点或水位的店铺继续按原进度运行。
+
+首次同步完成后，后续任务按更新时间增量读取并重扫六小时重叠窗口。重复运行由现有主键和内容哈希合并。访问令牌临近或已经过期时，入口通过既有加密刷新凭证和刷新租约轮换令牌。
 
 任务逐店隔离：一家店失败不会抹掉其他店的成功结果。全成功返回 HTTP 200；存在失败或明确请求了尚未授权的店铺时返回 HTTP 207。如果当前范围没有任何 D1 OAuth 或服务端 Token 目标，则返回 HTTP 422，并明确给出 `noConfiguredStores: true` 和 `skipReason: "SHOPIFY_NO_CONFIGURED_STORES"`，不会把空跑伪装成同步成功。响应只包含 `storeKey`、分页数、订单新增/更新/未变化计数、完成时间以及安全错误码和可重试标记，不包含租户 ID、店铺域名、客户资料或凭证。
 
 `ERP_SHOPIFY_RECONCILE_SCHEDULE_CONFIGURED=true` 只用于声明外部调度器已经实际配置并验证。端点代码存在并不代表平台已经自动调用；未配置时保持 `false`。调度器使用的 `ERP_INTERNAL_JOB_TOKEN` 必须作为服务端 Secret 管理，不能写入前端、仓库、命令历史或聊天。
+
+## Lightsail 后台任务
+
+发布目录会包含 Shopify 定时任务和 systemd 单元。Webhook 重试任务每分钟运行，增量对账每 15 分钟运行，两项任务通过本机回环调用现有接口。每家店完成授权及首次回补后，以该店最近同步时间和订单到账记录验收。
+
+配置单店 Shopify 应用时，在服务器交互终端运行 `sudo bash /opt/yicang/current/deploy/lightsail/enroll-shopify-app.sh <storeKey>`。如果服务端没有该店的 `SHOPIFY_*_SHOP_DOMAIN`，脚本会请求输入其官方 `myshopify.com` 域名，填写裸域名即可。已配置的有效域名会保留。确认是同一家店的其他官方域名可在私有环境文件中配置为 `SHOPIFY_*_ACCEPTED_DOMAINS`，多个域名用逗号分隔。
+
+脚本读取该店应用的 Client ID 和 Client Secret，隐藏域名和密钥输入，保留既有加密和任务密钥，并启用商品、库存及首次回补。商户在 Shopify 确认授权后，ERP 才能读取业务数据。既有站点升级时保留各店的有效凭证和回调。
+
+`/etc/yicang/shopify-jobs.env` 仅 root 可读，主应用和定时任务共用其中的 `ERP_INTERNAL_JOB_TOKEN`。启用定时前先核对店铺的 Shopify 官方身份。
+
+```bash
+sudo install -m 0644 /opt/yicang/current/deploy/lightsail/yicang-shopify-order-job@.service /etc/systemd/system/
+sudo install -m 0644 /opt/yicang/current/deploy/lightsail/yicang-shopify-{webhook,reconcile}.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart yicang
+sudo systemctl start yicang-shopify-order-job@webhook.service yicang-shopify-order-job@reconcile.service
+sudo systemctl enable --now yicang-shopify-webhook.timer yicang-shopify-reconcile.timer
+systemctl list-timers 'yicang-shopify-*.timer'
+sudo journalctl -u yicang-shopify-order-job@reconcile.service -n 10 --no-pager
+```
+
+后台日志只有数量及固定的结果码。`SHOPIFY_NO_CONFIGURED_STORES` 表示还没有可用授权。`initialImportRequired` 表示有店铺需要先完成历史范围回补。定时任务和至少一家授权店完成首轮实际验证后，再将 `ERP_SHOPIFY_RECONCILE_SCHEDULE_CONFIGURED=true` 加到服务器配置并重新加载主应用。
+
+该店订单和库存授权核验后，可以启用单店库存采集。
+
+```bash
+sudo install -m 0644 /opt/yicang/current/deploy/lightsail/yicang-shopify-inventory-mirror@.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start yicang-shopify-inventory-mirror@kaguyasu.service
+sudo systemctl enable --now yicang-shopify-inventory-mirror@kaguyasu.timer
+```
+
+库存任务按批刷新最近 30 天已落库订单涉及的 SKU。店铺接入页可查看已保存库存、采集时间和资料是否过期。Shopify 地点库存只用于查询和核对，ERP 的仓库库存流水仍按收货、发货和盘点记账。

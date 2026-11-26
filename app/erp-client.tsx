@@ -1,52 +1,63 @@
 'use client';
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, lazy, Suspense, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  MEMBER_ROLE_OPTIONS,
   managedMemberErrorMessage,
   memberRoleChangeBlock,
+  memberRoleLabel,
+  memberRoleOptions,
+  memberSelection,
   parseManagedMembersResponse,
   purchaseAssigneeCandidates,
-  type ManagedMemberRole,
+  type ManagedMemberSelection,
   type ManagedMemberView,
 } from '../lib/member-role-ui';
+import { canManageWarehouseFulfillment, canReadInventoryMovements, canReadWarehouseFulfillment, isAccessProfile, type Permission } from '../lib/domain';
 import {
   activePurchaseRequestIds,
   assignmentActionAllowed,
-  DIRECT_PURCHASE_REQUEST_DISABLED_MESSAGE,
   normalizedReceiptQuantities,
   purchaseOrderCompletion,
   receiptCorrectionAvailability,
   validateReceiptCorrectionDraft,
 } from '../lib/procurement-ui';
 import { purchaseAssignmentBlock } from '../lib/purchase-assignment-ui';
+import OpeningData from './erp-opening-data';
+import { ChannelOrderWorkspace, ChannelOrders, OperationsHome, StoreConnections, type StoreConnection } from './erp-operations';
+import ErpShopifyInventoryLookup from './erp-shopify-inventory-lookup';
+import ErpWarehouse from './erp-warehouse';
+import ErpNineStoreOrders, { type NineStoreWorkflow } from './erp-nine-store-orders';
+import type { AccessProfile, ChannelScope } from '../lib/domain';
+import ErpSupplierQuotes, { PurchaseQuoteApply } from './erp-supplier-quotes';
+import ErpPurchaseQuality, { usePurchaseQuality } from './erp-purchase-quality';
+import type { PurchaseProductDetails } from '../lib/purchase-product-details';
+import type { getWarehouseWorkspaceData, toWarehousePurchaseOrder } from '../lib/purchase-order-service';
+import { PurchaseProductFields, PurchaseProductImageLink, readPurchaseProductDetails } from './erp-purchase-product-fields';
+import ErpSkuImport from './erp-sku-import';
+import ErpSkuCatalog from './erp-sku-catalog';
+import ErpPurchasePaymentOverview, { formatPurchaseMinor } from './erp-purchase-payment-overview';
 
-type ModuleKey = 'dashboard' | 'platform' | 'orders' | 'inventory' | 'purchase' | 'warehouse' | 'logistics' | 'finance' | 'reports';
+const ErpLogistics = lazy(() => import('./erp-logistics'));
+const ErpFinance = lazy(() => import('./erp-finance'));
+const ErpPurchasePaymentRequests = lazy(() => import('./erp-purchase-payment-requests'));
+const ErpReports = lazy(() => import('./erp-reports'));
+
+type ModuleKey = 'dashboard' | 'platform' | 'orders' | 'inventory' | 'purchase' | 'warehouse' | 'logistics' | 'finance' | 'reports' | 'connections' | 'sources' | 'team';
 type OrderStatus = 'pending_review' | 'reserved' | 'shipped' | 'cancelled';
 type OrderAction = 'approve' | 'ship' | 'cancel';
-type Permission = 'orders:read' | 'orders:create' | 'orders:approve' | 'orders:ship' | 'orders:cancel' | 'audit:read' | 'connectors:read' | 'connectors:sync' | 'purchase:read' | 'purchase:mapping' | 'purchase:create' | 'purchase:submit' | 'purchase:review' | 'purchase:supplier:create' | 'purchase:order:create' | 'purchase:order:issue' | 'inventory:receive' | 'warehouse:manage' | 'members:manage';
 
 type ErpOrder = {
   id: string; orderNo: string; channel: string; destination: string; customerName: string;
   currency: string; amountMinor: number; status: OrderStatus; skuId: string; skuCode: string;
   skuName: string; warehouseId: string; warehouseName: string; quantity: number;
   version: number; createdAt: string; updatedAt: string;
+  sourceOrder?: { storeKey: string; orderNo: string; observedAt: string } | null;
 };
 
 type Inventory = {
   id: string; skuId: string; skuCode: string; skuName: string; warehouseId: string;
   warehouseName: string; onHandQty: number; reservedQty: number; availableQty: number;
   version: number; updatedAt: string;
-};
-
-type PlatformOrder = {
-  id: string; platform: string; storeKey: string; storeName: string; sourceOrderId: string;
-  sourceOrderName: string | null; sourceCreatedAt: string; sourceUpdatedAt: string;
-  sourceCancelledAt: string | null; test: boolean | null; financialStatus: string | null;
-  fulfillmentStatus: string | null; currency: string | null; currentTotalAmount: string | null;
-  currentTotalMinor: number | null; refundedAmount: string | null; refundedMinor: number | null;
-  businessOwnership: string | null; apiVersion: string; lineCount: number; refundCount: number;
-  fulfillmentCount: number;
 };
 
 type PurchaseDemandStatus = 'needs_mapping' | 'open' | 'not_required';
@@ -63,15 +74,17 @@ type PurchaseDemand = {
 };
 
 type PurchaseMember = { id: string; displayName: string; role: 'admin' | 'operator' | 'viewer' };
-type PurchaseSkuOption = { id: string; code: string; name: string };
+type PurchaseSkuOption = { id: string; code: string; name: string; productDetails?: PurchaseProductDetails; revision?: string };
 type PurchaseRequestStatus = 'draft' | 'pending_review' | 'approved' | 'rejected' | 'cancelled';
 type PurchaseRequestAction = 'submit' | 'approve' | 'reject' | 'cancel' | 'withdraw';
 type PurchaseRequestLine = {
-  id: string; demandId: string; skuId: string; skuCode?: string | null; skuName?: string | null;
+  id: string; demandId: string | null; skuId: string; skuCode?: string | null; skuName?: string | null;
   rawSku?: string | null; requestedQuantity: number; sourceRequiredQuantity?: number;
+  productDetails?: PurchaseProductDetails;
 };
 type PurchaseRequest = {
   id: string; requestNo: string; status: PurchaseRequestStatus;
+  source?: 'manual' | 'planning' | 'legacy';
   buyer: PurchaseMember | null; reviewer: PurchaseMember | null; creator: PurchaseMember | null;
   purchaser?: PurchaseMember | null;
   purchaserMemberId?: string; purchaserName?: string; reviewerMemberId?: string; reviewerName?: string; creatorName?: string;
@@ -93,24 +106,30 @@ type PurchaseOrderLine = {
   id: string; purchaseRequestLineId: string; skuId: string; skuCode: string; skuName: string;
   orderedQuantity: number; receivedQuantity: number; remainingQuantity: number;
   unitCostMinor: number | null; currency: string | null;
+  productDetails?: PurchaseProductDetails;
 };
 type PurchaseOrder = {
   id: string; orderNo: string; purchaseRequestId: string; purchaseRequestNo: string;
   purchaserMemberId?: string;
-  supplier: Pick<PurchaseSupplier, 'id' | 'code' | 'name' | 'contactName' | 'contactPhone' | 'contactEmail' | 'address'>;
+  supplier: Pick<PurchaseSupplier, 'id' | 'code' | 'name' | 'contactName' | 'contactPhone' | 'contactEmail' | 'address'> | null;
   deliveryWarehouse: PurchaseWarehouse | null; expectedDeliveryAt: string | null;
   paymentTerms: string | null; tradeTerms: string | null; status: PurchaseOrderStatus;
   currency: string | null; note: string | null; actionNote: string | null; version: number; lineCount: number;
   orderedQuantity: number; receivedQuantity: number; issuedAt: string | null; closedAt: string | null; cancelledAt: string | null;
   createdAt: string; updatedAt: string; lines: PurchaseOrderLine[];
 };
+type PurchaseOrderEditor =
+  | { request: PurchaseRequest; order?: never }
+  | { order: PurchaseOrder; request?: never };
+type ReceivableOrder = ReturnType<typeof toWarehousePurchaseOrder>;
+type WarehouseWorkspaceData = Awaited<ReturnType<typeof getWarehouseWorkspaceData>>;
 type PurchaseReceiptLine = {
   id: string; purchaseOrderLineId: string; skuId: string; skuCode: string; skuName: string;
   warehouseId: string; quantity: number;
 };
 type PurchaseReceipt = {
   id: string; receiptNo: string; purchaseOrderId: string; purchaseOrderNo: string;
-  warehouse: PurchaseWarehouse; status: 'posted'; note: string | null; receivedAt: string;
+  warehouse: Pick<PurchaseWarehouse, 'id' | 'code' | 'name'>; status: 'posted'; note: string | null; receivedAt: string;
   createdAt: string; lineCount: number; totalQuantity: number; originalQuantity?: number;
   correctedQuantity?: number; netQuantity?: number; correctionCount?: number; lines: PurchaseReceiptLine[];
 };
@@ -293,18 +312,8 @@ type PurchasePlanningPayload = {
 };
 
 type ShopifyStatus = {
-  ok: true; apiVersion: string; readOnly: true;
-  stores: Array<{
-    key: 'zimasya' | 'kaguyasu' | 'anzhap' | 'bizfurniz'; displayName: string;
-    expectedDomain: string; appConfigured: boolean; encryptionReady: boolean; credentialsConfigured: boolean;
-    authorizationRequired: boolean; authorizationStartUrl: string | null;
-    authorizationVerified: boolean; authorizationUpdatedAt: string | null;
-    accessTokenExpiresAt: string | null; refreshTokenExpiresAt: string | null;
-    identityVerified: boolean;
-    officialStoreId: string | null; verifiedDomain: string | null; identityVerifiedAt: string | null;
-    lastSuccessfulSyncAt: string | null; completedWatermark: string | null;
-    syncStatus: string; lastErrorCode: string | null;
-  }>;
+  ok: true; stores: StoreConnection[];
+  automation?: { scheduledReconciliationConfigured: boolean };
 };
 
 type InventorySourceTab = 'erp' | 'muku' | 'risk';
@@ -415,6 +424,7 @@ const shopifyOAuthFailureMessages: Record<string, string> = {
   SHOPIFY_TOKEN_EXCHANGE_NETWORK_ERROR: 'ERP 暂时未能连接 Shopify 授权服务，请重新授权。',
   SHOPIFY_IDENTITY_MISMATCH: '返回的 Shopify 店铺与 ERP 配置不一致，授权未保存。',
   SHOPIFY_REQUIRED_SCOPE_MISSING: '本次授权缺少订单只读权限，请重新授权并确认全部权限。',
+  SHOPIFY_AUTH_WRITABLE_SCOPE: '此 Shopify 应用包含写入权限。请使用广州 ERP 专用的只读应用。',
   SHOPIFY_AUTH_INVALID_RESPONSE: 'Shopify 授权响应不完整，请重新授权。',
 };
 
@@ -425,43 +435,47 @@ function shopifyOAuthFailureMessage(code: string | null) {
 
 type ErpPayload = {
   ok: true;
-  user: { displayName: string; email: string; role: 'admin' | 'operator' | 'viewer'; permissions: Permission[]; tenantName: string };
+  user: {
+    displayName: string; email: string; role: 'admin' | 'operator' | 'viewer'; permissions: Permission[]; tenantName: string;
+    accessProfile?: AccessProfile | null; channelScope?: ChannelScope | null; authProvider?: 'feishu' | 'existing';
+  };
   orders: ErpOrder[];
-  platformOrders: PlatformOrder[];
   inventory: Inventory[];
   audit: { action: string; entity_id: string; actor_email: string; before_json: string | null; after_json: string | null; created_at: string }[];
   summary: { totalOrders: number; totalPlatformOrders: number; platformPending: number; platformCancelled: number; platformRefunded: number; pendingReview: number; readyToShip: number; shipped: number; lowStock: number; totalAvailable: number };
 };
 
-const nav: { key: ModuleKey; label: string; code: string }[] = [
-  { key: 'dashboard', label: '工作台', code: '01' },
-  { key: 'platform', label: '平台订单', code: '02' },
-  { key: 'orders', label: '运营订单', code: '03' },
-  { key: 'inventory', label: '商品库存', code: '04' },
-  { key: 'purchase', label: '采购管理', code: '05' },
-  { key: 'warehouse', label: '仓库作业', code: '06' },
-  { key: 'logistics', label: '物流管理', code: '07' },
-  { key: 'finance', label: '财务管理', code: '08' },
-  { key: 'reports', label: '数据报表', code: '09' },
+const navigation: { title: string; items: { key: ModuleKey; label: string }[] }[] = [
+  { title: '总览', items: [{ key: 'dashboard', label: '运营工作台' }] },
+  { title: '订单与履约', items: [{ key: 'orders', label: '订单管理' }, { key: 'platform', label: '渠道订单' },
+    { key: 'warehouse', label: '仓库作业' }, { key: 'logistics', label: '物流管理' }] },
+  { title: '供应链', items: [{ key: 'inventory', label: '商品库存' }, { key: 'purchase', label: '采购管理' }] },
+  { title: '财务与分析', items: [{ key: 'finance', label: '财务管理' }, { key: 'reports', label: '数据报表' }] },
+  { title: '系统管理', items: [{ key: 'team', label: '团队权限' }, { key: 'connections', label: '店铺接入' },
+    { key: 'sources', label: '期初导入' }] },
 ];
+
+const channelModuleLabels: Record<ChannelScope, string> = { amazon: '亚马逊订单', wayfair: 'Wayfair 订单', shopify: '独立站订单' };
+
+function hasModuleAccess(module: ModuleKey, user: ErpPayload['user'] | undefined) {
+  if (!user || user.permissions.length === 0) return module === 'dashboard';
+  const can = (permission: Permission) => user.permissions.includes(permission);
+  if (user.channelScope) return module === 'platform' && can('channels:read');
+  switch (module) {
+    case 'dashboard': case 'orders': case 'platform': case 'inventory': case 'reports': return can('orders:read');
+    case 'logistics': return canReadWarehouseFulfillment(user.permissions, user.channelScope);
+    case 'purchase': return can('purchase:read');
+    case 'warehouse': return can('warehouse:read') || can('inventory:receive') || can('orders:read');
+    case 'finance': return can('finance:read') || can('purchase:order:create');
+    case 'connections': return can('connectors:read');
+    case 'sources': case 'team': return can('members:manage');
+  }
+}
 
 const statusLabel: Record<OrderStatus, string> = {
   pending_review: '待审核', reserved: '待发货', shipped: '已发货', cancelled: '已取消',
 };
 
-const actionLabel: Record<string, string> = {
-  CREATE_ORDER: '创建订单', APPROVE_ORDER: '审核并预占', SHIP_ORDER: '确认发货', CANCEL_ORDER: '取消订单',
-  MAP_PURCHASE_SKU: '映射采购 SKU', CREATE_PURCHASE_REQUEST: '创建采购申请',
-  SUBMIT_PURCHASE_REQUEST: '提交采购复审', APPROVE_PURCHASE_REQUEST: '批准采购申请',
-  REJECT_PURCHASE_REQUEST: '驳回采购申请', CANCEL_PURCHASE_REQUEST: '取消采购申请',
-  WITHDRAW_PURCHASE_REQUEST: '撤回已批准采购申请',
-  CREATE_SUPPLIER: '新增供应商', CREATE_WAREHOUSE: '新增仓库', CREATE_PURCHASE_ORDER: '生成正式采购单',
-  ISSUE_PURCHASE_ORDER: '确认采购下单', CANCEL_PURCHASE_ORDER: '取消采购单',
-  POST_PURCHASE_RECEIPT: '采购到货入库',
-  UPDATE_MEMBER_ROLE: '调整团队角色',
-  UPSERT_MUKU_SKU_MAPPING: '维护 MUKU SKU 映射', UPSERT_SKU_PROCUREMENT_POLICY: '维护采购策略',
-  CREATE_PURCHASE_REQUEST_FROM_PLAN: '采购建议转申请',
-};
 
 const purchaseDemandStatusLabel: Record<PurchaseDemandStatus, string> = {
   needs_mapping: '待 SKU 映射', open: '开放需求', not_required: '无需采购',
@@ -484,17 +498,9 @@ const purchaseOrderStatusLabel: Record<PurchaseOrderStatus, string> = {
   closed_short: '短到关闭', cancelled: '已取消',
 };
 
-type PurchaseTab = 'planning' | 'pending' | 'mapping' | 'requests' | 'approved' | 'orders' | 'received' | 'history';
-
-const plannedModules: Record<Exclude<ModuleKey, 'dashboard' | 'platform' | 'orders' | 'inventory'>, {
-  title: string; desc: string; source: string;
-}> = {
-  purchase: { title: '采购管理', desc: '采购计划、供应商下单与到货入库', source: '采购单或供应商数据' },
-  warehouse: { title: '仓库作业', desc: '入库、拣货、复核、装箱与盘点', source: '仓库或 WMS 数据' },
-  logistics: { title: '物流管理', desc: '面单、承运商、物流轨迹与异常处理', source: '承运商或物流服务商数据' },
-  finance: { title: '财务管理', desc: '平台结算、多币种、费用与对账', source: '平台账单或财务数据' },
-  reports: { title: '数据报表', desc: '基于可信业务明细生成统一口径报表', source: '已入库的真实业务明细' },
-};
+type PurchaseTab = 'planning' | 'pending' | 'mapping' | 'requests' | 'orders' | 'quotes' | 'received' | 'history' | 'sku-catalog';
+type PurchaseRequestFilter = 'all' | 'draft' | 'pending_review' | 'approved';
+type PurchaseOrderFilter = 'all' | 'draft' | 'awaiting_receipt' | 'partially_received';
 
 const emptyPurchaseSummary: PurchaseDemandSummary = {
   total: 0, open: 0, needsMapping: 0, notRequired: 0, openQuantity: 0, needsMappingQuantity: 0,
@@ -510,10 +516,22 @@ const emptyProcurementSummary: ProcurementSummary = {
   correctionCount: 0, correctedQuantity: 0, receivedQuantity: 0,
 };
 
-export default function ErpClient() {
-  const [active, setActive] = useState<ModuleKey>('dashboard');
+const maxManualPurchaseLines = 100;
+const maxManualPurchaseQuantity = 100_000_000;
+
+export default function ErpClient({ cognitoLogin = false, feishuLogin = false, continuousFeishu = false }: {
+  cognitoLogin?: boolean; feishuLogin?: boolean; continuousFeishu?: boolean;
+}) {
+  const [selectedModule, setActive] = useState<ModuleKey>('dashboard');
+  const [navigationOpen, setNavigationOpen] = useState(false);
+  const [orderStart, setOrderStart] = useState<OrderFilter>('all');
+  const [warehouseStart, setWarehouseStart] = useState<'inbound' | 'outbound'>('inbound');
   const [payload, setPayload] = useState<ErpPayload | null>(null);
+  const user = payload?.user;
+  const active = hasModuleAccess(selectedModule, user) ? selectedModule
+    : navigation.flatMap(({ items }) => items).find(({ key }) => hasModuleAccess(key, user))?.key ?? 'dashboard';
   const [purchasePayload, setPurchasePayload] = useState<PurchaseWorkspacePayload | null>(null);
+  const [warehouseWorkspace, setWarehouseWorkspace] = useState<WarehouseWorkspaceData | null>(null);
   const [purchasePlanning, setPurchasePlanning] = useState<PurchasePlanningPayload | null>(null);
   const [planningError, setPlanningError] = useState('');
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatus | null>(null);
@@ -526,6 +544,7 @@ export default function ErpClient() {
   const [showOrder, setShowOrder] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [actionBusy, setActionBusy] = useState('');
+  const actionKeys = useRef(new Map<string, string>());
   const [syncBusy, setSyncBusy] = useState('');
   const [inventorySource, setInventorySource] = useState<InventorySourceTab>('erp');
   const [mukuStatus, setMukuStatus] = useState<MukuStatus | null>(null);
@@ -537,7 +556,9 @@ export default function ErpClient() {
   const [mukuBusy, setMukuBusy] = useState('');
   const [mukuError, setMukuError] = useState('');
   const [mukuRefreshKey, setMukuRefreshKey] = useState(0);
-  const [purchaseTab, setPurchaseTab] = useState<PurchaseTab>('planning');
+  const [purchaseTab, setPurchaseTab] = useState<PurchaseTab>('requests');
+  const [requestFilter, setRequestFilter] = useState<PurchaseRequestFilter>('all');
+  const [purchaseOrderFilter, setPurchaseOrderFilter] = useState<PurchaseOrderFilter>('all');
   const [selectedDemandIds, setSelectedDemandIds] = useState<Set<string>>(new Set());
   const [selectedPlanRowIds, setSelectedPlanRowIds] = useState<Set<string>>(new Set());
   const [mappingDemand, setMappingDemand] = useState<PurchaseDemand | null>(null);
@@ -546,12 +567,22 @@ export default function ErpClient() {
   const [inventoryConfirmationRow, setInventoryConfirmationRow] = useState<PurchasePlanningRow | null>(null);
   const [showPurchaseRequest, setShowPurchaseRequest] = useState(false);
   const [showPlanningRequest, setShowPlanningRequest] = useState(false);
+  const [showManualRequest, setShowManualRequest] = useState(false);
+  const [skuEntry, setSkuEntry] = useState<{ origin: 'standalone' | 'manual-request'; code: string; sku?: PurchaseSkuOption } | null>(null);
+  const [showSkuImport, setShowSkuImport] = useState(false);
+  const [skuCatalogVersion, setSkuCatalogVersion] = useState(0);
+  const [createdSkuOptions, setCreatedSkuOptions] = useState<PurchaseSkuOption[]>([]);
+  const [newManualSku, setNewManualSku] = useState<PurchaseSkuOption | null>(null);
+  const [entryError, setEntryError] = useState('');
+  const skuAttempt = useRef<{ payload: string; key: string } | null>(null);
+  const manualRequestAttempt = useRef<{ payload: string; key: string } | null>(null);
   const [showSupplier, setShowSupplier] = useState(false);
   const [showWarehouse, setShowWarehouse] = useState(false);
-  const [purchaseOrderRequest, setPurchaseOrderRequest] = useState<PurchaseRequest | null>(null);
+  const [purchaseOrderEditor, setPurchaseOrderEditor] = useState<PurchaseOrderEditor | null>(null);
+  const purchaseOrderSaveAttempt = useRef<{ endpoint: string; payload: string; key: string } | null>(null);
   const [assignmentRequest, setAssignmentRequest] = useState<PurchaseRequest | null>(null);
   const [assignmentIdempotencyKey, setAssignmentIdempotencyKey] = useState('');
-  const [receivingOrder, setReceivingOrder] = useState<PurchaseOrder | null>(null);
+  const [receivingOrder, setReceivingOrder] = useState<ReceivableOrder | null>(null);
   const [purchaseReceiptIdempotencyKey, setPurchaseReceiptIdempotencyKey] = useState('');
   const [correctingReceipt, setCorrectingReceipt] = useState<PurchaseReceipt | null>(null);
   const [receiptCorrections, setReceiptCorrections] = useState<PurchaseReceiptCorrection[]>([]);
@@ -559,52 +590,77 @@ export default function ErpClient() {
   const [receiptCorrectionError, setReceiptCorrectionError] = useState('');
   const [receiptCorrectionIdempotencyKey, setReceiptCorrectionIdempotencyKey] = useState('');
   const [purchaseBusy, setPurchaseBusy] = useState('');
-  const [showMemberRoles, setShowMemberRoles] = useState(false);
   const [managedMembers, setManagedMembers] = useState<ManagedMemberView[]>([]);
   const [memberRoleBusy, setMemberRoleBusy] = useState('');
   const [memberRoleError, setMemberRoleError] = useState('');
+  const manualSkuOptions = useMemo(() => {
+    const options = new Map((purchasePayload?.skuOptions ?? []).map((sku) => [sku.id, sku]));
+    for (const sku of createdSkuOptions) options.set(sku.id, sku);
+    return [...options.values()];
+  }, [purchasePayload?.skuOptions, createdSkuOptions]);
 
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const response = await fetch('/api/erp', { cache: 'no-store' });
+      const response = await fetch('/api/erp?compact=1', { cache: 'no-store' });
       const body = await response.json() as ErpPayload | { message?: string };
-      if (response.status === 401) { setAuthRequired(true); return; }
+      if (response.status === 401) { setPayload(null); setAuthRequired(true); return; }
       if (!response.ok || !('ok' in body) || body.ok !== true) throw new Error('message' in body ? body.message : '业务数据加载失败');
       setPayload(body);
-      let purchaseResponse = await fetch('/api/purchase/workspace', { cache: 'no-store' });
-      if (purchaseResponse.status === 404) purchaseResponse = await fetch('/api/purchase/demands', { cache: 'no-store' });
-      const purchaseBody = await purchaseResponse.json() as PurchaseWorkspacePayload | PurchaseDemandsPayload | { message?: string };
-      if (purchaseResponse.status === 401) { setAuthRequired(true); return; }
-      if (!purchaseResponse.ok || !('ok' in purchaseBody) || purchaseBody.ok !== true) {
-        throw new Error('message' in purchaseBody ? purchaseBody.message : '采购需求加载失败');
-      }
-      const normalizedPurchase = normalizePurchaseWorkspace(purchaseBody);
-      setPurchasePayload(normalizedPurchase);
-      setSelectedDemandIds((current) => new Set([...current].filter((id) => normalizedPurchase.demands.some(
-        (demand) => demand.id === id && demand.status === 'open' && demandAvailableQuantity(demand) > 0,
-      ))));
-      const planningResponse = await fetch('/api/purchase/planning', { cache: 'no-store' });
-      const planningBody = await planningResponse.json().catch(() => null) as PurchasePlanningPayload | { message?: string } | null;
-      if (planningResponse.status === 401) { setAuthRequired(true); return; }
-      if (planningResponse.ok && planningBody && 'ok' in planningBody && planningBody.ok === true) {
-        setPurchasePlanning(planningBody);
-        setPlanningError('');
-        setSelectedPlanRowIds((current) => new Set([...current].filter((id) => planningBody.rows.some(
-          (row) => row.planRowId === id && planningRowConvertible(row, planningBody.readiness, planningBody.orderSourceReadiness),
+      if (body.user.permissions.includes('purchase:read')) {
+        let purchaseResponse = await fetch('/api/purchase/workspace', { cache: 'no-store' });
+        if (purchaseResponse.status === 404) purchaseResponse = await fetch('/api/purchase/demands', { cache: 'no-store' });
+        const purchaseBody = await purchaseResponse.json() as PurchaseWorkspacePayload | PurchaseDemandsPayload | { message?: string };
+        if (purchaseResponse.status === 401) { setAuthRequired(true); return; }
+        if (!purchaseResponse.ok || !('ok' in purchaseBody) || purchaseBody.ok !== true) {
+          throw new Error('message' in purchaseBody ? purchaseBody.message : '采购需求加载失败');
+        }
+        const normalizedPurchase = normalizePurchaseWorkspace(purchaseBody);
+        setPurchasePayload(normalizedPurchase);
+        setSelectedDemandIds((current) => new Set([...current].filter((id) => normalizedPurchase.demands.some(
+          (demand) => demand.id === id && demand.status === 'open' && demandAvailableQuantity(demand) > 0,
         ))));
+        const planningResponse = await fetch('/api/purchase/planning', { cache: 'no-store' });
+        const planningBody = await planningResponse.json().catch(() => null) as PurchasePlanningPayload | { message?: string } | null;
+        if (planningResponse.status === 401) { setAuthRequired(true); return; }
+        if (planningResponse.ok && planningBody && 'ok' in planningBody && planningBody.ok === true) {
+          setPurchasePlanning(planningBody);
+          setPlanningError('');
+          setSelectedPlanRowIds((current) => new Set([...current].filter((id) => planningBody.rows.some(
+            (row) => row.planRowId === id && planningRowConvertible(row, planningBody.readiness, planningBody.orderSourceReadiness),
+          ))));
+        } else {
+          setPlanningError(readApiMessage(planningBody, '采购建议暂时无法计算，现有申请和采购单仍可正常使用'));
+        }
       } else {
-        setPlanningError(readApiMessage(planningBody, '采购建议暂时无法计算，现有申请和采购单仍可正常使用'));
+        setPurchasePayload(null);
+        setPurchasePlanning(null);
+        setPlanningError('');
       }
-      const connectorResponse = await fetch('/api/connectors/shopify/status', { cache: 'no-store' });
-      if (connectorResponse.ok) setShopifyStatus(await connectorResponse.json() as ShopifyStatus);
+      if (body.user.permissions.includes('warehouse:read') && !body.user.permissions.includes('purchase:read')) {
+        const warehouseResponse = await fetch('/api/warehouse/workspace', { cache: 'no-store' });
+        if (warehouseResponse.status === 401) { setAuthRequired(true); return; }
+        const warehouseBody = await warehouseResponse.json() as (WarehouseWorkspaceData & { ok: true }) | { message?: string };
+        if (!warehouseResponse.ok || !('ok' in warehouseBody) || warehouseBody.ok !== true) {
+          throw new Error('message' in warehouseBody ? warehouseBody.message : '仓库工作台加载失败');
+        }
+        setWarehouseWorkspace(warehouseBody);
+      } else {
+        setWarehouseWorkspace(null);
+      }
       if (body.user.permissions.includes('connectors:read')) {
+        const connectorResponse = await fetch('/api/connectors/shopify/status', { cache: 'no-store' });
+        if (connectorResponse.ok) setShopifyStatus(await connectorResponse.json() as ShopifyStatus);
         const mukuStatusResponse = await fetch('/api/connectors/muku/status', { cache: 'no-store' });
         if (mukuStatusResponse.ok) {
           setMukuStatus(normalizeMukuStatus(await mukuStatusResponse.json()));
         }
         const mukuRunsResponse = await fetch('/api/connectors/muku/runs?page=1&pageSize=8', { cache: 'no-store' });
         if (mukuRunsResponse.ok) setMukuRuns(normalizeMukuRuns(await mukuRunsResponse.json()));
+      } else {
+        setShopifyStatus(null);
+        setMukuStatus(null);
+        setMukuRuns(null);
       }
       setAuthRequired(false);
       setError('');
@@ -623,9 +679,9 @@ export default function ErpClient() {
   const shouldPollPurchasePlanning = active === 'purchase' && Boolean(
     purchasePlanning && !purchasePlanning.freshness.readyForProcurement
     && (purchasePlanning.freshness.refreshInProgress
-      || purchasePlanning.freshness.refreshDue
       || mukuStatus?.autoRefresh?.refreshTriggered),
   );
+  const canReadConnectorStatus = user?.permissions.includes('connectors:read') ?? false;
 
   useEffect(() => {
     if (!shouldPollPurchasePlanning) return undefined;
@@ -637,12 +693,12 @@ export default function ErpClient() {
       try {
         const [planningResponse, statusResponse] = await Promise.all([
           fetch('/api/purchase/planning', { cache: 'no-store' }),
-          fetch('/api/connectors/muku/status', { cache: 'no-store' }),
+          canReadConnectorStatus ? fetch('/api/connectors/muku/status', { cache: 'no-store' }) : null,
         ]);
         const planningBody = await planningResponse.json().catch(() => null) as PurchasePlanningPayload | null;
-        const statusBody = await statusResponse.json().catch(() => null);
+        const statusBody = await statusResponse?.json().catch(() => null);
         if (cancelled) return;
-        if (statusResponse.ok) setMukuStatus(normalizeMukuStatus(statusBody));
+        if (statusResponse?.ok) setMukuStatus(normalizeMukuStatus(statusBody));
         if (planningResponse.ok && planningBody?.ok === true) {
           setPurchasePlanning(planningBody);
           setSelectedPlanRowIds((current) => new Set([...current].filter((id) => planningBody.rows.some(
@@ -667,7 +723,7 @@ export default function ErpClient() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [shouldPollPurchasePlanning]);
+  }, [shouldPollPurchasePlanning, canReadConnectorStatus]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -676,8 +732,10 @@ export default function ErpClient() {
     if (storeKey && oauthStatus === 'connected') {
       window.history.replaceState({}, '', window.location.pathname);
       const startTimer = window.setTimeout(() => {
-        setActive('platform');
-        setToast('Shopify 只读授权已安全保存，可以开始首次同步');
+        setActive('connections');
+        setToast(params.get('catalog') === 'pending'
+          ? 'Shopify 订单已授权，商品或库存权限待补'
+          : 'Shopify 只读授权已保存，可查看同步状态');
       }, 0);
       const clearTimer = window.setTimeout(() => setToast(''), 3600);
       return () => {
@@ -691,7 +749,7 @@ export default function ErpClient() {
         ? storeKey
         : 'bizfurniz';
       const startTimer = window.setTimeout(() => {
-        setActive('platform');
+        setActive('connections');
         setOAuthFailure({
           message: shopifyOAuthFailureMessage(params.get('code')),
           retryUrl: `/api/connectors/shopify/oauth/${safeStoreKey}/start`,
@@ -733,11 +791,6 @@ export default function ErpClient() {
   }, [active, inventorySource, mukuFilters, mukuPage, mukuRefreshKey, payload]);
 
   const can = useCallback((permission: Permission) => payload?.user.permissions.includes(permission) ?? false, [payload]);
-  const filteredOrders = useMemo(() => {
-    const term = query.trim().toLowerCase();
-    if (!term) return payload?.orders ?? [];
-    return (payload?.orders ?? []).filter((order) => [order.orderNo, order.channel, order.destination, order.customerName, order.skuCode, order.skuName, order.warehouseName, statusLabel[order.status]].some((value) => value.toLowerCase().includes(term)));
-  }, [payload, query]);
   const filteredInventory = useMemo(() => {
     const term = query.trim().toLowerCase();
     if (!term) return payload?.inventory ?? [];
@@ -760,16 +813,6 @@ export default function ErpClient() {
       item.sku ?? '', item.normalizedSku ?? '', ...item.reasons,
     ].some((value) => value.toLowerCase().includes(term)));
   }, [mukuRisk, query]);
-  const filteredPlatformOrders = useMemo(() => {
-    const term = query.trim().toLowerCase();
-    if (!term) return payload?.platformOrders ?? [];
-    return (payload?.platformOrders ?? []).filter((order) => [
-      order.sourceOrderName ?? order.sourceOrderId,
-      order.storeName,
-      order.financialStatus ?? '',
-      order.fulfillmentStatus ?? '',
-    ].some((value) => value.toLowerCase().includes(term)));
-  }, [payload, query]);
   const filteredPurchaseDemands = useMemo(() => {
     const term = query.trim().toLowerCase();
     if (!term) return purchasePayload?.demands ?? [];
@@ -807,6 +850,7 @@ export default function ErpClient() {
       request.reviewer?.displayName ?? '',
       request.creator?.displayName ?? '',
       purchaseRequestStatusLabel[request.status],
+      request.source === 'manual' ? '手工录入' : '',
       request.note ?? '',
       ...request.lines.flatMap((line) => [line.skuCode ?? '', line.skuName ?? '', line.rawSku ?? '']),
     ].some((value) => value.toLowerCase().includes(term)));
@@ -817,8 +861,8 @@ export default function ErpClient() {
     return (purchasePayload?.purchaseOrders ?? []).filter((order) => [
       order.orderNo,
       order.purchaseRequestNo,
-      order.supplier.code,
-      order.supplier.name,
+      order.supplier?.code ?? '',
+      order.supplier?.name ?? '',
       purchaseOrderStatusLabel[order.status],
       order.currency ?? '',
       order.note ?? '',
@@ -838,7 +882,26 @@ export default function ErpClient() {
     ].some((value) => value.toLowerCase().includes(term)));
   }, [purchasePayload, query]);
 
-  function switchModule(key: ModuleKey) { setActive(key); setQuery(''); }
+  function switchModule(key: ModuleKey) {
+    setActive(key);
+    setNavigationOpen(false);
+    setQuery('');
+    setOrderStart('all');
+    setWarehouseStart('inbound');
+    if (key === 'team' && active !== 'team' && !memberRoleBusy) void reloadManagedMembers();
+    window.scrollTo({ top: 0 });
+  }
+
+  function openOrders(filter: OrderFilter = 'all') {
+    switchModule('orders');
+    setOrderStart(filter);
+  }
+
+  function openOrderOutbound(order: { orderNo: string }) {
+    switchModule('warehouse');
+    setWarehouseStart('outbound');
+    setQuery(order.orderNo);
+  }
   function flash(message: string) { setToast(message); window.setTimeout(() => setToast(''), 2800); }
 
   async function refreshManagedMembers() {
@@ -848,8 +911,7 @@ export default function ErpClient() {
     setManagedMembers(parseManagedMembersResponse(body));
   }
 
-  async function openMemberRoles() {
-    setShowMemberRoles(true);
+  async function reloadManagedMembers() {
     setMemberRoleBusy('load');
     setMemberRoleError('');
     try {
@@ -861,7 +923,7 @@ export default function ErpClient() {
     }
   }
 
-  async function updateMemberRole(member: ManagedMemberView, role: ManagedMemberRole) {
+  async function updateMemberRole(member: ManagedMemberView, role: ManagedMemberSelection) {
     const localBlock = memberRoleChangeBlock(member, role, managedMembers);
     if (localBlock) { setMemberRoleError(localBlock); return; }
     setMemberRoleBusy(member.id);
@@ -870,19 +932,20 @@ export default function ErpClient() {
       const response = await fetch(`/api/members/${encodeURIComponent(member.id)}/role`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role }),
+        body: JSON.stringify(isAccessProfile(role) ? { accessProfile: role } : { role }),
       });
       const body = await response.json().catch(() => null);
       if (!response.ok) throw new Error(managedMemberErrorMessage(body, '成员角色更新失败'));
-      const changingSelf = member.email.trim().toLowerCase() === payload?.user.email.trim().toLowerCase();
+      const changingSelf = member.email.trim().toLowerCase() === payload?.user.email.trim().toLowerCase()
+        && (member.identityProvider ?? 'existing') === (payload.user.authProvider ?? 'existing');
       await loadData();
       if (changingSelf && role !== 'admin') {
-        setShowMemberRoles(false);
+        switchModule('dashboard');
         setManagedMembers([]);
       } else {
         await refreshManagedMembers();
       }
-      flash(`${member.displayName} 已调整为${MEMBER_ROLE_OPTIONS.find((option) => option.value === role)?.label ?? role}`);
+      flash(`${member.displayName} 已调整为${memberRoleLabel(role)}`);
     } catch (cause) {
       setMemberRoleError(cause instanceof Error ? cause.message : '成员角色更新失败');
     } finally {
@@ -916,37 +979,41 @@ export default function ErpClient() {
     } finally { setSubmitting(false); }
   }
 
-  async function runAction(order: ErpOrder, action: OrderAction) {
+  async function runAction(order: Pick<ErpOrder, 'id' | 'orderNo' | 'warehouseName' | 'quantity' | 'skuCode'>, action: OrderAction) {
     const message = action === 'approve'
       ? `将为 ${order.orderNo} 在${order.warehouseName}预占 ${order.quantity} 件 ${order.skuCode}，确认审核？`
       : action === 'ship'
         ? `将扣减 ${order.quantity} 件现存库存并写入不可变出库流水，确认发货？`
         : `将取消 ${order.orderNo} 并释放已预占库存（如有）。订单和历史不会被删除，确认继续？`;
-    if (!window.confirm(message)) return;
-    setActionBusy(`${order.id}:${action}`); setError('');
+    if (!window.confirm(message)) return false;
+    const operation = `${order.id}:${action}`;
+    const idempotencyKey = actionKeys.current.get(operation) ?? crypto.randomUUID();
+    actionKeys.current.set(operation, idempotencyKey);
+    setActionBusy(operation); setError('');
     try {
-      const response = await fetch(`/api/orders/${order.id}/actions`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
-        body: JSON.stringify({ action }),
+      const orderId = encodeURIComponent(order.id);
+      const shipping = action === 'ship';
+      const response = await fetch(shipping ? `/api/warehouse/outbound/${orderId}` : `/api/orders/${orderId}/actions`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify(shipping ? { step: 'ship', expectedVersion: 3 } : { action }),
       });
       const body = await response.json() as { message?: string };
       if (!response.ok) throw new Error(body.message ?? '订单操作失败');
+      actionKeys.current.delete(operation);
       await loadData();
       flash(action === 'approve' ? '审核完成，库存已预占' : action === 'ship' ? '发货完成，库存流水已更新' : '订单已取消，历史记录已保留');
+      return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '订单操作失败');
+      return false;
     } finally { setActionBusy(''); }
   }
 
-  async function runShopifySync(store: ShopifyStatus['stores'][number]) {
+  async function runShopifySync(store: StoreConnection) {
     if (!store.credentialsConfigured || syncBusy) return;
     const firstRun = !store.completedWatermark;
     const to = new Date();
     const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const message = firstRun
-      ? `将只读回补 ${store.displayName} 最近 7 天订单，不会向 Shopify 写入任何状态，确认继续？`
-      : `将从上次水位重叠回扫并增量同步 ${store.displayName}，确认继续？`;
-    if (!window.confirm(message)) return;
     setSyncBusy(store.key); setError('');
     try {
       const response = await fetch('/api/connectors/shopify/sync', {
@@ -1181,6 +1248,117 @@ export default function ErpClient() {
     } finally { setPurchaseBusy(''); }
   }
 
+  function openManualRequest() {
+    manualRequestAttempt.current = null;
+    setNewManualSku(null);
+    setEntryError('');
+    setShowManualRequest(true);
+  }
+
+  function openSkuEntry(origin: 'standalone' | 'manual-request', code = '', sku?: PurchaseSkuOption) {
+    skuAttempt.current = null;
+    setEntryError('');
+    setSkuEntry({ origin, code, sku });
+  }
+
+  function closeSkuEntry() {
+    if (purchaseBusy) return;
+    setEntryError('');
+    setSkuEntry(null);
+  }
+
+  async function submitPurchaseSku(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (purchaseBusy || !skuEntry) return;
+    const data = new FormData(event.currentTarget);
+    const code = String(data.get('code') ?? '').trim();
+    const name = String(data.get('name') ?? '').trim();
+    if (!code || !name) { setEntryError('请填写 SKU 编码和商品名称'); return; }
+    const { specification, dimensions, imageUrl, description } = readPurchaseProductDetails(data, 'skuDetails:');
+    const productDetails = { specification, dimensions, imageUrl, description };
+    const existingSku = skuEntry.sku;
+    const payload = JSON.stringify(existingSku
+      ? { productDetails: { name, ...productDetails }, expectedRevision: existingSku.revision }
+      : { code, name, productDetails });
+    if (skuAttempt.current?.payload !== payload) skuAttempt.current = { payload, key: crypto.randomUUID() };
+    setPurchaseBusy('create-sku');
+    setEntryError('');
+    try {
+      const response = await fetch(existingSku ? `/api/purchase/skus/${encodeURIComponent(existingSku.id)}` : '/api/purchase/skus', {
+        method: existingSku ? 'PATCH' : 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': skuAttempt.current.key },
+        body: payload,
+      });
+      const body = await response.json().catch(() => null) as { ok?: boolean; sku?: PurchaseSkuOption; code?: string; message?: string } | null;
+      if (response.status === 409 && body?.code === 'PURCHASE_SKU_CHANGED' && existingSku?.revision) {
+        setSkuCatalogVersion((current) => current + 1);
+        throw new Error('SKU 资料已更新。请关闭编辑窗口并重新打开该档案后再保存。');
+      }
+      if (!response.ok || !body?.ok || !body.sku) throw new Error(readApiMessage(body, 'SKU 保存失败'));
+      const savedSku = body.sku;
+      setCreatedSkuOptions((current) => [...current.filter((sku) => sku.id !== savedSku.id), savedSku]);
+      if (skuEntry.origin === 'manual-request' && !existingSku) setNewManualSku(savedSku);
+      setSkuEntry(null);
+      setSkuCatalogVersion((current) => current + 1);
+      await loadData();
+      flash(existingSku ? `SKU ${savedSku.code} 商品档案已更新` : `SKU ${savedSku.code} 已保存`);
+    } catch (cause) {
+      setEntryError(cause instanceof Error ? cause.message : 'SKU 保存失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
+  async function submitManualRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (purchaseBusy) return;
+    const intent = (event.nativeEvent as SubmitEvent).submitter?.getAttribute('value') === 'submit' ? 'submit' : 'draft';
+    const form = new FormData(event.currentTarget);
+    const quantities = form.getAll('quantity');
+    const lineIds = form.getAll('productLineId');
+    const lines = form.getAll('skuId').map((skuId, index) => ({
+      skuId: String(skuId),
+      quantity: Number(quantities[index]),
+      productDetails: readPurchaseProductDetails(form, `requestDetails:${lineIds[index]}:`),
+    }));
+    const note = String(form.get('note') ?? '').trim();
+    if (!note) { setEntryError('请填写采购原因'); return; }
+    if (!lines.length || lines.length > maxManualPurchaseLines || lines.some((line) => !line.skuId || !Number.isSafeInteger(line.quantity) || line.quantity < 1 || line.quantity > maxManualPurchaseQuantity)) {
+      setEntryError('请逐行选择 SKU，并填写 1 至 100,000,000 的整数数量');
+      return;
+    }
+    if (new Set(lines.map((line) => line.skuId)).size !== lines.length) {
+      setEntryError('同一 SKU 只能添加一行，请合并采购数量');
+      return;
+    }
+    const payload = JSON.stringify({
+      lines,
+      note,
+      purchaserMemberId: String(form.get('purchaserMemberId') ?? ''),
+      reviewerMemberId: String(form.get('reviewerMemberId') ?? ''),
+      intent,
+    });
+    if (manualRequestAttempt.current?.payload !== payload) manualRequestAttempt.current = { payload, key: crypto.randomUUID() };
+    setPurchaseBusy('create-manual-request');
+    setEntryError('');
+    try {
+      const response = await fetch('/api/purchase/manual-requests', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': manualRequestAttempt.current.key },
+        body: payload,
+      });
+      const body = await response.json().catch(() => null) as { ok?: boolean; request?: PurchaseRequest; replayed?: boolean; message?: string } | null;
+      if (!response.ok || !body?.ok || !body.request?.id) throw new Error(readApiMessage(body, '手工采购申请保存失败'));
+      if (intent === 'submit' && body.request.status === 'draft') throw new Error('申请仍为草稿，请核对后提交复审。');
+      setShowManualRequest(false);
+      setQuery('');
+      setRequestFilter('all');
+      setPurchaseTab('requests');
+      await loadData();
+      flash(body.request.status === 'pending_review' ? '采购申请已提交复审' : body.replayed ? '已找到先前保存的采购申请' : '采购申请草稿已保存');
+    } catch (cause) {
+      setEntryError(cause instanceof Error ? cause.message : '手工采购申请保存失败');
+    } finally { setPurchaseBusy(''); }
+  }
+
   async function submitSkuMapping(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!mappingDemand) return;
@@ -1248,22 +1426,16 @@ export default function ErpClient() {
   }
 
   async function runPurchaseRequestAction(request: PurchaseRequest, action: PurchaseRequestAction) {
+    const manual = request.source === 'manual';
     let note = '';
     if (action === 'reject' || action === 'withdraw') {
       const reason = window.prompt(action === 'reject'
-        ? `请输入驳回 ${request.requestNo} 的原因，需求将被释放但历史不会删除：`
-        : `请输入撤回 ${request.requestNo} 的原因。仅在尚未生成有效采购单时可撤回，需求会释放并重新计算：`);
+        ? `请输入驳回 ${request.requestNo} 的原因。${manual ? '申请历史会保留。' : '需求将被释放，申请历史会保留。'}`
+        : `请输入撤回 ${request.requestNo} 的原因。仅在尚未生成有效采购单时可撤回。${manual ? '' : '需求会释放并重新计算。'}`);
       if (reason === null) return;
       note = reason.trim();
       if (!note) { setError(action === 'reject' ? '驳回时必须填写原因' : '撤回时必须填写原因'); return; }
-    } else {
-      const message = action === 'approve'
-        ? `确认批准 ${request.requestNo}？批准后需求将保持占用，避免重复采购。`
-        : action === 'cancel'
-          ? `确认取消 ${request.requestNo}？需求会重新释放，申请历史不会删除。`
-          : `确认提交 ${request.requestNo} 进入复审？`;
-      if (!window.confirm(message)) return;
-    }
+    } else if (action === 'cancel' && !window.confirm(`确认取消 ${request.requestNo}？${manual ? '' : '需求会重新释放。'}申请历史会保留。`)) return;
     setPurchaseBusy(`${request.id}:${action}`); setError('');
     try {
       const response = await fetch(`/api/purchase/requests/${request.id}/actions`, {
@@ -1271,18 +1443,35 @@ export default function ErpClient() {
         headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({ action, note: note || undefined }),
       });
-      const body = await response.json() as { message?: string };
+      const body = await response.json() as { message?: string; purchaseOrder?: PurchaseOrder | null };
       if (!response.ok) throw new Error(body.message ?? '采购申请操作失败');
+      const draft = action === 'approve' && body.purchaseOrder?.status === 'draft' ? body.purchaseOrder : null;
+      if (action === 'approve') {
+        setRequestFilter('all');
+        if (draft) {
+          setQuery('');
+          setPurchaseOrderFilter('draft');
+          setPurchaseTab('orders');
+          const purchaser = assignmentActionAllowed(
+            Boolean(purchasePayload?.currentMemberId && draft.purchaserMemberId === purchasePayload.currentMemberId),
+            Boolean(purchasePayload?.developmentOpenAccess),
+          );
+          if (can('purchase:order:issue') && (payload?.user.role === 'admin' || purchaser)) {
+            purchaseOrderSaveAttempt.current = null;
+            setPurchaseOrderEditor({ order: draft });
+          }
+        }
+      }
       await loadData();
       flash(action === 'submit'
         ? '已提交复审'
         : action === 'approve'
-          ? '复审已批准'
+          ? draft ? `${draft.orderNo} 草稿已生成` : '申请已批准，可在采购申请中继续处理'
           : action === 'reject'
-            ? '已驳回并释放需求'
+            ? manual ? '采购申请已驳回' : '已驳回并释放需求'
             : action === 'withdraw'
-              ? '已撤回批准申请，需求已释放并重新计算'
-              : '草稿已取消并释放需求');
+              ? manual ? '已撤回批准申请' : '已撤回批准申请，需求已释放并重新计算'
+              : manual ? '草稿已取消' : '草稿已取消并释放需求');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '采购申请操作失败');
     } finally { setPurchaseBusy(''); }
@@ -1382,44 +1571,79 @@ export default function ErpClient() {
 
   async function submitPurchaseOrder(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!purchaseOrderRequest) return;
-    const form = event.currentTarget;
-    const data = new FormData(form);
-    const lineCosts = purchaseOrderRequest.lines.map((line) => {
-      const rawValue = String(data.get(`unitCost:${line.id}`) ?? '').trim();
+    if (!purchaseOrderEditor || purchaseBusy) return;
+    const issue = (event.nativeEvent as SubmitEvent).submitter?.getAttribute('value') === 'issue';
+    if (issue && !can('purchase:order:issue')) return;
+    const { request, order } = purchaseOrderEditor;
+    const data = new FormData(event.currentTarget);
+    const requestLineIds = order
+      ? order.lines.map((line) => line.purchaseRequestLineId)
+      : request.lines.map((line) => line.id);
+    const lineCosts = requestLineIds.map((purchaseRequestLineId) => {
+      const rawValue = String(data.get(`unitCost:${purchaseRequestLineId}`) ?? '').trim();
       return {
-        purchaseRequestLineId: line.id,
-        unitCostMinor: rawValue === '' ? Number.NaN : Math.round(Number(rawValue) * 100),
+        purchaseRequestLineId,
+        unitCostMinor: rawValue === '' ? null : Math.round(Number(rawValue) * 100),
+        productDetails: readPurchaseProductDetails(data, `orderDetails:${purchaseRequestLineId}:`),
       };
     });
-    if (lineCosts.length !== purchaseOrderRequest.lines.length
-      || lineCosts.some((line) => !Number.isSafeInteger(line.unitCostMinor) || line.unitCostMinor < 0)) {
-      setError('确认下单前必须为每条明细填写非负采购单价');
+    if (!lineCosts.length || lineCosts.some((line) => line.unitCostMinor !== null && (!Number.isSafeInteger(line.unitCostMinor) || line.unitCostMinor < 0))) {
+      setError('请输入有效的非负采购单价');
       return;
     }
-    setPurchaseBusy(`create-order:${purchaseOrderRequest.id}`); setError('');
+    const deliveryDate = String(data.get('expectedDeliveryAt') ?? '');
+    const previousDelivery = order?.expectedDeliveryAt;
+    const supplierId = String(data.get('supplierId') ?? '') || null;
+    const deliveryWarehouseId = String(data.get('deliveryWarehouseId') ?? '') || null;
+    const currency = String(data.get('currency') ?? '') || null;
+    if (issue && (!supplierId || !deliveryWarehouseId || !deliveryDate || !currency || lineCosts.some((line) => line.unitCostMinor === null))) {
+      setError('确认下单前，请补齐供应商、收货仓、交期、币种及每条明细的采购单价。');
+      return;
+    }
+    const details = {
+      supplierId,
+      deliveryWarehouseId,
+      expectedDeliveryAt: deliveryDate && previousDelivery?.slice(0, 10) === deliveryDate ? previousDelivery : deliveryDate || null,
+      currency,
+      paymentTerms: String(data.get('paymentTerms') ?? '').trim(),
+      tradeTerms: String(data.get('tradeTerms') ?? '').trim(),
+      note: String(data.get('note') ?? '').trim(),
+      lineCosts,
+      ...(issue ? { issue: true } : {}),
+    };
+    const body = order ? { ...details, expectedVersion: order.version } : {
+      ...details,
+      purchaseRequestId: request.id,
+    };
+    const endpoint = order ? `/api/purchase/orders/${order.id}` : '/api/purchase/orders';
+    const payload = JSON.stringify(body);
+    const previousAttempt = purchaseOrderSaveAttempt.current;
+    const key = previousAttempt?.endpoint === endpoint && previousAttempt.payload === payload
+      ? previousAttempt.key
+      : crypto.randomUUID();
+    purchaseOrderSaveAttempt.current = { endpoint, payload, key };
+    const fallback = issue ? '确认下单失败' : '采购单草稿保存失败';
+    setPurchaseBusy(`save-order:${order?.id ?? request?.id}`); setError('');
     try {
-      const response = await fetch('/api/purchase/orders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
-        body: JSON.stringify({
-          purchaseRequestId: purchaseOrderRequest.id,
-          supplierId: String(data.get('supplierId') ?? ''),
-          deliveryWarehouseId: String(data.get('deliveryWarehouseId') ?? ''),
-          expectedDeliveryAt: String(data.get('expectedDeliveryAt') ?? ''),
-          currency: String(data.get('currency') ?? 'CNY'),
-          paymentTerms: String(data.get('paymentTerms') ?? '').trim() || undefined,
-          tradeTerms: String(data.get('tradeTerms') ?? '').trim() || undefined,
-          note: String(data.get('note') ?? '').trim() || undefined,
-          lineCosts,
-        }),
+      const response = await fetch(endpoint, {
+        method: order ? 'PATCH' : 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+        body: payload,
       });
-      const body = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(body.message ?? '正式采购单生成失败');
-      setPurchaseOrderRequest(null); await loadData(); setPurchaseTab('orders');
-      flash('正式采购单已生成，确认下单后可登记到货');
+      const result = await response.json().catch(() => null) as { ok?: boolean; purchaseOrder?: PurchaseOrder; message?: string } | null;
+      if (!response.ok || !result?.ok || !result.purchaseOrder?.id) throw new Error(readApiMessage(result, fallback));
+      const savedOrder = result.purchaseOrder;
+      if (issue && savedOrder.status === 'draft') throw new Error('采购单仍为草稿，请核对下单结果。');
+      purchaseOrderSaveAttempt.current = null;
+      setPurchaseOrderEditor(null);
+      setQuery('');
+      setPurchaseOrderFilter(savedOrder.status === 'draft' ? 'draft' : 'awaiting_receipt');
+      setPurchaseTab('orders');
+      await loadData();
+      flash(savedOrder.status === 'issued' ? `${savedOrder.orderNo} 已确认下单，仓库可登记到货` :
+        savedOrder.status === 'draft' ? `${savedOrder.orderNo} 草稿已保存` : `${savedOrder.orderNo} · ${purchaseOrderStatusLabel[savedOrder.status]}`);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '正式采购单生成失败');
+      setError(cause instanceof Error ? cause.message : fallback);
     } finally { setPurchaseBusy(''); }
   }
 
@@ -1429,7 +1653,7 @@ export default function ErpClient() {
       : undefined;
     if (action === 'close' && !closeReason) return;
     const message = action === 'issue'
-      ? `确认将 ${order.orderNo} 标记为已向 ${order.supplier.name} 下单？`
+      ? `确认将 ${order.orderNo} 标记为已向 ${order.supplier?.name ?? '供应商'} 下单？`
       : action === 'close'
         ? `确认关闭 ${order.orderNo} 的剩余未到数量？已到货、原采购数量和关闭原因都会保留。`
         : `确认取消 ${order.orderNo}？采购单和操作历史会保留。`;
@@ -1439,11 +1663,15 @@ export default function ErpClient() {
       const response = await fetch(`/api/purchase/orders/${order.id}/actions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
-        body: JSON.stringify({ action, note: closeReason }),
+        body: JSON.stringify({ action, note: closeReason, expectedVersion: action === 'issue' ? order.version : undefined }),
       });
       const body = await response.json() as { message?: string };
       if (!response.ok) throw new Error(body.message ?? '采购单操作失败');
       await loadData();
+      if (action === 'issue') {
+        setQuery('');
+        setPurchaseOrderFilter('awaiting_receipt');
+      }
       flash(action === 'issue'
         ? '采购单已确认下单，等待到货'
         : action === 'close'
@@ -1492,7 +1720,7 @@ export default function ErpClient() {
     } finally { setPurchaseBusy(''); }
   }
 
-  function openPurchaseReceipt(order: PurchaseOrder) {
+  function openPurchaseReceipt(order: ReceivableOrder) {
     setReceivingOrder(order);
     setPurchaseReceiptIdempotencyKey(crypto.randomUUID());
     setError('');
@@ -1579,40 +1807,117 @@ export default function ErpClient() {
     }
   }
 
-  const activeLabel = nav.find((item) => item.key === active)?.label ?? '工作台';
-  const displayName = payload?.user.displayName || '未登录';
-  const initials = displayName.slice(0, 2).toUpperCase();
+  const canOpenImports = can('members:manage');
+  const openingWorkflow: NineStoreWorkflow = {
+    inventory: [], canCreate: false,
+    onOpenOrder: (orderNo) => { openOrders(); setQuery(orderNo); },
+    onOpenWarehouse: (orderNo) => openOrderOutbound({ orderNo }),
+    onOpenLogistics: (orderNo) => { switchModule('logistics'); setQuery(orderNo); },
+    onOpenInventory: (sku) => { switchModule('inventory'); setInventorySource('erp'); setQuery(sku); },
+  };
+  const channelLabel = user?.channelScope ? channelModuleLabels[user.channelScope] : undefined;
+  const awaitingAccess = Boolean(user && user.permissions.length === 0);
+  const activeLabel = channelLabel ?? (awaitingAccess ? '待授权' : navigation.flatMap((group) => group.items).find((item) => item.key === active)?.label ?? '运营工作台');
+  const showNavigation = Boolean(user && !awaitingAccess);
+  const showSearch = showNavigation && !['dashboard', 'connections', 'finance', 'reports'].includes(active);
 
   return (
-    <main className="app-shell">
-      <aside className="sidebar">
-        <button className="brand" onClick={() => switchModule('dashboard')}><span className="brand-mark">易</span><span>易仓 ERP</span></button>
-        <div className="pilot-tag"><span />真实数据模式 · 不生成样例</div>
-        <p className="nav-label">业务中心</p>
-        <nav>{nav.map((item) => <button className={active === item.key ? 'nav-item active' : 'nav-item'} onClick={() => switchModule(item.key)} key={item.key}><span className="nav-icon">{item.code}</span>{item.label}{item.key === 'orders' && Boolean(payload?.summary.pendingReview) && <b>{payload?.summary.pendingReview}</b>}</button>)}</nav>
-        <div className="sidebar-foot"><div className="help-icon">✓</div><div><strong>可信业务底座</strong><small>身份 · 幂等 · 审计 · 库存流水</small></div></div>
+    <main className={`app-shell erp-workspace${active === 'purchase' ? ' purchase-active' : ''}${authRequired ? ' erp-auth-layout' : ''}`}>
+      <aside className={navigationOpen ? 'sidebar nav-menu-open' : 'sidebar'}>
+        <div className="erp-sidebar-head">
+          <button className="brand" type="button" onClick={() => switchModule('dashboard')}><span className="brand-mark" aria-hidden="true">易</span><span>易仓 ERP</span></button>
+          {showNavigation && <button className="erp-nav-toggle" type="button" aria-controls="erp-navigation" aria-expanded={navigationOpen}
+            onClick={() => setNavigationOpen((open) => !open)}><span aria-hidden="true" />业务菜单</button>}
+        </div>
+        {showNavigation && <nav id="erp-navigation" className="erp-nav" aria-label="业务模块">
+          {navigation.map(({ title, items }) => {
+            const visible = items.filter(({ key }) => hasModuleAccess(key, user));
+            return visible.length ? <section className="erp-nav-group" key={title} aria-label={title}>
+              <h2>{title}</h2>
+              {visible.map(({ key, label }) => <button key={key} type="button" className={active === key ? 'nav-item active' : 'nav-item'}
+                aria-current={active === key ? 'page' : undefined} onClick={() => switchModule(key)}>
+                {(key === 'platform' && channelLabel) || label}{key === 'orders' && Boolean(payload?.summary.pendingReview) && <b>{payload?.summary.pendingReview}</b>}
+              </button>)}
+            </section> : null;
+          })}
+        </nav>}
       </aside>
 
       <section className="workspace">
         <header className="topbar">
-          <div className="crumb"><span>{payload?.user.tenantName ?? '易仓 ERP 工作区'}</span><i>／</i><strong>{activeLabel}</strong></div>
+          <div className="crumb"><span>{user?.tenantName ?? '易仓 ERP'}</span><i aria-hidden="true">/</i><strong>{activeLabel}</strong></div>
           <div className="top-actions">
-            <label className="search"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索当前模块" placeholder={active === 'dashboard' ? '切换模块后搜索业务数据' : `搜索${activeLabel}`} /></label>
-            <div className="live-badge"><i />仅真实数据</div>
-            <div className="avatar">{initials}</div><div className="user"><strong>{displayName}</strong><small>{payload?.user.role === 'admin' ? '系统管理员' : payload?.user.role === 'operator' ? '业务操作员' : '只读成员'}</small></div>
+            {showSearch && <label className="search"><span className="search-icon" aria-hidden="true" /><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索当前模块" placeholder={`搜索${activeLabel}`} /></label>}
+            {user && <div className="erp-account">
+              <div className="user"><strong>{user.displayName}</strong><small>{memberRoleLabel(user.accessProfile ?? user.role)}</small></div>
+              {(feishuLogin || cognitoLogin) && <form action={user.authProvider === 'feishu' ? '/api/auth/feishu/logout' : '/api/auth/cognito/logout'} method="post"><button className="erp-logout" type="submit">退出登录</button></form>}
+            </div>}
           </div>
         </header>
 
-        {authRequired ? <AuthRequired /> : loading && !payload ? <LoadingState /> : payload ? (
+        {authRequired ? <AuthRequired cognitoLogin={cognitoLogin} feishuLogin={feishuLogin} /> : loading && !payload ? <LoadingState /> : payload ? (
           <>
-            {oauthFailure && <div className="inline-alert" role="alert"><span>!</span><p>{oauthFailure.message}</p><button onClick={() => window.location.assign(oauthFailure.retryUrl)}>重新授权</button></div>}
+            {oauthFailure && can('connectors:sync') && <div className="inline-alert" role="alert"><span>!</span><p>{oauthFailure.message}</p><button onClick={() => window.location.assign(oauthFailure.retryUrl)}>重新授权</button></div>}
             {error && <div className="inline-alert" role="alert"><span>!</span><p>{error}</p><button onClick={() => { setError(''); void loadData(); }}>重试</button></div>}
-            {active === 'dashboard' && <Dashboard payload={payload} openOrder={() => setShowOrder(true)} go={switchModule} />}
-            {active === 'platform' && <PlatformOrdersView orders={filteredPlatformOrders} summary={payload.summary} status={shopifyStatus} canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync} />}
-            {active === 'orders' && <OrdersView orders={filteredOrders} summary={payload.summary} inventoryReady={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} />}
+            {awaitingAccess && <section className="content erp-access-state" aria-labelledby="erp-access-heading">
+              <h1 id="erp-access-heading">待管理员授权</h1><p>请联系工作区管理员分配岗位。</p>
+            </section>}
+            {active === 'dashboard' && hasModuleAccess('dashboard', user) && !awaitingAccess && <OperationsHome
+              tasks={[
+                { label: '待审核', value: payload.summary.pendingReview, unit: '单', detail: '审核后分配库存', tone: 'amber', open: () => openOrders('pending_review') },
+                { label: '待发货', value: payload.summary.readyToShip, unit: '单', detail: '已预占，待仓库处理', tone: 'blue', open: () => { switchModule('warehouse'); setWarehouseStart('outbound'); } },
+                { label: '待收货', value: purchasePayload?.procurementSummary.pendingReceiptQuantity ?? null, unit: '件', detail: '采购到货与质检', tone: 'teal', open: () => switchModule('warehouse') },
+                { label: '低库存', value: payload.inventory.length ? payload.summary.lowStock : null, unit: '项',
+                  detail: payload.inventory.length ? '查看可售与预占' : '库存尚未建账', tone: 'red', open: () => switchModule('inventory') },
+              ]}
+              stores={shopifyStatus?.stores ?? null} openOrders={() => openOrders()} openChannels={() => switchModule('platform')}
+              openStores={can('connectors:read') ? () => switchModule('connections') : undefined}
+              openImports={canOpenImports ? () => switchModule('sources') : undefined} readyForOrders={payload.inventory.length > 0}
+              recentOrders={payload.orders.length ? <OrderTable orders={payload.orders.slice(0, 5)} compact /> :
+                <div className="ops-no-orders"><strong>暂无运营订单</strong><span>已进入审核和仓库作业的订单会显示在这里。</span></div>}
+            />}
+            {active === 'platform' && user?.channelScope && <section className="content module-content">
+              <header className="module-head"><h1>{channelLabel}</h1></header>
+              <ErpNineStoreOrders key={user.channelScope} query={query} channelScope={user.channelScope} />
+            </section>}
+            {active === 'platform' && user?.channelScope && payload.summary.totalPlatformOrders > 0 && <ChannelOrders query={query} clearQuery={() => setQuery('')} refreshAfter={payload}
+              scoped openStores={can('connectors:read') ? () => switchModule('connections') : undefined}
+              canRefreshSource={can('connectors:sync')}
+              onLinked={() => { void loadData(); }} />}
+            {active === 'platform' && !user?.channelScope && can('orders:read') && <ChannelOrderWorkspace query={query} clearQuery={() => setQuery('')} refreshAfter={payload}
+              hasNativeOrders={payload.summary.totalPlatformOrders > 0} continuousFeishu={continuousFeishu}
+              openStores={can('connectors:read') ? () => switchModule('connections') : undefined} canRefreshSource={can('connectors:sync')}
+              workflow={{ ...openingWorkflow, inventory: payload.inventory, canCreate: can('orders:create') }}
+              onLinked={() => { void loadData(); }} />}
+            {active === 'connections' && can('connectors:read') && <StoreConnections stores={shopifyStatus?.stores ?? null}
+              jobActive={shopifyStatus?.automation?.scheduledReconciliationConfigured === true}
+              canSync={can('connectors:sync')} syncBusy={syncBusy} runSync={runShopifySync}
+              onOrdersSynced={() => { void loadData(); }}
+              inventoryPanel={<ErpShopifyInventoryLookup stores={shopifyStatus?.stores ?? null} canSync={can('connectors:sync')} />} />}
+            {active === 'orders' && <OrdersView key={orderStart} initialFilter={orderStart} query={query} refreshAfter={payload.orders} summary={payload.summary} inventoryReady={payload.inventory.length > 0}
+              can={can} busy={actionBusy} openOrder={() => setShowOrder(true)} runAction={runAction} openOutbound={openOrderOutbound} />}
             {active === 'inventory' && <InventoryView inventory={filteredInventory} summary={payload.summary} hasInventoryData={payload.inventory.length > 0} hasQuery={Boolean(query.trim())} source={inventorySource} setSource={switchInventorySource} mukuStatus={mukuStatus} mukuRuns={mukuRuns} mukuInventory={mukuInventory} mukuRisk={mukuRisk} mukuInventoryRows={filteredMukuInventory} mukuRiskRows={filteredMukuRisk} mukuPage={mukuPage} setMukuPage={setMukuPage} mukuFilters={mukuFilters} applyMukuFilters={applyMukuFilters} mukuBusy={mukuBusy} mukuError={mukuError} canRead={can('connectors:read')} canSync={can('connectors:sync')} testConnection={testMukuConnection} syncReadOnly={syncMukuReadOnly} />}
-            {active === 'purchase' && <PurchaseWorkspaceView planning={purchasePlanning} planningRows={filteredPurchasePlanningRows} planningError={planningError} demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} tab={purchaseTab} setTab={setPurchaseTab} selectedPlanRowIds={selectedPlanRowIds} togglePlanningRow={togglePlanningRow} openPlanningRequest={() => setShowPlanningRequest(true)} openPlanningMapping={setPlanningMapping} openPlanningPolicy={setPlanningPolicy} openInventoryConfirmation={setInventoryConfirmationRow} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openMemberRoles={() => { void openMemberRoles(); }} openPurchaseOrder={setPurchaseOrderRequest} openAssignment={openPurchaseAssignment} openReceipt={openPurchaseReceipt} openReceiptCorrection={(receipt) => { void openReceiptCorrection(receipt); }} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} hasQuery={Boolean(query.trim())} />}
-            {!['dashboard','platform','orders','inventory','purchase'].includes(active) && <PlannedModule module={plannedModules[active as keyof typeof plannedModules]} />}
+            {active === 'purchase' && <PurchaseWorkspaceView planning={purchasePlanning} planningRows={filteredPurchasePlanningRows} planningError={planningError} demands={filteredPurchaseDemands} requests={filteredPurchaseRequests} purchaseOrders={filteredPurchaseOrders} purchaseReceipts={filteredPurchaseReceipts} workspace={purchasePayload} isAdministrator={payload.user.role === 'admin'} tab={purchaseTab} setTab={setPurchaseTab} requestFilter={requestFilter} setRequestFilter={setRequestFilter} orderFilter={purchaseOrderFilter} setOrderFilter={setPurchaseOrderFilter} openManualRequest={openManualRequest} skuCatalogVersion={skuCatalogVersion} openSku={(sku) => openSkuEntry('standalone', sku?.code ?? '', sku)} openSkuImport={() => setShowSkuImport(true)} selectedPlanRowIds={selectedPlanRowIds} togglePlanningRow={togglePlanningRow} openPlanningRequest={() => setShowPlanningRequest(true)} openPlanningMapping={setPlanningMapping} openPlanningPolicy={setPlanningPolicy} openInventoryConfirmation={setInventoryConfirmationRow} selectedDemandIds={selectedDemandIds} toggleDemand={togglePurchaseDemand} openMapping={setMappingDemand} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} openPurchaseOrder={(request) => { setError(''); setPurchaseOrderEditor({ request }); }} openOrderDraft={(order) => { setError(''); setPurchaseOrderEditor({ order }); }} openAssignment={openPurchaseAssignment} openReceipt={openPurchaseReceipt} openReceiptCorrection={(receipt) => { void openReceiptCorrection(receipt); }} can={can} busy={purchaseBusy} runAction={runPurchaseRequestAction} runOrderAction={runPurchaseOrderAction} query={query} />}
+            {active === 'sources' && canOpenImports && <OpeningData query={query} setQuery={setQuery} workflow={openingWorkflow}
+              onStockSetup={() => switchModule('purchase')} onStockChanged={() => { void loadData(); }} />}
+            {active === 'team' && can('members:manage') && <TeamPermissions members={managedMembers} currentUser={payload.user}
+              query={query} busy={memberRoleBusy} error={memberRoleError} refresh={reloadManagedMembers} onChange={updateMemberRole} />}
+            {active === 'warehouse' && <ErpWarehouse<ReceivableOrder, PurchaseReceipt> initialTab={warehouseStart} workspace={purchasePayload ?? warehouseWorkspace} inventory={payload.inventory} query={query}
+              canReceive={can('inventory:receive')} canRequireQuality={can('purchase:order:issue')} canManage={can('warehouse:manage')}
+              canShip={canManageWarehouseFulfillment(payload.user.permissions, payload.user.channelScope)} busy={purchaseBusy || actionBusy}
+              canReadMovements={canReadInventoryMovements(payload.user.permissions, payload.user.channelScope)}
+              onCreateWarehouse={() => setShowWarehouse(true)} onReceive={openPurchaseReceipt} onCorrect={openReceiptCorrection}
+              onShip={(order) => runAction(order, 'ship')} onRefresh={loadData}
+              onOpenLogistics={hasModuleAccess('logistics', user) ? openingWorkflow.onOpenLogistics : undefined} />}
+            {active === 'logistics' && <Suspense fallback={<LoadingState message="正在加载物流管理…" />}>
+              <ErpLogistics query={query} canShip={canManageWarehouseFulfillment(payload.user.permissions, payload.user.channelScope)} canReadPlatform={can('connectors:read')} canReadInbound={false}
+                onOpenOrder={hasModuleAccess('orders', user) ? openingWorkflow.onOpenOrder : undefined} />
+            </Suspense>}
+            {active === 'finance' && <Suspense fallback={<LoadingState message="正在加载财务管理…" />}>
+              <FinanceWorkspace canReadLedger={can('finance:read')} canWriteLedger={can('finance:write')}
+                canRequest={can('purchase:order:create')} canReview={can('finance:review')} />
+            </Suspense>}
+            {active === 'reports' && <Suspense fallback={<LoadingState message="正在加载数据报表…" />}><ErpReports /></Suspense>}
           </>
         ) : <LoadingState message={error || '暂时无法加载业务数据'} />}
       </section>
@@ -1623,12 +1928,32 @@ export default function ErpClient() {
       {planningPolicy && purchasePayload && <PlanningPolicyModal row={planningPolicy} suppliers={purchasePayload.suppliers} busy={purchaseBusy.startsWith('planning-policy:')} error={error} onClose={() => { if (!purchaseBusy) { setPlanningPolicy(null); setError(''); } }} onSubmit={submitPlanningPolicy} />}
       {inventoryConfirmationRow && <InventoryConfirmationModal row={inventoryConfirmationRow} busy={purchaseBusy.startsWith('planning-inventory:')} error={error} onClose={() => { if (!purchaseBusy) { setInventoryConfirmationRow(null); setError(''); } }} onSubmit={submitInventoryConfirmation} />}
       {showPlanningRequest && purchasePlanning && purchasePayload && <PlanningRequestModal rows={purchasePlanning.rows.filter((row) => selectedPlanRowIds.has(row.planRowId))} members={purchasePayload.members} currentMemberId={purchasePayload.currentMemberId} developmentOpenAccess={purchasePayload.developmentOpenAccess} busy={purchaseBusy === 'create-planning-request'} error={error} onClose={() => { if (!purchaseBusy) { setShowPlanningRequest(false); setError(''); } }} onSubmit={submitPlanningRequest} />}
+      {showManualRequest && purchasePayload && <ManualPurchaseRequestModal
+        skuOptions={manualSkuOptions}
+        newSku={newManualSku}
+        members={purchasePayload.members}
+        currentMemberId={purchasePayload.currentMemberId}
+        canSubmitRequest={can('purchase:submit')}
+        developmentOpenAccess={purchasePayload.developmentOpenAccess}
+        busy={Boolean(purchaseBusy)}
+        error={entryError}
+        suspended={skuEntry?.origin === 'manual-request'}
+        onCreateSku={can('purchase:mapping') ? (code) => openSkuEntry('manual-request', code) : undefined}
+        onEditSku={can('purchase:mapping') ? (sku) => openSkuEntry('manual-request', sku.code, sku) : undefined}
+        onClose={() => { if (!purchaseBusy) { setShowManualRequest(false); setEntryError(''); } }}
+        onSubmit={submitManualRequest}
+      />}
+      {skuEntry && <PurchaseSkuModal preferredCode={skuEntry.code} sku={skuEntry.sku} busy={Boolean(purchaseBusy)} error={entryError} onClose={closeSkuEntry} onSubmit={submitPurchaseSku} />}
+      {showSkuImport && <ErpSkuImport onClose={() => setShowSkuImport(false)} onImported={async () => {
+        setCreatedSkuOptions([]);
+        setSkuCatalogVersion((current) => current + 1);
+        await loadData();
+      }} />}
       {showPurchaseRequest && purchasePayload && <PurchaseRequestModal demands={purchasePayload.demands.filter((demand) => selectedDemandIds.has(demand.id))} members={purchasePayload.members} currentMemberId={purchasePayload.currentMemberId} developmentOpenAccess={purchasePayload.developmentOpenAccess} busy={purchaseBusy === 'create-request'} error={error} onClose={() => { if (!purchaseBusy) { setShowPurchaseRequest(false); setError(''); } }} onSubmit={submitPurchaseRequest} />}
       {showSupplier && <SupplierModal busy={purchaseBusy === 'create-supplier'} error={error} onClose={() => { if (!purchaseBusy) { setShowSupplier(false); setError(''); } }} onSubmit={submitSupplier} />}
       {showWarehouse && <WarehouseModal busy={purchaseBusy === 'create-warehouse'} error={error} onClose={() => { if (!purchaseBusy) { setShowWarehouse(false); setError(''); } }} onSubmit={submitWarehouse} />}
-      {showMemberRoles && <MemberRolesModal members={managedMembers} currentUserEmail={payload?.user.email ?? ''} busy={memberRoleBusy} error={memberRoleError} onRetry={() => { void openMemberRoles(); }} onChange={(member, role) => { void updateMemberRole(member, role); }} onClose={() => { if (!memberRoleBusy) { setShowMemberRoles(false); setMemberRoleError(''); } }} />}
       {assignmentRequest && purchasePayload && <PurchaseAssignmentModal request={assignmentRequest} members={purchasePayload.members} developmentOpenAccess={purchasePayload.developmentOpenAccess} busy={purchaseBusy === `reassign:${assignmentRequest.id}`} error={error} onClose={() => { if (!purchaseBusy) { setAssignmentRequest(null); setAssignmentIdempotencyKey(''); setError(''); } }} onSubmit={submitPurchaseAssignment} />}
-      {purchaseOrderRequest && purchasePayload && <PurchaseOrderModal request={purchaseOrderRequest} suppliers={purchasePayload.suppliers} warehouses={purchasePayload.warehouses} busy={purchaseBusy.startsWith('create-order:')} error={error} openSupplier={() => setShowSupplier(true)} openWarehouse={() => setShowWarehouse(true)} onClose={() => { if (!purchaseBusy) { setPurchaseOrderRequest(null); setError(''); } }} onSubmit={submitPurchaseOrder} />}
+      {purchaseOrderEditor && purchasePayload && <PurchaseOrderModal key={purchaseOrderEditor.order?.id ?? purchaseOrderEditor.request?.id} editor={purchaseOrderEditor} suppliers={purchasePayload.suppliers} warehouses={purchasePayload.warehouses} canIssue={can('purchase:order:issue')} busy={purchaseBusy.startsWith('save-order:')} error={error} openSupplier={can('purchase:supplier:create') ? () => setShowSupplier(true) : undefined} openWarehouse={can('warehouse:manage') ? () => setShowWarehouse(true) : undefined} onClose={() => { if (!purchaseBusy) { setPurchaseOrderEditor(null); setError(''); } }} onSubmit={submitPurchaseOrder} />}
       {receivingOrder && <PurchaseReceiptModal order={receivingOrder} busy={purchaseBusy.startsWith('receive:')} error={error} onClose={() => { if (!purchaseBusy) { setReceivingOrder(null); setPurchaseReceiptIdempotencyKey(''); setError(''); } }} onSubmit={submitPurchaseReceipt} />}
       {correctingReceipt && <PurchaseReceiptCorrectionModal key={correctingReceipt.id} receipt={correctingReceipt} corrections={receiptCorrections} historyReady={receiptCorrectionsLoaded} loading={purchaseBusy === `load-corrections:${correctingReceipt.id}`} busy={purchaseBusy === `correct-receipt:${correctingReceipt.id}`} error={receiptCorrectionError} onRetry={() => { void openReceiptCorrection(correctingReceipt); }} onClose={() => { if (!purchaseBusy) { setCorrectingReceipt(null); setReceiptCorrections([]); setReceiptCorrectionsLoaded(false); setReceiptCorrectionIdempotencyKey(''); setReceiptCorrectionError(''); } }} onSubmit={submitReceiptCorrection} />}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
@@ -1636,53 +1961,113 @@ export default function ErpClient() {
   );
 }
 
-function Dashboard({ payload, openOrder, go }: { payload: ErpPayload; openOrder: () => void; go: (key: ModuleKey) => void }) {
-  const inventoryReady = payload.inventory.length > 0;
-  const hasBusinessData = payload.platformOrders.length > 0 || payload.orders.length > 0 || inventoryReady;
-  const metrics = [
-    ['平台订单', String(payload.summary.totalPlatformOrders), '官方 API 原始事实', 'green'],
-    ['待审核', String(payload.summary.pendingReview), '需审核后预占库存', 'orange'],
-    ['待发货', String(payload.summary.readyToShip), '库存已锁定', 'blue'],
-    ['低库存 SKU', String(payload.summary.lowStock), '可售量 ≤ 10', 'red'],
-  ];
-  return <div className="content"><div className="page-head"><div><p>{new Intl.DateTimeFormat('zh-CN', { dateStyle: 'full' }).format(new Date())}</p><h1>早上好，{payload.user.displayName}</h1><span>系统只展示已接入数据库的业务记录，不生成或补齐样例数据。</span></div>{payload.user.permissions.includes('orders:create') && <button className="primary-button" onClick={openOrder} disabled={!inventoryReady} title={inventoryReady ? '新建订单' : '请先接入真实 SKU、仓库和库存'}><span>＋</span> 新建订单</button>}</div>
-    {!hasBusinessData && <DataSourceNotice />}
-    <section className="metrics" aria-label="核心业务指标">{metrics.map((metric) => <article className="metric-card" key={metric[0]}><div className={`metric-symbol ${metric[3]}`}>{metric[0].slice(0,1)}</div><p>{metric[0]}</p><h2>{metric[1]}</h2><span className={metric[3] === 'red' ? 'negative' : ''}>{metric[2]}</span></article>)}</section>
-    <div className="dashboard-grid"><article className="card workflow-card"><div className="card-head"><div><h3>平台订单接入链路</h3><p>官方 API 只读同步，原始事实与运营动作分层</p></div><button className="link-button" onClick={() => go('platform')}>进入平台订单 →</button></div><div className="workflow-line"><div className="flow-step active"><b>01</b><span><strong>官方 API</strong><small>只读获取</small></span></div><i>→</i><div className="flow-step"><b>02</b><span><strong>分页增量</strong><small>重叠回扫</small></span></div><i>→</i><div className="flow-step"><b>03</b><span><strong>事实入库</strong><small>幂等更新</small></span></div><i>→</i><div className="flow-step"><b>04</b><span><strong>业务投影</strong><small>另行审核</small></span></div></div><div className="guardrails"><span>店铺身份核验</span><span>只读权限</span><span>断点续跑</span><span>原币保存</span><span>无物理删除</span></div></article>
-      <article className="card audit-card"><div className="card-head"><div><h3>最近审计</h3><p>创建、审核、发货与取消均自动留痕</p></div><span className="audit-lock">追加写</span></div><div className="audit-list">{payload.audit.slice(0, 4).map((item, index) => <div className="audit-item" key={`${item.entity_id}-${item.created_at}-${index}`}><span className="audit-dot" /><div><strong>{actionLabel[item.action] ?? item.action}</strong><small>{item.actor_email} · {formatTime(item.created_at)}</small></div></div>)}{!payload.audit.length && <p className="empty-note">{payload.user.permissions.includes('audit:read') ? '暂无业务操作记录' : '当前账号无审计查看权限'}</p>}</div></article></div>
-    <article className="card orders-card"><div className="card-head"><div><h3>最新系统订单</h3><p>仅显示数据库中已接入的真实订单</p></div><button className="link-button" onClick={() => go('orders')}>查看全部 →</button></div><OrderTable orders={payload.orders.slice(0, 4)} compact /></article>
-  </div>;
-}
-
-function PlatformOrdersView({ orders, summary, status, canSync, syncBusy, runSync }: {
-  orders: PlatformOrder[];
-  summary: ErpPayload['summary'];
-  status: ShopifyStatus | null;
-  canSync: boolean;
-  syncBusy: string;
-  runSync: (store: ShopifyStatus['stores'][number]) => void;
+function FinanceWorkspace({ canReadLedger, canWriteLedger, canRequest, canReview }: {
+  canReadLedger: boolean; canWriteLedger: boolean; canRequest: boolean; canReview: boolean;
 }) {
-  const stats = [
-    ['已入库订单', String(summary.totalPlatformOrders), '平台原始订单事实'],
-    ['Pending', String(summary.platformPending), '原状态保留'],
-    ['已取消', String(summary.platformCancelled), '不提前剔除'],
-    ['含退款', String(summary.platformRefunded), '退款对象独立保存'],
-  ];
-  return <div className="content module-content"><div className="module-head"><div><p>多店铺接入 / Shopify 第一阶段</p><h1>平台订单</h1><span>订单、订单行、退款交易、履约与追踪均从官方 API 只读同步；不会自动改平台或扣 ERP 库存。</span></div><div className="ledger-chip">Admin GraphQL {status?.apiVersion ?? '2026-07'} · 只读</div></div><StatCards stats={stats} />
-    <section className="connector-grid">{status?.stores.map((store) => <article className="card connector-card" key={store.key}><div className="connector-card-head"><div><p>SHOPIFY</p><h3>{store.displayName}</h3><small>{store.verifiedDomain ?? store.expectedDomain}</small></div><span className={store.identityVerified ? 'connector-state ready' : store.credentialsConfigured ? 'connector-state pending' : 'connector-state'}>{store.identityVerified ? '身份已核验' : store.authorizationVerified ? '已授权待同步' : store.appConfigured && store.encryptionReady ? '待授权' : store.appConfigured ? '密钥待配置' : '应用待配置'}</span></div><dl><div><dt>同步水位</dt><dd>{store.completedWatermark ? formatTime(store.completedWatermark) : '尚未建立'}</dd></div><div><dt>运行状态</dt><dd>{store.syncStatus === 'idle' ? '正常' : store.syncStatus === 'failed' ? `失败：${store.lastErrorCode ?? '待重试'}` : store.syncStatus === 'running' ? '同步中' : '未开始'}</dd></div></dl>{canSync && store.credentialsConfigured && <button className="primary-button connector-sync" disabled={Boolean(syncBusy)} onClick={() => runSync(store)}>{syncBusy === store.key ? '只读同步中…' : store.completedWatermark ? '运行增量同步' : '回补最近 7 天'}</button>}{canSync && !store.credentialsConfigured && store.authorizationStartUrl && <a className="primary-button connector-sync" href={store.authorizationStartUrl}>授权只读订单</a>}{canSync && !store.credentialsConfigured && !store.authorizationStartUrl && <button className="primary-button connector-sync" disabled>{store.appConfigured && !store.encryptionReady ? '加密密钥待配置' : store.appConfigured ? '等待授权配置' : '应用参数待配置'}</button>}</article>)}{!status && <article className="card connector-card"><p>正在读取连接器状态…</p></article>}</section>
-    <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active">全部平台订单</button></div><span>当前显示最近 {orders.length} 条</span></div><div className="table-wrap module-table"><table><thead><tr><th>平台订单</th><th>店铺</th><th>原始状态</th><th>订单行</th><th>退款 / 履约</th><th>原币当前金额</th><th>更新时间</th></tr></thead><tbody>{orders.length ? orders.map((order) => <tr key={order.id}><td><strong>{order.sourceOrderName ?? order.sourceOrderId}</strong><small className="cell-sub">{order.test ? '测试单 · ' : ''}{order.sourceCancelledAt ? '已取消' : '原始保留'}</small></td><td>{order.storeName}<small className="cell-sub">{order.platform}</small></td><td>{order.financialStatus ?? '未知'}<small className="cell-sub">{order.fulfillmentStatus ?? '履约未知'}</small></td><td>{order.lineCount}</td><td>{order.refundCount} / {order.fulfillmentCount}</td><td>{formatExactMoney(order.currentTotalAmount, order.currency)}</td><td>{formatTime(order.sourceUpdatedAt)}</td></tr>) : <tr><td className="empty-cell" colSpan={7}>尚未取得 ERP 独立店铺授权；连接器、数据模型和幂等入库已准备好，不会用模拟订单填充。</td></tr>}</tbody></table></div></article>
+  const [tab, setTab] = useState<'ledger' | 'requests'>(canReadLedger && canRequest ? 'ledger' : 'requests');
+  if (!canReadLedger && !canRequest) return <ErpFinance canRead={false} />;
+  return <>
+    <nav className="content finance-module-tabs" aria-label="财务业务">
+      <button type="button" aria-pressed={tab === 'requests'}
+        onClick={() => setTab('requests')}>采购请款</button>
+      {canReadLedger && <button type="button" aria-pressed={tab === 'ledger'}
+        onClick={() => setTab('ledger')}>发票与实付</button>}
+    </nav>
+    {tab === 'ledger' && canReadLedger ? <ErpFinance canRead canWrite={canWriteLedger} /> : <div className="content module-content">
+      <ErpPurchasePaymentRequests canRead={canReadLedger || canRequest} canRequest={canRequest} canReview={canReview} />
+    </div>}
+  </>;
+}
+
+const orderFilters = ['all', 'pending_review', 'reserved', 'shipped', 'cancelled'] as const;
+type OrderFilter = (typeof orderFilters)[number];
+type OrderListResponse = { ok: true; orders: ErpOrder[]; total: number; pageSize: number };
+
+function OrdersView({ initialFilter, query, refreshAfter, summary, inventoryReady, can, busy, openOrder, runAction, openOutbound }: {
+  initialFilter: OrderFilter; query: string; refreshAfter: ErpOrder[]; summary: ErpPayload['summary']; inventoryReady: boolean;
+  can: (permission: Permission) => boolean; busy: string; openOrder: () => void;
+  runAction: (order: ErpOrder, action: OrderAction) => void; openOutbound: (order: ErpOrder) => void;
+}) {
+  const [filter, setFilter] = useState<OrderFilter>(initialFilter);
+  const [cursor, setCursor] = useState({ key: '', page: 1 });
+  const [request, setRequest] = useState(0);
+  const [result, setResult] = useState<{ key: string; data?: OrderListResponse; error?: string }>();
+  const q = query.trim().slice(0, 100);
+  const filterKey = JSON.stringify([q, filter]);
+  const page = cursor.key === filterKey ? cursor.page : 1;
+  const key = JSON.stringify([filterKey, page, request]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      try {
+        const search = new URLSearchParams({ q, status: filter, page: String(page) });
+        const response = await fetch(`/api/orders?${search}`, { cache: 'no-store', signal: controller.signal });
+        const body = await response.json() as OrderListResponse & { message?: string };
+        if (!response.ok || body.ok !== true || !Array.isArray(body.orders)) throw new Error(body.message ?? '读取订单失败');
+        if (controller.signal.aborted) return;
+        const lastPage = Math.max(1, Math.ceil(body.total / body.pageSize));
+        if (page > lastPage) {
+          setCursor({ key: filterKey, page: lastPage });
+          return;
+        }
+        setResult({ key, data: body });
+      } catch (cause) {
+        if (!controller.signal.aborted) setResult({ key, error: cause instanceof Error ? cause.message : '读取订单失败' });
+      }
+    }, 150);
+    return () => { controller.abort(); window.clearTimeout(timer); };
+  }, [q, filter, page, key, filterKey, refreshAfter]);
+
+  const current = result?.key === key ? result : undefined;
+  const list = current?.data;
+  const pageCount = list ? Math.max(1, Math.ceil(list.total / list.pageSize)) : 1;
+  const stats = [['全部订单', summary.totalOrders], ['待审核', summary.pendingReview],
+    ['待发货', summary.readyToShip], ['已发货', summary.shipped]] as const;
+  return <div className="content module-content order-workspace">
+    <div className="module-head"><h1>订单管理</h1>
+      {can('orders:create') && <button type="button" className="primary-button" onClick={openOrder} disabled={!inventoryReady}
+        title={inventoryReady ? '新建订单' : '请先建立商品、仓库和库存'}>新建订单</button>}
+    </div>
+    {!inventoryReady && <DataSourceNotice compact />}
+    <dl className="order-summary" aria-label="订单概况">{stats.map(([label, value]) => <div key={label}>
+      <dt>{label}</dt><dd>{value}</dd>
+    </div>)}</dl>
+    <article className="card data-card">
+      <div className="data-toolbar order-toolbar"><div role="group" aria-label="按订单状态筛选">
+        {orderFilters.map((status) => <button type="button" key={status} className={filter === status ? 'tab-active' : undefined} aria-pressed={filter === status}
+          onClick={() => { setFilter(status); setCursor({ key: '', page: 1 }); }}>{status === 'all' ? '全部' : statusLabel[status]}</button>)}
+      </div><span>{list ? `${list.total} 条订单` : !current ? '正在读取…' : ''}</span></div>
+      {current?.error && <div className="inline-alert" role="alert"><p>{current.error}</p><button type="button" onClick={() => setRequest(request + 1)}>重试</button></div>}
+      <OrderTable orders={list?.orders ?? []} emptyMessage={current?.error ? '订单读取失败' : !current ? '正在读取订单…' : q || filter !== 'all' ? '没有符合筛选条件的订单' : '数据库中暂无订单'}
+        can={can} busy={busy} runAction={runAction} openOutbound={openOutbound} />
+      {list && pageCount > 1 && <div className="pagination"><span>第 {page} / {pageCount} 页</span><div>
+        <button type="button" aria-label="上一页" disabled={page <= 1} onClick={() => setCursor({ key: filterKey, page: page - 1 })}>‹</button>
+        <button type="button" aria-label="下一页" disabled={page >= pageCount} onClick={() => setCursor({ key: filterKey, page: page + 1 })}>›</button>
+      </div></div>}
+    </article>
   </div>;
 }
 
-function OrdersView({ orders, summary, inventoryReady, hasQuery, can, busy, openOrder, runAction }: { orders: ErpOrder[]; summary: ErpPayload['summary']; inventoryReady: boolean; hasQuery: boolean; can: (permission: Permission) => boolean; busy: string; openOrder: () => void; runAction: (order: ErpOrder, action: OrderAction) => void }) {
-  const stats = [['全部订单', String(summary.totalOrders), '持久化记录'],['待审核', String(summary.pendingReview), '审核后锁定库存'],['待发货', String(summary.readyToShip), '已完成库存预占'],['已发货', String(summary.shipped), '已写出库流水']];
-  return <div className="content module-content"><div className="module-head"><div><p>可信业务闭环 / 订单</p><h1>订单管理</h1><span>创建、审核、预占、发货、取消均由服务端状态机控制</span></div>{can('orders:create') && <button className="primary-button" onClick={openOrder} disabled={!inventoryReady} title={inventoryReady ? '新建订单' : '请先接入真实 SKU、仓库和库存'}><span>＋</span> 新建订单</button>}</div>{!inventoryReady && <DataSourceNotice compact />}<StatCards stats={stats} />
-    <article className="card data-card"><div className="data-toolbar"><div><button className="tab-active">全部</button><button>待审核</button><button>待发货</button><button>已完成</button></div><span>共 {orders.length} 条当前权限范围记录</span></div><OrderTable orders={orders} emptyMessage={hasQuery ? '没有符合当前搜索条件的订单' : '数据库中暂无订单；系统不会自动填充样例记录'} can={can} busy={busy} runAction={runAction} /><div className="pagination"><span>数据刷新后仍会保留</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div></article>
-  </div>;
-}
-
-function OrderTable({ orders, compact = false, emptyMessage = '数据库中暂无订单', can, busy = '', runAction }: { orders: ErpOrder[]; compact?: boolean; emptyMessage?: string; can?: (permission: Permission) => boolean; busy?: string; runAction?: (order: ErpOrder, action: OrderAction) => void }) {
-  return <div className="table-wrap module-table"><table><thead><tr><th>订单号</th><th>渠道 / 目的地</th><th>商品</th><th>仓库</th><th>数量</th><th>原币金额</th><th>状态</th>{!compact && <th>受控操作</th>}</tr></thead><tbody>{orders.length ? orders.map((order) => <tr key={order.id}><td><strong>{order.orderNo}</strong><small className="cell-sub">{order.customerName}</small></td><td>{order.channel}<small className="cell-sub">{order.destination}</small></td><td>{order.skuCode}<small className="cell-sub">{order.skuName}</small></td><td>{order.warehouseName}</td><td>{order.quantity}</td><td>{formatMoney(order.amountMinor, order.currency)}</td><td><Status status={order.status} /></td>{!compact && <td><div className="row-actions">{order.status === 'pending_review' && can?.('orders:approve') && <button disabled={Boolean(busy)} onClick={() => runAction?.(order, 'approve')}>{busy === `${order.id}:approve` ? '处理中…' : '审核预占'}</button>}{order.status === 'reserved' && can?.('orders:ship') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction?.(order, 'ship')}>{busy === `${order.id}:ship` ? '处理中…' : '确认发货'}</button>}{['pending_review','reserved'].includes(order.status) && can?.('orders:cancel') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction?.(order, 'cancel')}>取消</button>}{['shipped','cancelled'].includes(order.status) && <span className="terminal-label">终态已锁定</span>}</div></td>}</tr>) : <tr><td className="empty-cell" colSpan={compact ? 7 : 8}>{emptyMessage}</td></tr>}</tbody></table></div>;
+function OrderTable({ orders, compact = false, emptyMessage = '暂无订单', can, busy = '', runAction, openOutbound }: {
+  orders: ErpOrder[]; compact?: boolean; emptyMessage?: string; can?: (permission: Permission) => boolean; busy?: string;
+  runAction?: (order: ErpOrder, action: OrderAction) => void; openOutbound?: (order: ErpOrder) => void;
+}) {
+  return <div className="table-wrap module-table order-table" role="region" aria-label={compact ? '近期订单' : '订单列表'} tabIndex={0}><table>
+    <thead><tr><th>订单号</th><th>渠道 / 目的地</th><th>商品</th><th>仓库</th><th className="order-number">数量</th><th className="order-number">原币金额</th><th>状态</th>{!compact && <th>操作</th>}</tr></thead>
+    <tbody>{orders.length ? orders.map((order) => <tr key={order.id}>
+      <td><strong>{order.orderNo}</strong><small className="cell-sub">{order.customerName}</small>
+        {order.sourceOrder && <small className="cell-sub">平台单 {order.sourceOrder.orderNo} · {order.sourceOrder.storeKey}</small>}</td>
+      <td>{order.channel}<small className="cell-sub">{order.destination}</small></td>
+      <td>{order.skuCode}<small className="cell-sub">{order.skuName}</small></td>
+      <td>{order.warehouseName}</td><td className="order-number">{order.quantity}</td><td className="order-number">{formatMoney(order.amountMinor, order.currency)}</td><td><Status status={order.status} /></td>
+      {!compact && <td><div className="row-actions">
+        {order.status === 'pending_review' && can?.('orders:approve') && <button type="button" disabled={Boolean(busy)} onClick={() => runAction?.(order, 'approve')}>{busy === `${order.id}:approve` ? '处理中…' : '审核预占'}</button>}
+        {order.status === 'reserved' && can?.('orders:ship') && <button type="button" className="action-primary" disabled={Boolean(busy)} onClick={() => openOutbound?.(order)}>去出库作业</button>}
+        {(order.status === 'pending_review' || order.status === 'reserved') && can?.('orders:cancel') && <button type="button" className="action-muted" disabled={Boolean(busy)} onClick={() => runAction?.(order, 'cancel')}>取消</button>}
+      </div></td>}
+    </tr>) : <tr><td className="empty-cell" colSpan={compact ? 7 : 8}>{emptyMessage}</td></tr>}</tbody>
+  </table></div>;
 }
 
 function InventoryView({ inventory, summary, hasInventoryData, hasQuery, source, setSource, mukuStatus, mukuRuns, mukuInventory, mukuRisk, mukuInventoryRows, mukuRiskRows, mukuPage, setMukuPage, mukuFilters, applyMukuFilters, mukuBusy, mukuError, canRead, canSync, testConnection, syncReadOnly }: {
@@ -1744,7 +2129,7 @@ function InventoryView({ inventory, summary, hasInventoryData, hasQuery, source,
     <article className="card data-card">
       <div className="data-toolbar inventory-source-toolbar"><div><button className={source === 'erp' ? 'tab-active' : ''} onClick={() => setSource('erp')}>ERP 库存账本</button>{canRead && <button className={source === 'muku' ? 'tab-active' : ''} onClick={() => setSource('muku')}>MUKU 只读库存</button>}{canRead && <button className={source === 'risk' ? 'tab-active' : ''} onClick={() => setSource('risk')}>库存风险</button>}</div><span>{source === 'erp' ? '可售量 = 现存 − 预占' : '顶部搜索筛选当前页；下方条件查询整个只读快照'}</span></div>
       {external && <form className="muku-filter-bar" onSubmit={(event) => { event.preventDefault(); applyMukuFilters(filterDraft); }}><label><span>SKU 精确查询</span><input value={filterDraft.sku} onChange={(event) => setFilterDraft((current) => ({ ...current, sku: event.target.value }))} placeholder="输入 SKU，可留空" /></label>{source === 'muku' && <label><span>仓库查询</span><input value={filterDraft.warehouse} onChange={(event) => setFilterDraft((current) => ({ ...current, warehouse: event.target.value }))} placeholder="仓库编码或完整名称" /></label>}<div><button className="secondary-button" type="button" disabled={Boolean(mukuBusy) || (!mukuFilters.sku && !mukuFilters.warehouse)} onClick={() => { const empty = { sku: '', warehouse: '' }; setFilterDraft(empty); applyMukuFilters(empty); }}>清除</button><button className="primary-button" type="submit" disabled={Boolean(mukuBusy)}>查询快照</button></div></form>}
-      {source === 'erp' && <><div className="table-wrap module-table"><table><thead><tr><th>SKU</th><th>商品名称</th><th>仓库</th><th>现存</th><th>预占</th><th>可售</th><th>库存状态</th><th>版本</th></tr></thead><tbody>{inventory.length ? inventory.map((item) => <tr key={item.id}><td><strong>{item.skuCode}</strong></td><td>{item.skuName}</td><td>{item.warehouseName}</td><td>{item.onHandQty}</td><td>{item.reservedQty}</td><td><strong>{item.availableQty}</strong></td><td><InventoryStatus available={item.availableQty} /></td><td>v{item.version}</td></tr>) : <tr><td className="empty-cell" colSpan={8}>{hasQuery ? '没有符合当前搜索条件的库存记录' : '尚未接入真实 SKU、仓库和库存记录'}</td></tr>}</tbody></table></div><div className="pagination"><span>订单审核、取消和发货后自动更新</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div></>}
+      {source === 'erp' && <><div className="table-wrap module-table"><table><thead><tr><th>SKU</th><th>商品名称</th><th>仓库</th><th>现存</th><th>预占</th><th>可售</th><th>库存状态</th><th>版本</th></tr></thead><tbody>{inventory.length ? inventory.map((item) => <tr key={item.id}><td><strong>{item.skuCode}</strong></td><td>{item.skuName}</td><td>{item.warehouseName}</td><td>{item.onHandQty}</td><td>{item.reservedQty}</td><td><strong>{item.availableQty}</strong></td><td><InventoryStatus available={item.availableQty} /></td><td>v{item.version}</td></tr>) : <tr><td className="empty-cell" colSpan={8}>{hasQuery ? '没有符合当前搜索条件的库存记录' : '尚未接入真实 SKU、仓库和库存记录'}</td></tr>}</tbody></table></div><div className="pagination"><span>收货、盘点、订单审核、取消和发货后自动记账</span><span>{inventory.length} 条库存</span></div></>}
       {source === 'muku' && <><div className="table-wrap module-table muku-source-table"><table><thead><tr><th>SKU / 商品</th><th>仓库</th><th>可用</th><th>锁定</th><th>在手</th><th>在途</th><th>库龄</th><th>源更新时间</th></tr></thead><tbody>{inventoryLoading ? <tr><td className="empty-cell" colSpan={8}>正在读取 MUKU 只读库存快照…</td></tr> : mukuInventoryRows.length ? mukuInventoryRows.map((item) => <tr key={item.id}><td><strong>{formatNullableValue(item.sku)}</strong><small className="cell-sub">{item.productName ?? item.normalizedSku ?? '商品信息未知'}</small></td><td>{item.warehouseName ?? '未知'}<small className="cell-sub">{item.warehouseCode ?? '仓库编码未知'}</small></td><td><strong className={item.available === null ? 'null-value' : ''}>{formatNullableValue(item.available)}</strong></td><td className={item.locked === null ? 'null-value' : ''}>{formatNullableValue(item.locked)}</td><td className={item.onHand === null ? 'null-value' : ''}>{formatNullableValue(item.onHand)}</td><td className={item.inTransit === null ? 'null-value' : ''}>{formatNullableValue(item.inTransit)}</td><td className={item.ageDays === null ? 'null-value' : ''}>{formatNullableValue(item.ageDays, ' 天')}</td><td>{formatOptionalTime(item.sourceUpdatedAt)}<small className="cell-sub">ERP 获取：{formatOptionalTime(item.ingestedAt)}</small></td></tr>) : <tr><td className="empty-cell" colSpan={8}>{(hasQuery || hasMukuFilters) && mukuInventory ? '没有符合当前查询条件的外部库存' : '尚未取得 MUKU 库存快照；不会用模拟值填充'}</td></tr>}</tbody></table></div><MukuPaginationView pagination={pagination} currentPage={mukuPage} setPage={setMukuPage} busy={Boolean(mukuBusy)} fallbackText={mukuInventory?.stale ? '数据已过时，显示最后有效快照' : `源生成：${formatOptionalTime(mukuInventory?.generatedAt ?? null)}`} /></>}
       {source === 'risk' && <><div className="table-wrap module-table muku-source-table"><table><thead><tr><th>SKU</th><th>命中风险</th><th>可用 / 在手</th><th>30 天销量</th><th>最大库龄</th><th>源更新时间</th></tr></thead><tbody>{riskLoading ? <tr><td className="empty-cell" colSpan={6}>正在读取 MUKU 库存风险快照…</td></tr> : mukuRiskRows.length ? mukuRiskRows.map((item) => { const labels = mukuRiskLabels(item); return <tr key={item.id}><td><strong>{formatNullableValue(item.sku)}</strong><small className="cell-sub">{item.normalizedSku ?? '标准化 SKU 未知'}</small></td><td><div className="risk-tags">{labels.map((label) => <span className={label === '判定未知' ? 'risk-pill unknown' : label === '未命中已知规则' ? 'risk-pill clear' : 'risk-pill'} key={label}>{label}</span>)}</div></td><td>{formatNullableValue(item.available)} / {formatNullableValue(item.onHand)}<small className="cell-sub">锁定：{formatNullableValue(item.locked)}</small></td><td className={item.sales30d === null ? 'null-value' : ''}>{formatNullableValue(item.sales30d)}</td><td className={item.ageDays === null ? 'null-value' : ''}>{formatNullableValue(item.ageDays, ' 天')}</td><td>{formatOptionalTime(item.sourceUpdatedAt)}</td></tr>; }) : <tr><td className="empty-cell" colSpan={6}>{(hasQuery || hasMukuFilters) && mukuRisk ? '没有符合当前查询条件的风险记录' : '尚未取得 MUKU 风险快照；未知不会显示为无风险'}</td></tr>}</tbody></table></div><MukuPaginationView pagination={pagination} currentPage={mukuPage} setPage={setMukuPage} busy={Boolean(mukuBusy)} fallbackText={mukuRisk?.stale ? '数据已过时，显示最后有效快照' : `源生成：${formatOptionalTime(mukuRisk?.generatedAt ?? null)}`} /></>}
     </article>
@@ -1776,24 +2161,28 @@ function MukuPaginationView({ pagination, currentPage, setPage, busy, fallbackTe
   return <div className="pagination muku-pagination"><span>{fallbackText}</span><div><button aria-label="上一页" disabled={busy || page <= 1} onClick={() => setPage(Math.max(1, page - 1))}>‹</button><button className="current" disabled>{page} / {totalPages}</button><button aria-label="下一页" disabled={busy || !(pagination?.hasNext ?? false)} onClick={() => setPage(page + 1)}>›</button></div></div>;
 }
 
-function PurchaseWorkspaceView({ planning, planningRows, planningError, demands, requests, purchaseOrders, purchaseReceipts, workspace, tab, setTab, selectedPlanRowIds, togglePlanningRow, openPlanningRequest, openPlanningMapping, openPlanningPolicy, openInventoryConfirmation, selectedDemandIds, toggleDemand, openMapping, openSupplier, openWarehouse, openMemberRoles, openPurchaseOrder, openAssignment, openReceipt, openReceiptCorrection, can, busy, runAction, runOrderAction, hasQuery }: {
+function PurchaseWorkspaceView({ planning, planningRows, planningError, demands, requests, purchaseOrders, purchaseReceipts, workspace, isAdministrator, tab, setTab, requestFilter, setRequestFilter, orderFilter, setOrderFilter, openManualRequest, skuCatalogVersion, openSku, openSkuImport, selectedPlanRowIds, togglePlanningRow, openPlanningRequest, openPlanningMapping, openPlanningPolicy, openInventoryConfirmation, selectedDemandIds, toggleDemand, openMapping, openSupplier, openWarehouse, openPurchaseOrder, openOrderDraft, openAssignment, openReceipt, openReceiptCorrection, can, busy, runAction, runOrderAction, query }: {
   planning: PurchasePlanningPayload | null; planningRows: PurchasePlanningRow[]; planningError: string;
   demands: PurchaseDemand[]; requests: PurchaseRequest[]; purchaseOrders: PurchaseOrder[]; purchaseReceipts: PurchaseReceipt[];
-  workspace: PurchaseWorkspacePayload | null; tab: PurchaseTab; setTab: (tab: PurchaseTab) => void;
+  workspace: PurchaseWorkspacePayload | null; isAdministrator: boolean; tab: PurchaseTab; setTab: (tab: PurchaseTab) => void;
+  requestFilter: PurchaseRequestFilter; setRequestFilter: (filter: PurchaseRequestFilter) => void;
+  orderFilter: PurchaseOrderFilter; setOrderFilter: (filter: PurchaseOrderFilter) => void;
+  openManualRequest: () => void; skuCatalogVersion: number; openSku: (sku?: PurchaseSkuOption) => void; openSkuImport: () => void;
   selectedPlanRowIds: Set<string>; togglePlanningRow: (id: string) => void;
   openPlanningRequest: () => void; openPlanningMapping: (exception: MukuPlanningException) => void;
   openPlanningPolicy: (row: PurchasePlanningRow) => void;
   openInventoryConfirmation: (row: PurchasePlanningRow) => void;
   selectedDemandIds: Set<string>; toggleDemand: (id: string) => void;
   openMapping: (demand: PurchaseDemand) => void; openSupplier: () => void; openWarehouse: () => void;
-  openMemberRoles: () => void;
-  openPurchaseOrder: (request: PurchaseRequest) => void; openReceipt: (order: PurchaseOrder) => void;
+  openPurchaseOrder: (request: PurchaseRequest) => void; openOrderDraft: (order: PurchaseOrder) => void; openReceipt: (order: PurchaseOrder) => void;
   openAssignment: (request: PurchaseRequest) => void;
   openReceiptCorrection: (receipt: PurchaseReceipt) => void;
   can: (permission: Permission) => boolean; busy: string;
   runAction: (request: PurchaseRequest, action: PurchaseRequestAction) => void;
-  runOrderAction: (order: PurchaseOrder, action: 'issue' | 'cancel' | 'close') => void; hasQuery: boolean;
+  runOrderAction: (order: PurchaseOrder, action: 'issue' | 'cancel' | 'close') => void;
+  query: string;
 }) {
+  const hasQuery = Boolean(query.trim());
   const summary = workspace?.summary ?? emptyPurchaseSummary;
   const requestSummary = workspace?.requestSummary ?? emptyPurchaseRequestSummary;
   const procurementSummary = workspace?.procurementSummary ?? emptyProcurementSummary;
@@ -1801,6 +2190,7 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
   const allRequests = workspace?.requests ?? requests;
   const developmentOpenAccess = workspace?.developmentOpenAccess === true;
   const activeRequestIds = activePurchaseRequestIds(allOrders);
+  const draftOrdersByRequestId = new Map(allOrders.filter((order) => order.status === 'draft').map((order) => [order.purchaseRequestId, order]));
   const assignedPurchaseRequestIds = new Set(allRequests.filter((request) => (
     developmentOpenAccess || (
       request.buyer?.id ?? request.purchaser?.id ?? request.purchaserMemberId
@@ -1816,55 +2206,121 @@ function PurchaseWorkspaceView({ planning, planningRows, planningError, demands,
     request.buyer?.displayName ?? request.purchaser?.displayName ?? request.purchaserName ?? '采购负责人',
   ]));
   const requestsById = new Map(allRequests.map((request) => [request.id, request]));
-  const approvedRequests = requests.filter((request) => request.status === 'approved' && !activeRequestIds.has(request.id));
-  const activeOrders = purchaseOrders.filter((order) => ['draft', 'issued', 'partially_received'].includes(order.status));
+  const awaitsOrder = (request: PurchaseRequest) => request.status === 'approved'
+    && (!activeRequestIds.has(request.id) || draftOrdersByRequestId.has(request.id));
+  const activeOrders = purchaseOrders.filter((order) => (
+    ['draft', 'issued', 'partially_received'].includes(order.status)
+    && (orderFilter === 'all' || order.status === orderFilter || (orderFilter === 'awaiting_receipt' && order.status !== 'draft'))
+  ));
   const closedOrders = purchaseOrders.filter((order) => ['received', 'closed_short', 'cancelled'].includes(order.status));
   const historyRequests = requests.filter((request) => ['rejected', 'cancelled'].includes(request.status));
-  const pendingDemandCount = (workspace?.demands ?? demands).filter(
-    (demand) => demand.status === 'open' && demandAvailableQuantity(demand) > 0,
-  ).length;
   const availableQuantity = summary.availableQuantity ?? demands.filter((demand) => demand.status === 'open').reduce((sum, demand) => sum + demandAvailableQuantity(demand), 0);
+  const awaitingOrderCount = allRequests.filter(awaitsOrder).length;
+  const missingOrderSetup = workspace ? [
+    !workspace.suppliers.some((supplier) => supplier.active) && '供应商',
+    !workspace.warehouses.length && '收货仓',
+  ].filter(Boolean) : [];
   const stats = [
-    ['建议采购', planning ? formatOptionalQuantity(planning.summary.recommendedQty) : '未知', '订单需求 + 安全库存 - 有效覆盖'],
-    ['可转申请', planning ? String(planning.summary.convertibleOrderQty) : '未知', '仅转换已验证官方订单需求'],
-    ['待复审申请', String(requestSummary.pendingReview), '审批后才能正式下单'],
-    ['待到货数量', String(procurementSummary.pendingReceiptQuantity), '已下单未完成入库'],
+    { label: '待复审', count: requestSummary.pendingReview, unit: '单', active: tab === 'requests' && requestFilter === 'pending_review', open: () => { setRequestFilter('pending_review'); setTab('requests'); } },
+    { label: '已批准待下单', count: awaitingOrderCount, unit: '单', active: tab === 'requests' && requestFilter === 'approved', open: () => { setRequestFilter('approved'); setTab('requests'); } },
+    { label: '待到货', count: procurementSummary.pendingReceiptQuantity, unit: '件', active: tab === 'orders' && orderFilter === 'awaiting_receipt', open: () => { setOrderFilter('awaiting_receipt'); setTab('orders'); } },
+    { label: '累计入库', count: procurementSummary.receivedQuantity, unit: '件', active: tab === 'received', open: () => setTab('received') },
   ];
   const visibleDemands = tab === 'pending'
     ? demands.filter((demand) => demand.status === 'open' && demandAvailableQuantity(demand) > 0)
     : tab === 'mapping' ? demands.filter((demand) => demand.status === 'needs_mapping') : [];
-  const visibleRequests = requests.filter((request) => request.status === 'draft' || request.status === 'pending_review');
-  const tabs: Array<[PurchaseTab, string, number]> = [
-    ['planning', '今日采购建议', planning?.summary.buy ?? 0],
-    ['pending', '订单需求明细', pendingDemandCount],
-    ['mapping', 'SKU 映射', summary.needsMapping],
-    ['requests', '申请与复审', requestSummary.draft + requestSummary.pendingReview],
-    ['approved', '待转采购单', approvedRequests.length],
-    ['orders', '采购单 / 待到货', activeOrders.length],
-    ['received', '到货记录', purchaseReceipts.length],
-    ['history', '历史', historyRequests.length + closedOrders.length],
+  const visibleRequests = requests.filter((request) => (
+    (request.status === 'draft' || request.status === 'pending_review' || awaitsOrder(request))
+    && (requestFilter === 'all' || request.status === requestFilter)
+  ));
+  const tabs: Array<{ key: PurchaseTab; label: string; count?: number }> = [
+    { key: 'requests', label: '采购申请', count: visibleRequests.length },
+    { key: 'orders', label: '采购单', count: activeOrders.length },
+    { key: 'received', label: '到货记录', count: purchaseReceipts.length },
+    { key: 'planning', label: '采购建议', count: planning ? planningRows.length : undefined },
+    { key: 'pending', label: '订单需求', count: visibleDemands.length },
+    { key: 'sku-catalog', label: '商品档案' },
+    { key: 'mapping', label: 'SKU 映射', count: visibleDemands.length },
+    ...(can('purchase:order:create') ? [{ key: 'quotes' as const, label: '供应商报价' }] : []),
+    { key: 'history', label: '历史单据', count: historyRequests.length + closedOrders.length },
   ];
-  const toolbarText = tab === 'planning'
-    ? planning ? `建议 ${formatOptionalQuantity(planning.summary.recommendedQty)} 件 · 可转申请 ${planning.summary.convertibleOrderQty} 件` : '等待采购建议'
-    : tab === 'pending' ? `未分配订单需求 ${availableQuantity} 件（不等于应采购量）`
-    : tab === 'mapping' ? '映射后自动进入待处理'
-      : tab === 'orders' ? `待到货 ${procurementSummary.pendingReceiptQuantity} 件`
-        : tab === 'received' ? `累计入库 ${procurementSummary.receivedQuantity} 件`
-          : `供应商 ${procurementSummary.suppliers} 家`;
-  return <div className="content module-content"><div className="module-head"><div><p>订单需求 / 采购执行</p><h1>采购工作台</h1><span>已验证的官方订单形成采购需求，经过申请、复审、供应商下单和到货登记后更新 ERP 库存；不会向 Shopify 写入。</span></div><div className="purchase-head-actions"><div className="ledger-chip">需求防重复 · 入库有流水 · 历史不删除</div>{can('members:manage') && <button className="secondary-button team-button" onClick={openMemberRoles} disabled={Boolean(busy)}>团队角色</button>}{can('warehouse:manage') && <button className="secondary-button warehouse-button" onClick={openWarehouse} disabled={Boolean(busy)}><span>＋</span>仓库</button>}{can('purchase:supplier:create') && <button className="primary-button" onClick={openSupplier} disabled={Boolean(busy)}><span>＋</span>供应商</button>}</div></div><StatCards stats={stats} />
-    {planning?.storeCoverage && <div className={`planning-inline-warning purchase-scope-warning ${planning.storeCoverage.mode === 'full' ? 'ready' : ''}`}><strong>{planning.storeCoverage.mode === 'full' ? '店铺范围已全量覆盖' : '当前仅为 Shopify 店铺试点'}</strong> 已验证并纳入采购 {planning.storeCoverage.activeOfficialStoreCount}/{planning.storeCoverage.candidateStoreCount} 家：{planning.storeCoverage.activeStoreKeys.join('、') || '无'}。{planning.storeCoverage.missingCandidateStoreKeys.length > 0 && <> 未授权、未验证的店铺不在本次采购范围：{planning.storeCoverage.missingCandidateStoreKeys.join('、')}。</>}</div>}
-    {planning && !planning.orderSourceReadiness && <div className="planning-order-source-warning purchase-source-warning"><strong>官方订单源未就绪</strong><span>{formatOrderSourceWarning(planning)}</span></div>}
-    <article className="card data-card purchase-workspace-card"><div className="data-toolbar purchase-toolbar"><div>{tabs.map(([key, label, count]) => <button key={key} className={tab === key ? 'tab-active' : ''} onClick={() => setTab(key)}>{label}<b>{count}</b></button>)}</div><span>{toolbarText}</span></div>
+  const activeTab = tabs.find((section) => section.key === tab);
+  const hasStatusFilter = (tab === 'requests' && requestFilter !== 'all') || (tab === 'orders' && orderFilter !== 'all');
+
+  function clearStatusFilters() {
+    setRequestFilter('all');
+    setOrderFilter('all');
+  }
+
+  return <div className="content module-content procurement-workbench">
+    <header className="procurement-header">
+      <div className="procurement-title"><h1>采购管理</h1></div>
+      <div className="purchase-head-actions">
+        {(can('warehouse:manage') || can('purchase:supplier:create') || can('purchase:mapping')) &&
+          <details className="ops-purchase-setup"><summary className="secondary-button">基础资料</summary>
+            <div onClick={(event) => { if ((event.target as HTMLElement).closest('button')) event.currentTarget.parentElement?.removeAttribute('open'); }}>
+              {can('purchase:mapping') && <button type="button" onClick={() => openSku()} disabled={Boolean(busy)}>新增 SKU</button>}
+              {can('purchase:mapping') && <button type="button" onClick={openSkuImport} disabled={Boolean(busy)}>批量导入 SKU</button>}
+              {can('purchase:supplier:create') && <button type="button" onClick={openSupplier} disabled={Boolean(busy)}>新增供应商</button>}
+              {can('warehouse:manage') && <button type="button" onClick={openWarehouse} disabled={Boolean(busy)}>新增仓库</button>}
+            </div>
+          </details>}
+        {can('purchase:create') && <button type="button" className="primary-button" onClick={openManualRequest} disabled={!workspace || Boolean(busy)}>新建采购申请</button>}
+      </div>
+    </header>
+    <section className="procurement-metrics" aria-label="采购进度">
+      {stats.map(({ label, count, unit, active, open }) => <button type="button" key={label} className="procurement-metric" aria-pressed={active} onClick={open}>
+        <span>{label}</span>
+        <span className="procurement-metric-value"><strong>{workspace ? formatOptionalQuantity(count) : '—'}</strong><small>{unit}</small></span>
+      </button>)}
+    </section>
+    <article className="card data-card purchase-workspace-card">
+      <nav className="procurement-tabs" aria-label="采购模块">
+        {tabs.map(({ key, label }) => <button type="button" key={key} className={tab === key ? 'tab-active' : ''} aria-current={tab === key ? 'page' : undefined} onClick={() => {
+          clearStatusFilters();
+          setTab(key);
+        }}>{label}</button>)}
+      </nav>
+      <div className="procurement-table-toolbar">
+        <div className="procurement-list-heading">
+          <h2>{activeTab?.label}</h2>
+          {workspace && activeTab?.count !== undefined && <span className="procurement-result-count" aria-live="polite">{activeTab.count} 条</span>}
+        </div>
+        {tab === 'requests' && <div className="procurement-filters">
+          <label htmlFor="request-status-filter">申请状态</label>
+          <select id="request-status-filter" value={requestFilter} onChange={(event) => setRequestFilter(event.target.value as PurchaseRequestFilter)}>
+            <option value="all">全部状态</option><option value="draft">草稿</option><option value="pending_review">待复审</option>
+            <option value="approved">已批准待下单</option>
+          </select>
+          {hasStatusFilter && <button type="button" className="procurement-text-button" onClick={clearStatusFilters}>清除筛选</button>}
+        </div>}
+        {tab === 'orders' && <div className="procurement-filters">
+          <label htmlFor="order-status-filter">单据状态</label>
+          <select id="order-status-filter" value={orderFilter} onChange={(event) => setOrderFilter(event.target.value as PurchaseOrderFilter)}>
+            <option value="all">全部状态</option><option value="draft">待下单</option><option value="awaiting_receipt">待到货</option><option value="partially_received">部分到货</option>
+          </select>
+          {hasStatusFilter && <button type="button" className="procurement-text-button" onClick={clearStatusFilters}>清除筛选</button>}
+        </div>}
+      </div>
       {tab === 'planning' ? <PurchasePlanningView planning={planning} rows={planningRows} error={planningError} skuOptions={workspace?.skuOptions ?? []} selectedPlanRowIds={selectedPlanRowIds} toggleRow={togglePlanningRow} openRequest={openPlanningRequest} openMapping={openPlanningMapping} openPolicy={openPlanningPolicy} openInventoryConfirmation={openInventoryConfirmation} canCreate={can('purchase:create')} canMap={can('purchase:mapping')} busy={busy} hasQuery={hasQuery} />
+        : tab === 'sku-catalog' ? <ErpSkuCatalog canManage={can('purchase:mapping')} busy={Boolean(busy)} refreshVersion={skuCatalogVersion} onAdd={() => openSku()} onEdit={openSku} onImport={openSkuImport} />
+        : tab === 'quotes' ? <ErpSupplierQuotes suppliers={workspace?.suppliers ?? []} canRead={can('purchase:order:create')} canManage={can('purchase:supplier:create')} />
         : tab === 'pending' || tab === 'mapping' ? <>
-        {tab === 'pending' && <div className="planning-inline-warning"><strong>只读订单需求</strong> {DIRECT_PURCHASE_REQUEST_DISABLED_MESSAGE}。这里的“未分配”不等于应采购数量。</div>}
-        <PurchaseDemandTable demands={visibleDemands} selectable={false} selectedDemandIds={selectedDemandIds} toggleDemand={toggleDemand} openMapping={openMapping} canMap={can('purchase:mapping')} busy={busy} emptyMessage={hasQuery ? '没有符合当前搜索条件的需求' : tab === 'pending' ? '暂无未分配的订单需求；需要采购时请从“今日采购建议”生成申请' : '暂无待映射的真实订单行'} />
-      </> : tab === 'requests' ? <><div className="planning-inline-warning"><strong>{developmentOpenAccess ? '开发试运行模式' : '正式岗位分离'}</strong> {developmentOpenAccess ? '开发期允许当前登录账号继续任何已分配的采购流程，方便换 GPT 账号联调；每次操作仍记录实际账号。' : '采购负责人负责提交，指定复审人负责批准或驳回，且两者必须为不同成员。'}</div><PurchaseRequestTable requests={visibleRequests} currentMemberId={workspace?.currentMemberId ?? null} developmentOpenAccess={developmentOpenAccess} can={can} busy={busy} runAction={runAction} openAssignment={openAssignment} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购申请' : '暂无草稿或待复审申请；请从“今日采购建议”按最新库存结果生成'} /></>
-        : tab === 'approved' ? <PurchaseRequestTable requests={approvedRequests} currentMemberId={workspace?.currentMemberId ?? null} developmentOpenAccess={developmentOpenAccess} can={can} busy={busy} runAction={runAction} openPurchaseOrder={openPurchaseOrder} openAssignment={openAssignment} emptyMessage={hasQuery ? '没有符合当前搜索条件的已批准申请' : '暂无待转采购单；采购申请批准后会出现在这里'} />
-          : tab === 'orders' ? <PurchaseOrderTable orders={activeOrders} assignedPurchaseRequestIds={assignedPurchaseRequestIds} purchaserNamesByRequestId={purchaserNamesByRequestId} requestsById={requestsById} openAssignment={openAssignment} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage={hasQuery ? '没有符合当前搜索条件的采购单' : '暂无待下单或待到货采购单'} />
+        {tab === 'pending' && <div className="procurement-list-notice">
+          <span>未分配需求 {formatOptionalQuantity(availableQuantity)} 件，采购量以采购建议为准。</span>
+          <button type="button" className="procurement-text-button" onClick={() => setTab('planning')}>查看采购建议</button>
+        </div>}
+        <PurchaseDemandTable demands={visibleDemands} selectable={false} selectedDemandIds={selectedDemandIds} toggleDemand={toggleDemand} openMapping={openMapping} canMap={can('purchase:mapping')} busy={busy} emptyMessage={hasQuery ? '没有符合搜索条件的需求' : tab === 'pending' ? '暂无未分配的订单需求' : '暂无待映射的订单行'} />
+      </> : tab === 'requests' ? <>
+        {missingOrderSetup.length > 0 && <div className="procurement-list-notice">确认下单前请补齐{missingOrderSetup.join('、')}。</div>}
+        <PurchaseRequestTable requests={visibleRequests} currentMemberId={workspace?.currentMemberId ?? null}
+          developmentOpenAccess={developmentOpenAccess} isAdministrator={isAdministrator} can={can} busy={busy} runAction={runAction}
+          openPurchaseOrder={openPurchaseOrder} openAssignment={openAssignment} draftOrdersByRequestId={draftOrdersByRequestId} openOrderDraft={openOrderDraft}
+          emptyMessage={hasQuery || requestFilter !== 'all' ? '没有符合筛选条件的采购申请' : '暂无采购申请'} />
+      </>
+          : tab === 'orders' ? <PurchaseOrderTable orders={activeOrders} isAdministrator={isAdministrator} openOrderDraft={openOrderDraft} assignedPurchaseRequestIds={assignedPurchaseRequestIds} purchaserNamesByRequestId={purchaserNamesByRequestId} requestsById={requestsById} openAssignment={openAssignment} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage={hasQuery || orderFilter !== 'all' ? '没有符合筛选条件的采购单' : '暂无待下单或待到货的采购单'} />
             : tab === 'received' ? <PurchaseReceiptTable receipts={purchaseReceipts} canCorrect={can('inventory:receive')} busy={busy} openCorrection={openReceiptCorrection} emptyMessage={hasQuery ? '没有符合当前搜索条件的到货记录' : '暂无到货记录；确认采购单下单后可分批登记到货'} />
               : <div className="purchase-history-sections"><div><h3>已结束的申请</h3><PurchaseRequestTable requests={historyRequests} currentMemberId={workspace?.currentMemberId ?? null} developmentOpenAccess={developmentOpenAccess} can={can} busy={busy} runAction={runAction} emptyMessage="暂无驳回或取消的采购申请" /></div><div><h3>已结束的采购单</h3><PurchaseOrderTable orders={closedOrders} assignedPurchaseRequestIds={assignedPurchaseRequestIds} purchaserNamesByRequestId={purchaserNamesByRequestId} requestsById={requestsById} openAssignment={openAssignment} can={can} busy={busy} openReceipt={openReceipt} runAction={runOrderAction} emptyMessage="暂无完成或取消的正式采购单" /></div></div>}
-      <div className="pagination"><span>取消、退款、到货和库存变化均保留原始记录；系统不物理删除采购历史</span><div><button disabled>‹</button><button className="current">1</button><button disabled>›</button></div></div>
     </article>
   </div>;
 }
@@ -1880,7 +2336,7 @@ function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanR
 }) {
   const [showAllMappings, setShowAllMappings] = useState(false);
   if (!planning) {
-    return <div className="planning-unavailable"><strong>采购建议暂时不可用</strong><span>{error || '正在等待库存快照和采购策略数据。现有申请、采购单与到货流程不受影响。'}</span></div>;
+    return <div className="planning-unavailable" role="status"><strong>{error ? '采购建议暂时不可用' : '正在读取采购建议'}</strong>{error && <span>{error}</span>}</div>;
   }
   const freshness = planning.freshness;
   const sourceTimeBlocked = planning.rows.some((row) => row.blockers.some((reason) => [
@@ -1898,39 +2354,75 @@ function PurchasePlanningView({ planning, rows, error, skuOptions, selectedPlanR
   const selectedRows = planning.rows.filter((row) => selectedPlanRowIds.has(row.planRowId));
   const selectedQuantity = selectedRows.reduce((sum, row) => sum + row.conversion.eligibleOrderQty, 0);
   const mappingExceptions = planning.mappingExceptions.muku;
+  const coverage = planning.storeCoverage;
+  const canConvert = planning.readiness !== 'stale' && planning.orderSourceReadiness;
   return <div className="planning-workspace">
-    <section className={`planning-freshness ${freshnessState.className}`} aria-label="采购数据新鲜度">
-      <div><span className="planning-signal" /><div><strong>{freshnessState.label}</strong><small>最近检查 {formatOptionalTime(freshness.checkedAt)} · 允许时效 {freshness.maxAgeMinutes} 分钟</small></div></div>
-      <div className="planning-source-times"><span>MUKU 库存生成 <b>{formatOptionalTime(inventoryFreshness?.generatedAt ?? null)}</b></span><span>ERP 同步 <b>{formatOptionalTime(inventoryFreshness?.lastSuccessAt ?? null)}</b></span></div>
-      {!freshness.readyForProcurement && <p>{freshness.blockingReasons.map((reason) => reason.message).join('；') || '库存快照状态未知，暂不允许转采购申请。'}</p>}
-      {freshness.readyForProcurement && sourceTimeBlocked && <p>ERP 刚读取到 MUKU 导出，但至少一项仓库业务源时间未知、无效或超过采购时效，相关建议已被阻断。</p>}
-    </section>
-    <section className="planning-operations" aria-label="采购数据自动化运维状态">
-      <div className="planning-operations-head">
-        <div><strong>持续同步与到期监控</strong><small>{operations.browserRefresh.note}</small></div>
-        <span className={`status-pill ${operations.automationReady ? 'success' : 'danger'}`}>{operations.automationReady ? '安全调度已确认' : '自动化尚未闭环'}</span>
+    <div className="purchase-selection planning-selection">
+      <div>
+        <strong>已选 {selectedRows.length} 个 SKU · 可转 {selectedQuantity} 件</strong>
+        {error ? <span role="status">{error}</span> : !canConvert && <span>订单源或库存未就绪。原因见下方数据来源。</span>}
       </div>
-      <div className="planning-operations-grid">
-        <article className={operations.muku.dataReady ? 'ready' : 'blocked'}>
-          <div className="planning-operation-title"><div><strong>MUKU 库存</strong><small>{operations.sitesMcpScheduleConfigured ? `Sites 托管任务每小时检查，允许时效 ${freshness.maxAgeMinutes} 分钟` : `建议每 ${operations.muku.recommendedIntervalMinutes} 分钟检查一次到期状态`}</small></div><span className={`status-pill ${operations.muku.automationReady ? 'success' : ''}`}>{operations.muku.automationReady ? '已调度' : operations.muku.endpointReady ? '仅任务入口' : '入口未就绪'}</span></div>
-          <div className="planning-operation-times"><span>最近成功<b>{formatOptionalTime(operations.muku.lastSuccessAt)}</b></span><span>数据有效至<b>{formatOptionalTime(operations.muku.freshUntil)}</b></span><span>建议刷新点<b>{formatOptionalTime(operations.muku.nextRefreshDueAt)}</b></span></div>
-          <small className="planning-operation-config">{operations.sitesMcpScheduleConfigured ? `调度方式：Sites MCP 托管任务 · 允许邮箱：${operations.automationAllowedEmailsConfigured ? '已配置' : '未配置'}` : `受保护入口：${operations.muku.endpointReady ? '已就绪' : '未就绪'} · 外部调度：${operations.muku.externalScheduleConfigured ? '已声明配置' : '未确认'}`}</small>
-          {[...operations.muku.configurationBlockers, ...operations.muku.dataBlockers].length > 0 && <p>{[...operations.muku.configurationBlockers, ...operations.muku.dataBlockers].join('；')}</p>}
-        </article>
-        <article className={operations.shopify.stores.length > 0 && operations.shopify.stores.every((store) => store.ready) ? 'ready' : 'blocked'}>
-          <div className="planning-operation-title"><div><strong>Shopify 订单</strong><small>{operations.sitesMcpScheduleConfigured ? `Sites 托管任务每小时增量对账，允许时效 ${operations.shopify.maxAgeMinutes} 分钟` : `增量补漏建议每 ${operations.shopify.recommendedIntervalMinutes} 分钟运行，允许时效 ${operations.shopify.maxAgeMinutes} 分钟`}</small></div><span className={`status-pill ${operations.shopify.automationReady ? 'success' : ''}`}>{operations.shopify.automationReady ? '已调度' : operations.shopify.endpointReady ? '仅任务入口' : '入口未就绪'}</span></div>
-          <div className="planning-operation-times"><span>最近成功<b>{formatOptionalTime(operations.shopify.lastSuccessAt)}</b></span><span>最早到期<b>{formatOptionalTime(operations.shopify.nextExpiryAt)}</b></span><span>官方店铺<b>{operations.shopify.stores.length || '无'}</b></span></div>
-          <small className="planning-operation-config">{operations.sitesMcpScheduleConfigured ? `调度方式：Sites MCP 托管任务 · 允许邮箱：${operations.automationAllowedEmailsConfigured ? '已配置' : '未配置'}` : `受保护入口：${operations.shopify.endpointReady ? '已就绪' : '未就绪'} · 外部调度：${operations.shopify.externalScheduleConfigured ? '已声明配置' : '未确认'}`}</small>
-          {operations.shopify.stores.length > 0 && <div className="planning-store-syncs">{operations.shopify.stores.map((store) => <span key={store.storeId}><b>{store.storeName}</b>{formatOptionalTime(store.lastSuccessAt)} → {formatOptionalTime(store.freshUntil)}{store.reasons.length ? ` · ${store.reasons.map(planningReasonLabel).join('、')}` : ' · 正常'}</span>)}</div>}
-          {operations.shopify.configurationBlockers.length > 0 && <p>{operations.shopify.configurationBlockers.join('；')}</p>}
-        </article>
-      </div>
-    </section>
-    <section className="planning-formula" aria-label="采购建议公式"><div><strong>系统怎么算</strong><span>{planning.formula.target} − {planning.formula.coverage}</span></div><small>{planning.formula.recommendation}。MUKU 在途只展示，不参与抵扣。</small></section>
-    {error && <div className="planning-inline-warning">{error}</div>}
-    <div className="purchase-selection planning-selection"><div><strong>已选 {selectedRows.length} 个 SKU / 可转 {selectedQuantity} 件</strong><span>只会把已验证的官方订单缺口转成申请；安全库存和取整超量不会伪造订单需求</span></div><button className="primary-button" disabled={!selectedRows.length || !selectedQuantity || !canCreate || Boolean(busy) || planning.readiness === 'stale' || !planning.orderSourceReadiness} onClick={openRequest}><span>＋</span>按建议生成申请</button></div>
+      {canCreate && <button type="button" className="primary-button" disabled={!selectedRows.length || !selectedQuantity || Boolean(busy) || !canConvert} onClick={openRequest}>按建议生成申请</button>}
+    </div>
     <PurchasePlanningTable planning={planning} rows={rows} selectedPlanRowIds={selectedPlanRowIds} toggleRow={toggleRow} openPolicy={openPolicy} openInventoryConfirmation={openInventoryConfirmation} canMap={canMap} busy={busy} hasQuery={hasQuery} />
-    {mappingExceptions.length > 0 && <section className="planning-exceptions"><div className="planning-section-head"><div><strong>MUKU SKU 待映射</strong><span>{mappingExceptions.length} 项库存尚未归属到 ERP SKU，不会按 0 库存参与建议</span></div>{mappingExceptions.length > 24 && <button onClick={() => setShowAllMappings((current) => !current)}>{showAllMappings ? '收起' : `展开全部 ${mappingExceptions.length} 项`}</button>}</div><div className="planning-exception-grid">{(showAllMappings ? mappingExceptions : mappingExceptions.slice(0, 24)).map((item) => <article key={item.mukuSku}><div><strong>{item.mukuSku}</strong><small>可用 {formatOptionalQuantity(item.availableQty)} · 在途 {formatOptionalQuantity(item.inboundQty)}</small></div><span className={`status-pill ${item.status === 'ambiguous' ? 'danger' : ''}`}>{item.status === 'ambiguous' ? '存在歧义' : '未映射'}</span>{canMap && <button disabled={Boolean(busy) || !skuOptions.length} onClick={() => openMapping(item)}>去映射</button>}</article>)}</div></section>}
+    {mappingExceptions.length > 0 && <section className="planning-exceptions" aria-labelledby="purchase-mapping-exceptions">
+      <div className="planning-section-head">
+        <div className="procurement-list-heading"><h3 id="purchase-mapping-exceptions">MUKU SKU 待映射</h3><span>{mappingExceptions.length} 条</span></div>
+        {mappingExceptions.length > 24 && <button type="button" onClick={() => setShowAllMappings((current) => !current)}>{showAllMappings ? '收起' : '查看全部'}</button>}
+      </div>
+      <div className="table-wrap module-table" role="region" aria-label="MUKU 待映射库存列表" tabIndex={0}>
+        <table className="procurement-mapping-table">
+          <thead><tr><th scope="col">MUKU SKU</th><th scope="col" className="procurement-number">可用库存</th><th scope="col" className="procurement-number">在途数量</th><th scope="col">映射状态</th>{canMap && <th scope="col">操作</th>}</tr></thead>
+          <tbody>{(showAllMappings ? mappingExceptions : mappingExceptions.slice(0, 24)).map((item) => <tr key={item.mukuSku}>
+            <td><strong>{item.mukuSku}</strong></td>
+            <td className="procurement-number">{formatOptionalQuantity(item.availableQty)}</td>
+            <td className="procurement-number">{formatOptionalQuantity(item.inboundQty)}</td>
+            <td><span className={`status-pill ${item.status === 'ambiguous' ? 'danger' : ''}`}>{item.status === 'ambiguous' ? '存在歧义' : '未映射'}</span></td>
+            {canMap && <td><button type="button" className="procurement-text-button" disabled={Boolean(busy) || !skuOptions.length} onClick={() => openMapping(item)}>映射 SKU</button></td>}
+          </tr>)}</tbody>
+        </table>
+      </div>
+      <p className="procurement-mapping-note">待映射的库存暂不参与采购建议。</p>
+    </section>}
+    <details className="procurement-source-details">
+      <summary><strong>数据来源与计算依据</strong><small>{!planning.orderSourceReadiness ? '订单源未就绪' : freshnessState.label}</small></summary>
+      {coverage && <div className="procurement-filter-note">
+        已验证 Shopify 店铺 {coverage.activeOfficialStoreCount}/{coverage.candidateStoreCount} 家
+        {coverage.activeStoreKeys.length > 0 && <> · {coverage.activeStoreKeys.join('、')}</>}
+        {coverage.missingCandidateStoreKeys.length > 0 && <> · 待验证 {coverage.missingCandidateStoreKeys.join('、')}</>}
+      </div>}
+      {!planning.orderSourceReadiness && <div className="planning-order-source-warning">
+        <strong>官方订单源未就绪</strong><span>{formatOrderSourceWarning(planning)}</span>
+      </div>}
+      <section className={`planning-freshness ${freshnessState.className}`} aria-label="采购数据新鲜度">
+        <div><span className="planning-signal" /><div><strong>{freshnessState.label}</strong><small>最近检查 {formatOptionalTime(freshness.checkedAt)} · 允许时效 {freshness.maxAgeMinutes} 分钟</small></div></div>
+        <div className="planning-source-times"><span>MUKU 库存生成 <b>{formatOptionalTime(inventoryFreshness?.generatedAt ?? null)}</b></span><span>ERP 同步 <b>{formatOptionalTime(inventoryFreshness?.lastSuccessAt ?? null)}</b></span></div>
+        {!freshness.readyForProcurement && <p>{freshness.blockingReasons.map((reason) => reason.message).join('；') || '库存快照状态未知，暂不允许转采购申请。'}</p>}
+        {freshness.readyForProcurement && sourceTimeBlocked && <p>ERP 刚读取到 MUKU 导出，但至少一项仓库业务源时间未知、无效或超过采购时效，相关建议已被阻断。</p>}
+      </section>
+      <section className="planning-operations" aria-label="采购数据自动化运维状态">
+        <div className="planning-operations-head">
+          <div><strong>持续同步与到期监控</strong><small>{operations.browserRefresh.note}</small></div>
+          <span className={`status-pill ${operations.automationReady ? 'success' : 'danger'}`}>{operations.automationReady ? '安全调度已确认' : '自动化尚未闭环'}</span>
+        </div>
+        <div className="planning-operations-grid">
+          <article className={operations.muku.dataReady ? 'ready' : 'blocked'}>
+            <div className="planning-operation-title"><div><strong>MUKU 库存</strong><small>{operations.sitesMcpScheduleConfigured ? `Sites 托管任务每小时检查，允许时效 ${freshness.maxAgeMinutes} 分钟` : `建议每 ${operations.muku.recommendedIntervalMinutes} 分钟检查一次到期状态`}</small></div><span className={`status-pill ${operations.muku.automationReady ? 'success' : ''}`}>{operations.muku.automationReady ? '已调度' : operations.muku.endpointReady ? '仅任务入口' : '入口未就绪'}</span></div>
+            <div className="planning-operation-times"><span>最近成功<b>{formatOptionalTime(operations.muku.lastSuccessAt)}</b></span><span>数据有效至<b>{formatOptionalTime(operations.muku.freshUntil)}</b></span><span>建议刷新点<b>{formatOptionalTime(operations.muku.nextRefreshDueAt)}</b></span></div>
+            <small className="planning-operation-config">{operations.sitesMcpScheduleConfigured ? `调度方式：Sites MCP 托管任务 · 允许邮箱：${operations.automationAllowedEmailsConfigured ? '已配置' : '未配置'}` : `受保护入口：${operations.muku.endpointReady ? '已就绪' : '未就绪'} · 外部调度：${operations.muku.externalScheduleConfigured ? '已声明配置' : '未确认'}`}</small>
+            {[...operations.muku.configurationBlockers, ...operations.muku.dataBlockers].length > 0 && <p>{[...operations.muku.configurationBlockers, ...operations.muku.dataBlockers].join('；')}</p>}
+          </article>
+          <article className={operations.shopify.stores.length > 0 && operations.shopify.stores.every((store) => store.ready) ? 'ready' : 'blocked'}>
+            <div className="planning-operation-title"><div><strong>Shopify 订单</strong><small>{operations.sitesMcpScheduleConfigured ? `Sites 托管任务每小时增量对账，允许时效 ${operations.shopify.maxAgeMinutes} 分钟` : `增量补漏建议每 ${operations.shopify.recommendedIntervalMinutes} 分钟运行，允许时效 ${operations.shopify.maxAgeMinutes} 分钟`}</small></div><span className={`status-pill ${operations.shopify.automationReady ? 'success' : ''}`}>{operations.shopify.automationReady ? '已调度' : operations.shopify.endpointReady ? '仅任务入口' : '入口未就绪'}</span></div>
+            <div className="planning-operation-times"><span>最近成功<b>{formatOptionalTime(operations.shopify.lastSuccessAt)}</b></span><span>最早到期<b>{formatOptionalTime(operations.shopify.nextExpiryAt)}</b></span><span>官方店铺<b>{operations.shopify.stores.length || '无'}</b></span></div>
+            <small className="planning-operation-config">{operations.sitesMcpScheduleConfigured ? `调度方式：Sites MCP 托管任务 · 允许邮箱：${operations.automationAllowedEmailsConfigured ? '已配置' : '未配置'}` : `受保护入口：${operations.shopify.endpointReady ? '已就绪' : '未就绪'} · 外部调度：${operations.shopify.externalScheduleConfigured ? '已声明配置' : '未确认'}`}</small>
+            {operations.shopify.stores.length > 0 && <div className="planning-store-syncs">{operations.shopify.stores.map((store) => <span key={store.storeId}><b>{store.storeName}</b>{formatOptionalTime(store.lastSuccessAt)} → {formatOptionalTime(store.freshUntil)}{store.reasons.length ? ` · ${store.reasons.map(planningReasonLabel).join('、')}` : ' · 正常'}</span>)}</div>}
+            {operations.shopify.configurationBlockers.length > 0 && <p>{operations.shopify.configurationBlockers.join('；')}</p>}
+          </article>
+        </div>
+      </section>
+      <section className="planning-formula" aria-label="采购建议公式"><div><strong>系统怎么算</strong><span>{planning.formula.target} − {planning.formula.coverage}</span></div><small>{planning.formula.recommendation}。MUKU 在途只展示，不参与抵扣。</small></section>
+    </details>
   </div>;
 }
 
@@ -1940,32 +2432,45 @@ function PurchasePlanningTable({ planning, rows, selectedPlanRowIds, toggleRow, 
   openInventoryConfirmation: (row: PurchasePlanningRow) => void;
   canMap: boolean; busy: string; hasQuery: boolean;
 }) {
-  return <div className="table-wrap module-table"><table className="purchase-planning-table"><thead><tr><th className="selection-cell">选择</th><th>ERP SKU / MUKU SKU</th><th>订单需求 / 安全库存</th><th>有效可用 / 在途</th><th>ERP 覆盖 / 已收展示</th><th>建议采购</th><th>状态与依据</th><th>操作</th></tr></thead><tbody>{rows.length ? rows.map((row) => {
+  return <div className="table-wrap module-table" role="region" aria-label="采购建议列表" tabIndex={0}><table className="purchase-planning-table">
+    <thead><tr>
+      <th scope="col" className="selection-cell">选择</th>
+      <th scope="col">商品 SKU</th>
+      <th scope="col">订单需求<small className="cell-sub">安全库存</small></th>
+      <th scope="col">可用库存<small className="cell-sub">在途数量</small></th>
+      <th scope="col">采购链覆盖<small className="cell-sub">未收及已收明细</small></th>
+      <th scope="col">建议采购</th>
+      <th scope="col">状态与依据</th>
+      <th scope="col">操作</th>
+    </tr></thead>
+    <tbody>{rows.length ? rows.map((row) => {
     const convertible = planningRowConvertible(row, planning.readiness, planning.orderSourceReadiness);
     const matchedSkus = row.mukuSkus.map((source) => source.sku).join('、');
     const canConfirmInventory = manualInventoryConfirmationEligible(row);
     return <tr key={row.planRowId} className={row.decision === 'blocked' ? 'planning-row-blocked' : ''}><td className="selection-cell"><input className="purchase-check" type="checkbox" aria-label={`选择 ${row.skuCode}`} checked={selectedPlanRowIds.has(row.planRowId)} disabled={!convertible || Boolean(busy)} onChange={() => toggleRow(row.planRowId)} /></td><td><strong>{row.skuCode}</strong><small className="cell-sub">{row.skuName}</small><small className="cell-sub planning-match">{matchedSkus || (row.mukuMatchStatus === 'ambiguous' ? 'MUKU SKU 存在歧义' : '尚未匹配 MUKU 编码')}</small></td><td><strong>{row.orderDemandQty} / {formatOptionalQuantity(row.safetyStockQty)}</strong><small className="cell-sub">近 30 天销量：{formatOptionalQuantity(row.sales30d)}</small></td><td><strong>{formatOptionalQuantity(row.effectiveAvailableQty)} / {formatOptionalQuantity(row.mukuInboundQty)}</strong><small className="cell-sub">{planningAvailableSourceLabel(row)}</small><small className="cell-sub">在途仅展示，不抵扣</small></td><td><strong>{row.erpPurchaseChainCoverageQty}</strong><small className="cell-sub">PO 未收 {row.erpOpenPoQty} · 已收 {row.erpReceivedQty}（仅展示）</small></td><td><strong className="planning-recommendation">{formatOptionalQuantity(row.recommendedQty)}</strong><small className="cell-sub">可转官方订单 {row.conversion.eligibleOrderQty} 件</small>{row.conversion.blockedRecommendationQty > 0 && <small className="cell-sub attention-text">另有 {row.conversion.blockedRecommendationQty} 件不可自动转</small>}</td><td><span className={`status-pill planning-status-${row.decision}`}>{planningDecisionLabel(row.decision)}</span><details className="planning-explanation"><summary>查看计算依据</summary><div><p><b>公式：</b>{formatPlanningEquation(row)}</p>{row.explanations.map((text, index) => <p key={`${row.planRowId}-explanation-${index}`}>{text}</p>)}{[...row.blockers, ...row.warnings].map((reason) => <p className="attention-text" key={`${row.planRowId}-${reason}`}>{planningReasonLabel(reason)}</p>)}<p className="planning-source-note">原始 MUKU 可用量：{formatOptionalQuantity(row.mukuAvailableQty)} · 有效可用量来源：{planningAvailableSourceLabel(row)} · 库存源更新时间：{formatOptionalTime(row.sourceTimes.inventoryRecordUpdatedAt)}</p></div></details></td><td><div className="row-actions planning-row-actions">{canMap && <button disabled={Boolean(busy)} onClick={() => openPolicy(row)}>采购策略</button>}{canMap && canConfirmInventory && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openInventoryConfirmation(row)}>{row.inventoryConfirmation ? '更新 / 续期库存' : '人工确认库存'}</button>}{convertible ? <span className="terminal-label">勾选后批量转申请</span> : <span className="terminal-label">{!planning.orderSourceReadiness ? '官方订单源未就绪' : row.conversion.eligibleOrderQty <= 0 && row.blockers.length === 0 ? '暂无可转订单缺口' : planningPrimaryBlocker(row)}</span>}</div></td></tr>;
-  }) : <tr><td className="empty-cell" colSpan={8}>{hasQuery ? '没有符合当前搜索条件的采购建议' : '暂无可计算的 ERP SKU；接入真实订单或设置采购策略后会出现在这里'}</td></tr>}</tbody></table></div>;
+  }) : <tr><td className="empty-cell" colSpan={8}><span>{hasQuery ? '没有符合搜索条件的采购建议' : '暂无采购建议。接入订单并完成 SKU 映射后可查看。'}</span></td></tr>}</tbody></table></div>;
 }
 
 function PurchaseDemandTable({ demands, selectable, selectedDemandIds, toggleDemand, openMapping, canMap, busy, emptyMessage }: {
   demands: PurchaseDemand[]; selectable: boolean; selectedDemandIds: Set<string>; toggleDemand: (id: string) => void;
   openMapping: (demand: PurchaseDemand) => void; canMap: boolean; busy: string; emptyMessage: string;
 }) {
-  return <div className="table-wrap module-table"><table className="purchase-demand-table"><thead><tr>{selectable && <th className="selection-cell">选择</th>}<th>店铺 / 订单</th><th>平台 SKU / ERP SKU</th><th>商品</th><th>订单需求 / 已占 / 未分配</th><th>状态</th><th>操作</th><th>订单更新时间</th></tr></thead><tbody>{demands.length ? demands.map((demand) => {
+  return <div className="table-wrap module-table" role="region" aria-label="订单需求列表" tabIndex={0}><table className="purchase-demand-table"><thead><tr>{selectable && <th scope="col" className="selection-cell">选择</th>}<th scope="col">店铺 / 订单</th><th scope="col">平台 SKU / ERP SKU</th><th scope="col">商品</th><th scope="col">需求 / 已占 / 未分配</th><th scope="col">状态</th><th scope="col">操作</th><th scope="col">更新时间</th></tr></thead><tbody>{demands.length ? demands.map((demand) => {
     const available = demandAvailableQuantity(demand);
     return <tr key={demand.id}>{selectable && <td className="selection-cell"><input className="purchase-check" type="checkbox" aria-label={`选择 ${demand.rawSku ?? demand.sourceOrderLineId}`} checked={selectedDemandIds.has(demand.id)} disabled={available <= 0 || Boolean(busy)} onChange={() => toggleDemand(demand.id)} /></td>}<td><strong>{demand.storeName}</strong><small className="cell-sub">{demand.sourceOrderName ?? demand.sourceOrderId}</small></td><td><strong>{demand.rawSku?.trim() || '缺少 SKU'}</strong><small className="cell-sub">{demand.mappedSkuCode ? `ERP：${demand.mappedSkuCode}` : '尚未映射 ERP SKU'}</small></td><td>{demand.title ?? demand.name ?? '未提供商品名'}{demand.mappedSkuName && <small className="cell-sub">{demand.mappedSkuName}</small>}</td><td><strong>{demand.requiredQuantity} / {demand.allocatedQuantity ?? 0} / {available}</strong><small className="cell-sub">当前 / 未履约：{formatOptionalQuantity(demand.currentQuantity)} / {formatOptionalQuantity(demand.unfulfilledQuantity)}</small></td><td><span className={`status-pill ${demand.status === 'open' ? 'success' : ''}`}>{purchaseDemandStatusLabel[demand.status]}</span><small className="cell-sub">{demand.reasonCode ? (purchaseDemandReasonLabel[demand.reasonCode] ?? demand.reasonCode) : '已归一为订单需求'}</small></td><td><div className="row-actions">{demand.status === 'needs_mapping' && canMap && demand.rawSku?.trim() && <button disabled={Boolean(busy)} onClick={() => openMapping(demand)}>映射 SKU</button>}{demand.status === 'needs_mapping' && !demand.rawSku?.trim() && <span className="terminal-label">平台未提供 SKU</span>}{demand.status === 'open' && <span className="terminal-label">{available > 0 ? '请到今日采购建议' : '已进入申请'}</span>}</div></td><td>{formatTime(demand.sourceUpdatedAt)}</td></tr>;
-  }) : <tr><td className="empty-cell" colSpan={selectable ? 8 : 7}>{emptyMessage}</td></tr>}</tbody></table></div>;
+  }) : <tr><td className="empty-cell" colSpan={selectable ? 8 : 7}><span>{emptyMessage}</span></td></tr>}</tbody></table></div>;
 }
 
-function PurchaseRequestTable({ requests, currentMemberId, developmentOpenAccess, can, busy, runAction, openPurchaseOrder, openAssignment, emptyMessage }: {
-  requests: PurchaseRequest[]; currentMemberId: string | null; developmentOpenAccess: boolean;
+function PurchaseRequestTable({ requests, currentMemberId, developmentOpenAccess, isAdministrator = false, can, busy, runAction, openPurchaseOrder, openAssignment, draftOrdersByRequestId, openOrderDraft, emptyMessage }: {
+  requests: PurchaseRequest[]; currentMemberId: string | null; developmentOpenAccess: boolean; isAdministrator?: boolean;
   can: (permission: Permission) => boolean; busy: string;
   runAction: (request: PurchaseRequest, action: PurchaseRequestAction) => void; emptyMessage: string;
   openPurchaseOrder?: (request: PurchaseRequest) => void;
   openAssignment?: (request: PurchaseRequest) => void;
+  draftOrdersByRequestId?: Map<string, PurchaseOrder>;
+  openOrderDraft?: (order: PurchaseOrder) => void;
 }) {
-  return <div className="table-wrap module-table"><table className="purchase-request-table"><thead><tr><th>申请单</th><th>采购负责人</th><th>复审人</th><th>明细 / 件数</th><th>状态</th><th>备注</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{requests.length ? requests.map((request) => {
+  return <div className="table-wrap module-table" role="region" aria-label="采购申请列表" tabIndex={0}><table className="purchase-request-table"><thead><tr><th scope="col">申请单</th><th scope="col">采购负责人</th><th scope="col">复审人</th><th scope="col">明细 / 件数</th><th scope="col">状态</th><th scope="col">备注</th><th scope="col">更新时间</th><th scope="col">操作</th></tr></thead><tbody>{requests.length ? requests.map((request) => {
     const purchaserMemberId = request.buyer?.id ?? request.purchaser?.id ?? request.purchaserMemberId;
     const reviewerMemberId = request.reviewer?.id ?? request.reviewerMemberId;
     const assignedPurchaser = assignmentActionAllowed(
@@ -1976,48 +2481,115 @@ function PurchaseRequestTable({ requests, currentMemberId, developmentOpenAccess
       Boolean(currentMemberId && reviewerMemberId === currentMemberId),
       developmentOpenAccess,
     );
-    return <tr key={request.id}><td><strong>{request.requestNo}</strong><small className="cell-sub">创建：{request.creator?.displayName ?? '系统成员'}</small></td><td>{request.buyer?.displayName ?? '待指定'}</td><td>{request.reviewer?.displayName ?? '待指定'}</td><td>{request.lineCount} 行 / {request.totalQuantity} 件</td><td><span className={`status-pill purchase-status-${request.status}`}>{purchaseRequestStatusLabel[request.status]}</span>{request.needsAttention && <small className="cell-sub attention-text">源订单已变化，需复核</small>}</td><td>{request.reviewNote ?? request.note ?? '—'}</td><td>{formatTime(request.updatedAt)}</td><td><div className="row-actions">{openAssignment && can('members:manage') && ['draft','pending_review','approved'].includes(request.status) && <button className="action-muted" disabled={Boolean(busy)} onClick={() => openAssignment(request)}>{busy === `reassign:${request.id}` ? '交接中…' : '重新指派'}</button>}{request.status === 'draft' && assignedPurchaser && can('purchase:submit') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'submit')}>{busy === `${request.id}:submit` ? '提交中…' : '提交复审'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'cancel')}>取消</button></>}{request.status === 'draft' && !assignedPurchaser && <span className="terminal-label">等待 {request.buyer?.displayName ?? '采购负责人'} 提交</span>}{request.status === 'pending_review' && assignedReviewer && can('purchase:review') && <><button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'approve')}>{busy === `${request.id}:approve` ? '复审中…' : '批准'}</button><button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'reject')}>驳回</button></>}{request.status === 'pending_review' && !assignedReviewer && <span className="terminal-label">等待 {request.reviewer?.displayName ?? '复审人'} 处理</span>}{request.status === 'approved' && openPurchaseOrder && assignedPurchaser && can('purchase:order:create') && !request.needsAttention && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openPurchaseOrder(request)}>生成正式采购单</button>}{request.status === 'approved' && openPurchaseOrder && assignedPurchaser && can('purchase:submit') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'withdraw')}>{busy === `${request.id}:withdraw` ? '撤回中…' : '撤回重算'}</button>}{request.status === 'approved' && request.needsAttention && <span className="terminal-label">源订单变化，暂不能转单</span>}{request.status === 'approved' && openPurchaseOrder && !assignedPurchaser && !request.needsAttention && <span className="terminal-label">等待 {request.buyer?.displayName ?? '采购负责人'} 转采购单</span>}{(['rejected','cancelled'].includes(request.status) || (request.status === 'approved' && !openPurchaseOrder)) && <span className="terminal-label">历史已保留</span>}</div></td></tr>;
-  }) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
+    const draftOrder = draftOrdersByRequestId?.get(request.id);
+    const approved = request.status === 'approved';
+    const canOpenDraft = (assignedPurchaser || isAdministrator) && can('purchase:order:issue');
+    const canOpenLegacyOrder = (assignedPurchaser || isAdministrator) && can('purchase:order:create') && !request.needsAttention;
+    return <tr key={request.id}><td><strong>{request.requestNo}</strong>{request.source === 'manual' && <small className="cell-sub">手工录入</small>}<small className="cell-sub">创建：{request.creator?.displayName ?? '系统成员'}</small></td><td>{request.buyer?.displayName ?? '待指定'}</td><td>{request.reviewer?.displayName ?? '待指定'}</td><td>{request.lineCount} 行 / {request.totalQuantity} 件
+      {request.source === 'manual' && <details className="manual-request-details">
+        <summary>查看商品明细</summary>
+        <ul>{request.lines.map((line) => <li key={line.id}>
+          <strong>{line.skuCode ?? line.rawSku ?? '未知 SKU'}</strong><span>{line.productDetails?.name ?? line.skuName} · {line.requestedQuantity} 件</span>
+          {line.productDetails?.specification && <small>规格 · {line.productDetails.specification}</small>}
+          {line.productDetails?.dimensions && <small>尺寸 · {line.productDetails.dimensions}</small>}
+          {line.productDetails?.description && <small className="purchase-product-description-text">商品介绍 · {line.productDetails.description}</small>}
+          <PurchaseProductImageLink value={line.productDetails?.imageUrl} />
+        </li>)}</ul>
+      </details>}
+    </td><td><span className={`status-pill purchase-status-${request.status}`}>{purchaseRequestStatusLabel[request.status]}</span>{request.needsAttention && <small className="cell-sub attention-text">源订单已变化，需复核</small>}</td><td>{request.source === 'manual' ? <>
+      {request.note ?? '—'}{request.reviewNote && <small className="cell-sub">复审：{request.reviewNote}</small>}
+    </> : request.reviewNote ?? request.note ?? '—'}</td><td>{formatTime(request.updatedAt)}</td><td><div className="row-actions">
+      {request.status === 'draft' && assignedPurchaser && can('purchase:submit') && <>
+        <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'submit')}>{busy === `${request.id}:submit` ? '提交中…' : '提交复审'}</button>
+        <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'cancel')}>取消</button>
+      </>}
+      {request.status === 'draft' && !assignedPurchaser && <span className="terminal-label">等待 {request.buyer?.displayName ?? '采购负责人'} 提交</span>}
+      {request.status === 'pending_review' && assignedReviewer && can('purchase:review') && <>
+        <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(request, 'approve')}>{busy === `${request.id}:approve` ? '复审中…' : '批准'}</button>
+        <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'reject')}>驳回</button>
+      </>}
+      {request.status === 'pending_review' && !assignedReviewer && <span className="terminal-label">等待 {request.reviewer?.displayName ?? '复审人'} 处理</span>}
+      {approved && draftOrder && <>
+        {openOrderDraft && canOpenDraft && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openOrderDraft(draftOrder)}>编辑采购单草稿</button>}
+        <span className="terminal-label">{draftOrder.orderNo} · 待下单</span>
+      </>}
+      {approved && !draftOrder && openPurchaseOrder && <>
+        {canOpenLegacyOrder && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openPurchaseOrder(request)}>开采购单</button>}
+        {assignedPurchaser && can('purchase:submit') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(request, 'withdraw')}>{busy === `${request.id}:withdraw` ? '撤回中…' : request.source === 'manual' ? '撤回申请' : '撤回重算'}</button>}
+        {request.needsAttention && <span className="terminal-label">源订单变化，暂不能转单</span>}
+        {!assignedPurchaser && !isAdministrator && !request.needsAttention && <span className="terminal-label">等待 {request.buyer?.displayName ?? '采购负责人'} 转采购单</span>}
+      </>}
+      {openAssignment && can('members:manage') && ['draft','pending_review','approved'].includes(request.status) && <button className="action-muted" disabled={Boolean(busy)} onClick={() => openAssignment(request)}>{busy === `reassign:${request.id}` ? '交接中…' : '重新指派'}</button>}
+      {['rejected','cancelled'].includes(request.status) && <span className="terminal-label">—</span>}
+    </div></td></tr>;
+  }) : <tr><td className="empty-cell" colSpan={8}><span>{emptyMessage}</span></td></tr>}</tbody></table></div>;
 }
 
-function PurchaseOrderTable({ orders, assignedPurchaseRequestIds, purchaserNamesByRequestId, requestsById, openAssignment, can, busy, openReceipt, runAction, emptyMessage }: {
-  orders: PurchaseOrder[]; can: (permission: Permission) => boolean; busy: string;
+function PurchaseOrderTable({ orders, isAdministrator = false, assignedPurchaseRequestIds, purchaserNamesByRequestId, requestsById, openAssignment, can, busy, openOrderDraft, openReceipt, runAction, emptyMessage }: {
+  orders: PurchaseOrder[]; isAdministrator?: boolean; can: (permission: Permission) => boolean; busy: string;
   assignedPurchaseRequestIds: Set<string>; purchaserNamesByRequestId: Map<string, string>;
   requestsById: Map<string, PurchaseRequest>; openAssignment: (request: PurchaseRequest) => void;
+  openOrderDraft?: (order: PurchaseOrder) => void;
   openReceipt: (order: PurchaseOrder) => void;
   runAction: (order: PurchaseOrder, action: 'issue' | 'cancel' | 'close') => void; emptyMessage: string;
 }) {
-  return <div className="table-wrap module-table"><table className="purchase-order-table"><thead><tr><th>正式采购单</th><th>供应商 / 收货</th><th>申请单</th><th>采购 / 已到 / 未到</th><th>金额信息</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{orders.length ? orders.map((order) => {
+  return <div className="table-wrap module-table" role="region" aria-label="采购单列表" tabIndex={0}><table className="purchase-order-table"><thead><tr><th scope="col">采购单</th><th scope="col">供应商 / 收货</th><th scope="col">申请单</th><th scope="col" className="procurement-number">采购 / 已到 / 未到</th><th scope="col" className="procurement-number">金额</th><th scope="col">状态</th><th scope="col">更新时间</th><th scope="col">操作</th></tr></thead><tbody>{orders.length ? orders.map((order) => {
     const remaining = Math.max(0, order.orderedQuantity - order.receivedQuantity);
     const assignedPurchaser = assignedPurchaseRequestIds.has(order.purchaseRequestId);
-    const totalMinor = order.lines.reduce<number | null>((sum, line) => {
-      if (sum === null || line.unitCostMinor === null || !order.currency || line.currency !== order.currency) return null;
-      const lineAmount = line.unitCostMinor * line.orderedQuantity;
-      const nextTotal = sum + lineAmount;
-      return Number.isSafeInteger(lineAmount) && Number.isSafeInteger(nextTotal) ? nextTotal : null;
-    }, order.lines.length ? 0 : null);
+    const totalMinor = order.lines.reduce<bigint | null>((sum, line) => {
+      if (sum === null || !order.currency || line.currency !== order.currency || line.unitCostMinor === null
+        || !Number.isSafeInteger(line.unitCostMinor) || !Number.isSafeInteger(line.orderedQuantity)) return null;
+      return sum + BigInt(line.unitCostMinor) * BigInt(line.orderedQuantity);
+    }, order.lines.length ? BigInt(0) : null);
     const documentUrl = `/api/purchase/orders/${encodeURIComponent(order.id)}/document`;
     const completion = purchaseOrderCompletion(order);
+    const missing = order.supplier ? completion.missing : ['供应商', ...completion.missing];
     const purchaseRequest = requestsById.get(order.purchaseRequestId);
+    const isDraft = order.status === 'draft';
+    const awaitingReceipt = order.status === 'issued' || order.status === 'partially_received';
+    const canManageDraft = isDraft && (assignedPurchaser || isAdministrator) && can('purchase:order:issue');
+    const canReceive = awaitingReceipt && can('inventory:receive');
+    const canClose = awaitingReceipt && assignedPurchaser && can('purchase:order:issue');
+    const canCancel = canManageDraft && assignedPurchaser;
+    const canReassign = purchaseRequest && (isDraft || awaitingReceipt) && can('members:manage');
+    const canReadDocument = can('purchase:read');
     return <tr key={order.id}>
       <td><strong>{order.orderNo}</strong><small className="cell-sub">{order.lineCount} 行 · v{order.version}</small></td>
-      <td><strong>{order.supplier.name}</strong><small className="cell-sub">{order.supplier.code}</small><small className="cell-sub">{order.deliveryWarehouse ? `${order.deliveryWarehouse.code} · ${order.deliveryWarehouse.name}` : '未设置收货仓'} · {order.expectedDeliveryAt ?? '交期未填'}</small></td>
-      <td>{order.purchaseRequestNo}</td>
-      <td><strong>{order.orderedQuantity} / {order.receivedQuantity} / {remaining}</strong><small className="cell-sub">采购 / 已到 / 未到</small></td>
-      <td>{totalMinor !== null && order.currency ? formatMoney(totalMinor, order.currency) : '单价待补齐'}<small className="cell-sub">{order.currency ?? '币种未指定'}</small></td>
+      <td><strong>{order.supplier?.name ?? '供应商待选'}</strong>{order.supplier && <small className="cell-sub">{order.supplier.code}</small>}<small className="cell-sub">{order.deliveryWarehouse ? `${order.deliveryWarehouse.code} · ${order.deliveryWarehouse.name}` : '未设置收货仓'} · {order.expectedDeliveryAt ?? '交期未填'}</small></td>
+      <td>{order.purchaseRequestNo}{purchaserNamesByRequestId.has(order.purchaseRequestId) && <small className="cell-sub">{purchaserNamesByRequestId.get(order.purchaseRequestId)}</small>}</td>
+      <td className="procurement-number"><strong>{order.orderedQuantity} / {order.receivedQuantity} / {remaining}</strong></td>
+      <td className="procurement-number">
+        {totalMinor !== null ? formatPurchaseMinor(totalMinor.toString(), order.currency) : order.currency ? '金额待核' : '币种未指定'}
+        {can('purchase:order:create') && <ErpPurchasePaymentOverview order={order} />}
+      </td>
       <td><span className={`status-pill purchase-order-status-${order.status}`}>{purchaseOrderStatusLabel[order.status]}</span>{order.status === 'closed_short' && <small className="cell-sub">原因：{order.actionNote ?? '未记录'}</small>}</td>
       <td>{formatTime(order.updatedAt)}</td>
-      <td><div className="row-actions">
-        {can('purchase:read') && <><a href={documentUrl} target="_blank" rel="noreferrer">打印采购单</a><a href={`${documentUrl}?format=csv`} download>导出 CSV</a></>}
-        {can('members:manage') && purchaseRequest && ['draft','issued','partially_received'].includes(order.status) && <button className="action-muted" disabled={Boolean(busy)} onClick={() => openAssignment(purchaseRequest)}>重新指派</button>}
-        {order.status === 'draft' && assignedPurchaser && can('purchase:order:issue') && <>{completion.ready ? <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(order, 'issue')}>{busy === `${order.id}:issue` ? '处理中…' : '确认下单'}</button> : <span className="terminal-label">不可下单：缺 {completion.missing.join('、')}</span>}<button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(order, 'cancel')}>取消采购单</button></>}
-        {order.status === 'draft' && !assignedPurchaser && <span className="terminal-label">等待 {purchaserNamesByRequestId.get(order.purchaseRequestId) ?? '采购负责人'} 确认</span>}
-        {['issued','partially_received'].includes(order.status) && can('inventory:receive') && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openReceipt(order)}>登记到货</button>}
-        {['issued','partially_received'].includes(order.status) && assignedPurchaser && can('purchase:order:issue') && <button className="action-muted" disabled={Boolean(busy)} onClick={() => runAction(order, 'close')}>{busy === `${order.id}:close` ? '关闭中…' : '关闭剩余量'}</button>}
-        {['received','closed_short','cancelled'].includes(order.status) && <span className="terminal-label">历史已保留</span>}
+      <td><div className="row-actions procurement-order-actions">
+        {canManageDraft && <>
+          {!missing.length ? <button className="action-primary" disabled={Boolean(busy)} onClick={() => runAction(order, 'issue')}>
+            {busy === `${order.id}:issue` ? '处理中…' : '确认下单'}</button>
+            : openOrderDraft && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openOrderDraft(order)}>编辑草稿</button>}
+          {missing.length > 0 && <span className="terminal-label">待补齐 {missing.join('、')}</span>}
+        </>}
+        {isDraft && !assignedPurchaser && !isAdministrator && <span className="terminal-label">待采购负责人或管理员确认</span>}
+        {canReceive && <button className="action-primary" disabled={Boolean(busy)} onClick={() => openReceipt(order)}>登记到货</button>}
+        {(canReadDocument || canReassign || canClose || canCancel) && <details className="procurement-row-more" name="purchase-order-actions">
+          <summary aria-label={`${order.orderNo} 的更多操作`}>更多</summary>
+          <div>
+            {canManageDraft && !missing.length && openOrderDraft && <button type="button" disabled={Boolean(busy)} onClick={() => openOrderDraft(order)}>编辑草稿</button>}
+            {canReadDocument && <>
+              <a href={documentUrl} target="_blank" rel="noreferrer">{isDraft ? '预览草稿' : order.status === 'cancelled' ? '查看取消单' : '打印采购单'}</a>
+              <a href={`${documentUrl}?format=csv`} download>导出 CSV</a>
+              <ErpPurchaseQuality order={order} canRequire={can('purchase:order:issue')} canInspect={can('inventory:receive')} />
+            </>}
+            {canReassign && <button type="button" disabled={Boolean(busy)} onClick={() => openAssignment(purchaseRequest)}>重新指派</button>}
+            {canClose && <button type="button" className="procurement-destructive-action" disabled={Boolean(busy)} onClick={() => runAction(order, 'close')}>{busy === `${order.id}:close` ? '关闭中…' : '关闭剩余量'}</button>}
+            {canCancel && <button type="button" className="procurement-destructive-action" disabled={Boolean(busy)} onClick={() => runAction(order, 'cancel')}>取消采购单</button>}
+          </div>
+        </details>}
       </div></td>
     </tr>;
-  }) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
+  }) : <tr><td className="empty-cell" colSpan={8}><span>{emptyMessage}</span></td></tr>}</tbody></table></div>;
 }
 
 function PurchaseReceiptTable({ receipts, canCorrect, busy, openCorrection, emptyMessage }: {
@@ -2027,10 +2599,10 @@ function PurchaseReceiptTable({ receipts, canCorrect, busy, openCorrection, empt
   openCorrection: (receipt: PurchaseReceipt) => void;
   emptyMessage: string;
 }) {
-  return <div className="table-wrap module-table"><table className="purchase-receipt-table"><thead><tr><th>到货单</th><th>采购单</th><th>入库仓</th><th>明细 / 件数</th><th>SKU</th><th>到货时间</th><th>状态</th><th>操作</th></tr></thead><tbody>{receipts.length ? receipts.map((receipt) => {
+  return <div className="table-wrap module-table" role="region" aria-label="到货记录列表" tabIndex={0}><table className="purchase-receipt-table"><thead><tr><th scope="col">到货单</th><th scope="col">采购单</th><th scope="col">入库仓</th><th scope="col">明细 / 件数</th><th scope="col">SKU</th><th scope="col">到货时间</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead><tbody>{receipts.length ? receipts.map((receipt) => {
     const quantities = normalizedReceiptQuantities(receipt);
     return <tr key={receipt.id}>
-      <td><strong>{receipt.receiptNo}</strong><small className="cell-sub">{receipt.note ?? '不可变入库记录'}</small></td>
+      <td><strong>{receipt.receiptNo}</strong>{receipt.note && <small className="cell-sub">{receipt.note}</small>}</td>
       <td>{receipt.purchaseOrderNo}</td>
       <td><strong>{receipt.warehouse.name}</strong><small className="cell-sub">{receipt.warehouse.code}</small></td>
       <td>{receipt.lineCount} 行 / 净 {quantities.netQuantity} 件<small className="cell-sub">原收 {quantities.originalQuantity} · 已冲正 {quantities.correctedQuantity}</small></td>
@@ -2045,17 +2617,11 @@ function PurchaseReceiptTable({ receipts, canCorrect, busy, openCorrection, empt
           ? <span className="terminal-label">已无可冲正数量</span>
           : <span className="terminal-label">仅入库人员可冲正</span>}</div></td>
     </tr>;
-  }) : <tr><td className="empty-cell" colSpan={8}>{emptyMessage}</td></tr>}</tbody></table></div>;
-}
-
-function PlannedModule({ module }: { module: (typeof plannedModules)[keyof typeof plannedModules] }) {
-  return <div className="content module-content"><div className="module-head"><div><p>业务规划 / 数据源待接入</p><h1>{module.title}</h1><span>{module.desc}</span></div><div className="source-chip">当前无业务数据</div></div>
-    <article className="card source-empty"><div className="source-empty-mark">0</div><p>真实数据源尚未接入</p><h2>这里不会展示虚构记录</h2><span>接入{module.source}后，本模块才会生成指标和明细。</span></article>
-  </div>;
+  }) : <tr><td className="empty-cell" colSpan={8}><span>{emptyMessage}</span></td></tr>}</tbody></table></div>;
 }
 
 function DataSourceNotice({ compact = false }: { compact?: boolean }) {
-  return <div className={compact ? 'data-source-notice compact' : 'data-source-notice'}><div className="source-status">空</div><div><strong>当前数据库没有业务数据</strong><span>系统已关闭样例数据生成。接入 Excel / CSV 或平台 API 后，这里只显示你的真实记录。</span></div></div>;
+  return <div className={compact ? 'data-source-notice compact' : 'data-source-notice'}><div><strong>运营库存尚未建账</strong><span>建好商品和仓库后，通过盘点或采购收货登记库存。</span></div></div>;
 }
 
 function StatCards({ stats }: { stats: string[][] }) {
@@ -2093,17 +2659,42 @@ function InventoryConfirmationModal({ row, busy, error, onClose, onSubmit }: {
   return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal purchase-modal inventory-confirmation-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>{previous ? '更新并续期库存确认' : '人工确认仓库可用库存'}</h2><p>{row.skuCode} · {row.skuName}</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="mapping-context"><strong>MUKU 可用库存：未知</strong><span>{mappingText}</span><code>确认范围：全部仓库汇总 · 保存后有效 24 小时</code></div>{previous && <div className="planning-modal-warning">上次确认 {previous.confirmedAvailableQty} 件，有效至 {formatOptionalTime(previous.expiresAt)}；本次保存会以当前时间重新计算 24 小时有效期。</div>}<div className="form-grid"><label>仓库可用库存<input name="confirmedAvailableQty" type="number" min="0" max="100000000" step="1" inputMode="numeric" defaultValue={previous?.confirmedAvailableQty ?? 0} required /></label><label>有效期<input value="保存后 24 小时" readOnly /></label><label className="full">核对说明<textarea name="note" rows={3} minLength={3} maxLength={500} defaultValue={previous?.note ?? ''} placeholder="例如：仓库人工核对，全部仓库可用库存为 0" required /></label>{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>兜底规则</span>仅在 MUKU 可用量未知且 SKU 映射无歧义时生效；MUKU 一旦提供明确值，系统立即优先使用 MUKU。此操作不回写 MUKU 或共享盘。</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy}>{busy ? '正在保存…' : previous ? '更新并续期 24 小时' : '确认并启用 24 小时'}</button></div></form></div>;
 }
 
-function MemberRolesModal({ members, currentUserEmail, busy, error, onRetry, onChange, onClose }: {
+function TeamPermissions({ members, currentUser, query, busy, error, refresh, onChange }: {
   members: ManagedMemberView[];
-  currentUserEmail: string;
+  currentUser: ErpPayload['user'];
+  query: string;
   busy: string;
   error: string;
-  onRetry: () => void;
-  onChange: (member: ManagedMemberView, role: ManagedMemberRole) => void;
-  onClose: () => void;
+  refresh: () => void;
+  onChange: (member: ManagedMemberView, role: ManagedMemberSelection) => void;
 }) {
-  const normalizedCurrentEmail = currentUserEmail.trim().toLowerCase();
-  return <div className="modal-backdrop modal-layer-top" onMouseDown={onClose}><section className="modal member-roles-modal" onMouseDown={(event) => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="member-roles-title"><div className="modal-head"><div><h2 id="member-roles-title">采购团队角色</h2><p>只管理已经登录过 ERP 的成员；这里不新增或删除账号</p></div><button type="button" onClick={onClose} disabled={Boolean(busy)}>×</button></div><div className="member-role-guide">{MEMBER_ROLE_OPTIONS.map((option) => <article key={option.value}><strong>{option.label}</strong><span>{option.description}</span></article>)}</div>{error && <div className="member-role-error" role="alert">{error}<button type="button" onClick={onRetry} disabled={Boolean(busy)}>刷新成员</button></div>}<div className="member-role-list">{busy === 'load' && !members.length ? <div className="member-role-empty"><span className="loader" /><p>正在读取团队成员…</p></div> : members.length ? members.map((member) => <MemberRoleRow key={`${member.id}:${member.role}`} member={member} members={members} currentUser={member.email.trim().toLowerCase() === normalizedCurrentEmail} busy={busy} onChange={onChange} />) : <div className="member-role-empty"><p>暂无可管理成员</p><span>成员首次登录 ERP 后才会出现在这里。</span></div>}</div><div className="modal-safety"><span>权限规则</span>角色由服务端强制校验；负责人和唯一管理员不能降级，所有变更都会写入审计记录。</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={Boolean(busy)}>完成</button></div></section></div>;
+  const normalizedCurrentEmail = currentUser.email.trim().toLowerCase();
+  const term = query.trim().toLowerCase();
+  const visibleMembers = term ? members.filter((member) => [member.displayName, memberDisplayEmail(member),
+    memberRoleLabel(memberSelection(member))].some((value) => value.toLowerCase().includes(term))) : members;
+
+  return <section className="content module-content team-permissions" aria-labelledby="team-permissions-title">
+    <header className="module-head">
+      <div><h1 id="team-permissions-title">团队权限</h1><span>{term ? `匹配 ${visibleMembers.length} 人` : `共 ${members.length} 人`}</span></div>
+      <button className="secondary-button" type="button" onClick={refresh} disabled={Boolean(busy)}>
+        {busy === 'load' ? '正在刷新…' : '刷新成员'}
+      </button>
+    </header>
+    {error && <p className="member-role-error" role="alert">{error}</p>}
+    <div className="member-role-list" aria-busy={busy === 'load'}>
+      {Boolean(visibleMembers.length) && <div className="member-role-head" aria-hidden="true"><span>成员</span><span>岗位权限</span><span>操作</span></div>}
+      {busy === 'load' && !members.length ? <div className="member-role-empty" role="status"><span className="loader" /><p>正在读取团队成员…</p></div>
+        : visibleMembers.length ? visibleMembers.map((member) => (
+          <MemberRoleRow key={member.id + ':' + memberSelection(member)} member={member} members={members} busy={busy} onChange={onChange}
+            currentUser={member.email.trim().toLowerCase() === normalizedCurrentEmail
+              && (member.identityProvider ?? 'existing') === (currentUser.authProvider ?? 'existing')} />
+        )) : !error && <div className="member-role-empty"><p>{term ? '没有符合搜索条件的成员' : '暂无可管理成员'}</p></div>}
+    </div>
+  </section>;
+}
+
+function memberDisplayEmail(member: ManagedMemberView) {
+  return member.email.endsWith('@feishu.invalid') ? '' : member.email;
 }
 
 function MemberRoleRow({ member, members, currentUser, busy, onChange }: {
@@ -2111,12 +2702,269 @@ function MemberRoleRow({ member, members, currentUser, busy, onChange }: {
   members: ManagedMemberView[];
   currentUser: boolean;
   busy: string;
-  onChange: (member: ManagedMemberView, role: ManagedMemberRole) => void;
+  onChange: (member: ManagedMemberView, role: ManagedMemberSelection) => void;
 }) {
-  const [draftRole, setDraftRole] = useState<ManagedMemberRole>(member.role);
+  const currentRole = memberSelection(member);
+  const [draftRole, setDraftRole] = useState<ManagedMemberSelection>(currentRole);
   const block = memberRoleChangeBlock(member, draftRole, members);
-  const isOnlyAdmin = member.role === 'admin' && members.filter((item) => item.role === 'admin').length <= 1;
-  return <article className="member-role-row"><div className="member-role-person"><div className="member-role-avatar">{member.displayName.slice(0, 2).toUpperCase()}</div><div><strong>{member.displayName}{currentUser && <em>当前账号</em>}{member.protectedOwner && <em>负责人</em>}</strong><span>{member.email}</span></div></div><label>角色<select aria-label={`调整 ${member.displayName} 的角色`} value={draftRole} disabled={Boolean(busy) || member.protectedOwner} onChange={(event) => setDraftRole(event.target.value as ManagedMemberRole)}>{MEMBER_ROLE_OPTIONS.map((option) => <option key={option.value} value={option.value} disabled={Boolean(memberRoleChangeBlock(member, option.value, members))}>{option.label}</option>)}</select></label><button className="secondary-button" type="button" disabled={Boolean(busy) || draftRole === member.role || Boolean(block)} onClick={() => onChange(member, draftRole)}>{busy === member.id ? '保存中…' : '保存角色'}</button>{(member.protectedOwner || isOnlyAdmin || block) && <small>{block ?? (member.protectedOwner ? '负责人角色固定为管理员' : '请先指定另一名管理员后再调整')}</small>}</article>;
+  const isOnlyAdmin = currentRole === 'admin' && members.filter((item) => memberSelection(item) === 'admin').length <= 1;
+  const email = memberDisplayEmail(member);
+  const provider = member.identityProvider === 'feishu' ? '飞书账号' : '原登录账号';
+  return <article className="member-role-row">
+    <div className="member-role-person">
+      <div>
+        <strong>{member.displayName}{currentUser && <em>当前账号</em>}{member.protectedOwner && <em>负责人</em>}</strong>
+        <span>{[provider, email].filter(Boolean).join(' · ')}</span>
+      </div>
+    </div>
+    <label><span>岗位权限</span>
+      <select aria-label={'调整 ' + member.displayName + ' 的权限'} value={draftRole} disabled={Boolean(busy) || member.protectedOwner}
+        onChange={(event) => setDraftRole(event.target.value as ManagedMemberSelection)}>
+        {memberRoleOptions(member).map((option) => (
+          <option key={option.value} value={option.value} disabled={Boolean(memberRoleChangeBlock(member, option.value, members))}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+    <button className="secondary-button" type="button" disabled={Boolean(busy) || draftRole === currentRole || Boolean(block)}
+      onClick={() => onChange(member, draftRole)}>{busy === member.id ? '保存中…' : '保存权限'}</button>
+    {(member.protectedOwner || isOnlyAdmin || block) && <small>{block ?? (member.protectedOwner ? '负责人固定为管理员' : '唯一管理员')}</small>}
+  </article>;
+}
+
+function ProcurementEntryModal({ titleId, title, description, className, busy, error, submitLabel, canSubmit = true, primarySubmit, suspended, topLayer, onClose, onSubmit, children }: {
+  titleId: string; title: string; description: string; className: string; busy: boolean; error: string;
+  submitLabel: string; canSubmit?: boolean; primarySubmit?: { label: string; value: string; enabled: boolean }; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  suspended?: boolean; topLayer?: boolean;
+  children: ReactNode;
+}) {
+  const formRef = useRef<HTMLFormElement>(null);
+  useEffect(() => {
+    const previousFocus = document.activeElement;
+    const form = formRef.current;
+    (form?.querySelector<HTMLElement>('[data-entry-focus]') ?? form)?.focus();
+    return () => {
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus();
+    };
+  }, []);
+
+  return <div className={`modal-backdrop${topLayer ? ' modal-layer-top' : ''}`} inert={suspended} onMouseDown={onClose}>
+    <form
+      ref={formRef}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
+      aria-describedby={`${titleId}-description`}
+      aria-busy={busy}
+      tabIndex={-1}
+      className={`modal ${className}`}
+      onSubmit={onSubmit}
+      onMouseDown={(event) => event.stopPropagation()}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          if (!busy) onClose();
+        }
+        if (event.key !== 'Tab') return;
+        const focusable = event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled):not([type="hidden"]):not([hidden]), select:not(:disabled), textarea:not(:disabled), a[href]');
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const active = document.activeElement;
+        if (!first || (event.shiftKey ? active === first || active === event.currentTarget : active === last)) {
+          event.preventDefault();
+          (event.shiftKey ? last : first)?.focus();
+        }
+      }}
+    >
+      <div className="modal-head">
+        <div><h2 id={titleId}>{title}</h2><p id={`${titleId}-description`}>{description}</p></div>
+        <button type="button" aria-label="关闭" onClick={onClose} disabled={busy}>×</button>
+      </div>
+      <fieldset className="procurement-entry-fields" disabled={busy}>{children}</fieldset>
+      {error && <p className="form-error procurement-entry-error" role="alert">{error}</p>}
+      <div className="modal-actions">
+        <button type="button" onClick={onClose} disabled={busy}>取消</button>
+        <button className={primarySubmit ? 'secondary-button' : 'primary-button'} type="submit" value="draft" disabled={busy || !canSubmit}>{busy ? '正在保存…' : submitLabel}</button>
+        {primarySubmit && <button className="primary-button" type="submit" value={primarySubmit.value}
+          disabled={busy || !canSubmit || !primarySubmit.enabled}>{busy ? '正在处理…' : primarySubmit.label}</button>}
+      </div>
+    </form>
+  </div>;
+}
+
+function PurchaseSkuModal({ preferredCode, sku, busy, error, onClose, onSubmit }: {
+  preferredCode: string; sku?: PurchaseSkuOption; busy: boolean; error: string; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return <ProcurementEntryModal
+    titleId="purchase-sku-title"
+    title={sku ? '编辑商品档案' : '新增 SKU'}
+    description={sku ? '更新档案后，新选用该 SKU 的采购明细会带入新资料。' : '建立档案后，选用此 SKU 时会带入商品资料。'}
+    className="purchase-modal"
+    topLayer
+    busy={busy}
+    error={error}
+    submitLabel="保存 SKU"
+    onClose={onClose}
+    onSubmit={onSubmit}
+  >
+    <div className="form-grid">
+      <label>SKU 编码<input name="code" data-entry-focus={!preferredCode || undefined} defaultValue={preferredCode} readOnly={Boolean(sku)} required maxLength={80} autoComplete="off" /></label>
+      <label>商品名称<input name="name" data-entry-focus={Boolean(preferredCode) || undefined} defaultValue={sku?.name} required maxLength={160} autoComplete="off" /></label>
+      <PurchaseProductFields prefix="skuDetails:" details={sku?.productDetails} includeName={false} />
+    </div>
+  </ProcurementEntryModal>;
+}
+
+function ManualPurchaseRequestModal({ skuOptions, newSku, members, currentMemberId, canSubmitRequest, developmentOpenAccess, busy, error, suspended, onCreateSku, onEditSku, onClose, onSubmit }: {
+  skuOptions: PurchaseSkuOption[]; newSku: PurchaseSkuOption | null; members: PurchaseMember[]; currentMemberId: string | null;
+  canSubmitRequest: boolean; developmentOpenAccess: boolean;
+  busy: boolean; error: string; suspended?: boolean; onCreateSku?: (code: string) => void; onEditSku?: (sku: PurchaseSkuOption) => void;
+  onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const { purchasers, reviewers } = purchaseAssigneeCandidates(members);
+  const defaultBuyer = purchasers.find((member) => member.id === currentMemberId)?.id
+    ?? purchasers.find((member) => member.role === 'operator')?.id ?? purchasers[0]?.id ?? '';
+  const defaultReviewer = reviewers.find((member) => member.id !== defaultBuyer)?.id ?? reviewers[0]?.id ?? '';
+  const [buyerId, setBuyerId] = useState(defaultBuyer);
+  const [reviewerId, setReviewerId] = useState(defaultReviewer);
+  const [lines, setLines] = useState<Array<{ id: string; sku: PurchaseSkuOption | null }>>(() => [{
+    id: crypto.randomUUID(), sku: null,
+  }]);
+  const [lastNewSku, setLastNewSku] = useState(newSku);
+  if (newSku !== lastNewSku) {
+    setLastNewSku(newSku);
+    if (newSku && !lines.some((line) => line.sku?.id === newSku.id)) {
+      const emptyIndex = lines.findIndex((line) => !line.sku);
+      if (emptyIndex >= 0) setLines(lines.map((line, index) => index === emptyIndex ? { ...line, sku: newSku } : line));
+      else if (lines.length < maxManualPurchaseLines) setLines([...lines, { id: `new-sku-${newSku.id}`, sku: newSku }]);
+    }
+  }
+  const [search, setSearch] = useState('');
+  const [searchResult, setSearchResult] = useState<{ term: string; skus: PurchaseSkuOption[]; error: string } | null>(null);
+  const term = search.trim();
+  const hasSkus = skuOptions.length > 0;
+  useEffect(() => {
+    if (!term) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      try {
+        const query = new URLSearchParams({ q: term });
+        const response = await fetch(`/api/purchase/skus?${query}`, { cache: 'no-store', signal: controller.signal });
+        const body = await response.json().catch(() => null) as { ok?: boolean; skus?: PurchaseSkuOption[] } | null;
+        if (!response.ok || !body?.ok || !Array.isArray(body.skus)) throw new Error('SKU 搜索失败');
+        if (!controller.signal.aborted) setSearchResult({ term, skus: body.skus, error: '' });
+      } catch {
+        if (!controller.signal.aborted) setSearchResult({ term, skus: [], error: 'SKU 搜索暂不可用，已显示本地匹配结果。' });
+      }
+    }, 220);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [term]);
+
+  const matchingSkus = term ? skuOptions.filter((sku) => (
+    sku.code.toLowerCase().includes(term.toLowerCase()) || sku.name.toLowerCase().includes(term.toLowerCase())
+  )) : skuOptions;
+  const currentSearch = searchResult?.term === term ? searchResult : null;
+  const visibleSkus = currentSearch && !currentSearch.error ? currentSearch.skus : matchingSkus.slice(0, 40);
+  const selectedIds = new Set(lines.flatMap((line) => line.sku ? [line.sku.id] : []));
+  const separated = developmentOpenAccess || buyerId !== reviewerId;
+  const canSave = hasSkus && lines.every((line) => line.sku) && Boolean(buyerId && reviewerId) && separated;
+  const canSubmitDirectly = canSubmitRequest && assignmentActionAllowed(Boolean(currentMemberId && buyerId === currentMemberId), developmentOpenAccess);
+  const canAddLine = lines.length < maxManualPurchaseLines && lines.every((line) => line.sku);
+
+  return <ProcurementEntryModal
+    titleId="manual-purchase-title"
+    title="新建采购申请"
+    description="填商品、数量和原因，由指定管理员复审。"
+    className="procurement-modal"
+    busy={busy}
+    suspended={suspended}
+    error={suspended ? '' : error}
+    canSubmit={canSave}
+    submitLabel="保存草稿"
+    primarySubmit={{ label: '提交复审', value: 'submit', enabled: canSubmitDirectly }}
+    onClose={onClose}
+    onSubmit={onSubmit}
+  >
+    {!hasSkus ? <div className="procurement-entry-empty">
+      <p>暂无可采购的 SKU。请先建立商品档案。</p>
+      {onCreateSku && <button type="button" className="secondary-button" data-entry-focus onClick={() => onCreateSku('')}>新增 SKU</button>}
+    </div> : <>
+      <div className="form-grid manual-request-assignees">
+        <label>采购负责人
+          <select name="purchaserMemberId" value={buyerId} onChange={(event) => setBuyerId(event.target.value)} required>
+            <option value="" disabled>请选择采购负责人</option>
+            {purchasers.map((member) => <option key={member.id} value={member.id}>{member.displayName} · {member.role === 'admin' ? '管理员' : '操作员'}</option>)}
+          </select>
+        </label>
+        <label>复审人
+          <select name="reviewerMemberId" value={reviewerId} onChange={(event) => setReviewerId(event.target.value)} required>
+            <option value="" disabled>请选择复审人</option>
+            {reviewers.map((member) => <option key={member.id} value={member.id}>{member.displayName} · 管理员</option>)}
+          </select>
+        </label>
+        {!buyerId || !reviewerId ? <p className="form-error full">请先安排具备提交和复审权限的成员。</p> : !separated
+          ? <p className="form-error full">采购负责人和复审人须为不同成员。</p>
+          : !canSubmitDirectly && <p className="full procurement-filter-note">可保存草稿，由指定的采购负责人提交。</p>}
+      </div>
+      <section className="purchase-order-lines manual-request-lines" aria-label="采购明细">
+        <div className="purchase-order-lines-head">
+          <strong>采购明细</strong>
+          <div className="manual-request-line-actions"><button type="button" className="secondary-button" disabled={!canAddLine} onClick={() => {
+            setLines((current) => [...current, { id: crypto.randomUUID(), sku: null }]);
+          }}>添加一行</button>{onCreateSku && <button type="button" className="secondary-button" onClick={() => onCreateSku(term.slice(0, 80))}>新增 SKU</button>}</div>
+        </div>
+        <div className="form-grid manual-request-search">
+          <label className="full">搜索 SKU
+            <input
+              type="search"
+              data-entry-focus
+              value={search}
+              maxLength={160}
+              onChange={(event) => setSearch(event.target.value)}
+              onKeyDown={(event) => { if (event.key === 'Enter') event.preventDefault(); }}
+              placeholder="输入 SKU 编码或商品名称"
+            />
+          </label>
+          {term && <small className="full" role="status">{currentSearch?.error || (!currentSearch ? '正在搜索…' : `匹配 ${visibleSkus.length} 个 SKU`)}</small>}
+          {!term && skuOptions.length > visibleSkus.length && <small className="full">默认显示前 {visibleSkus.length} 个 SKU，可用搜索查找其他商品。</small>}
+        </div>
+        {lines.map((line, index) => {
+          const options = line.sku && !visibleSkus.some((sku) => sku.id === line.sku?.id) ? [line.sku, ...visibleSkus] : visibleSkus;
+          return <div className="form-grid manual-request-line" key={line.id}>
+            <input type="hidden" name="productLineId" value={line.id} />
+            <label>商品 SKU
+              <select name="skuId" aria-label={`商品 SKU，商品 ${index + 1}`} value={line.sku?.id ?? ''} required onChange={(event) => {
+                const sku = options.find((item) => item.id === event.target.value) ?? null;
+                setLines((current) => current.map((item) => item.id === line.id ? { ...item, sku } : item));
+              }}>
+                <option value="" disabled>请选择商品 SKU</option>
+                {options.map((sku) => <option key={sku.id} value={sku.id} disabled={sku.id !== line.sku?.id && selectedIds.has(sku.id)}>{sku.code} · {sku.name}</option>)}
+              </select>
+            </label>
+            <label>采购数量
+              <input name="quantity" aria-label={`采购数量，商品 ${index + 1}`} type="number" min={1} max={maxManualPurchaseQuantity} step={1} inputMode="numeric" defaultValue={1} required />
+            </label>
+            <button type="button" className="secondary-button" aria-label={`移除商品 ${index + 1}`} disabled={lines.length === 1} onClick={() => {
+              setLines((current) => current.filter((item) => item.id !== line.id));
+            }}>移除</button>
+            {line.sku && <>
+              <PurchaseProductFields key={line.sku.id} prefix={`requestDetails:${line.id}:`} details={line.sku.productDetails} defaultName={line.sku.name} />
+              <div className="manual-product-note"><small>此处的商品资料仅用于本次申请。</small>
+                {onEditSku && <button type="button" className="link-button" onClick={() => {
+                  const sku = line.sku && (skuOptions.find((option) => option.id === line.sku?.id) ?? line.sku);
+                  if (sku) onEditSku(sku);
+                }}>编辑商品档案</button>}
+              </div>
+            </>}
+          </div>;
+        })}
+      </section>
+      <div className="form-grid manual-request-note">
+        <label className="full">采购原因<textarea name="note" rows={3} maxLength={500} required placeholder="例如：补广州仓现货" /></label>
+      </div>
+    </>}
+  </ProcurementEntryModal>;
 }
 
 function PlanningRequestModal({ rows, members, currentMemberId, developmentOpenAccess, busy, error, onClose, onSubmit }: {
@@ -2201,26 +3049,158 @@ function WarehouseModal({ busy, error, onClose, onSubmit }: {
   return <div className="modal-backdrop modal-layer-top" onMouseDown={onClose}><form className="modal purchase-modal warehouse-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>新增 ERP 仓库</h2><p>采购单会固定收货仓和收货地址，到货只能入该仓</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>仓库编码<input name="code" required minLength={1} maxLength={40} placeholder="例如 SZ-01" autoComplete="off" /></label><label>仓库名称<input name="name" required minLength={1} maxLength={120} placeholder="例如 深圳成品仓" autoComplete="organization" /></label><label>收货联系人<input name="contactName" maxLength={120} placeholder="例如 林仓管" autoComplete="name" /></label><label>收货电话<input name="contactPhone" maxLength={60} placeholder="供送货人联系" autoComplete="tel" /></label><label className="full">完整收货地址<textarea name="address" rows={3} maxLength={1000} placeholder="省 / 市 / 区 / 街道 / 门牌及收货要求" /></label>{error && <div className="form-error full">{error}</div>}</div><div className="modal-safety"><span>库存规则</span>仓库编码在当前 ERP 内唯一 · 新增不会改变现有库存 · 入库后才产生库存流水</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy}>{busy ? '正在保存…' : '保存仓库'}</button></div></form></div>;
 }
 
-function PurchaseOrderModal({ request, suppliers, warehouses, busy, error, openSupplier, openWarehouse, onClose, onSubmit }: {
-  request: PurchaseRequest; suppliers: PurchaseSupplier[]; warehouses: PurchaseWarehouse[]; busy: boolean; error: string;
-  openSupplier: () => void; openWarehouse: () => void; onClose: () => void;
+function PurchaseOrderModal({ editor, suppliers, warehouses, canIssue, busy, error, openSupplier, openWarehouse, onClose, onSubmit }: {
+  editor: PurchaseOrderEditor; suppliers: PurchaseSupplier[]; warehouses: PurchaseWarehouse[]; canIssue: boolean; busy: boolean; error: string;
+  openSupplier?: () => void; openWarehouse?: () => void; onClose: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
+  const { request, order } = editor;
   const activeSuppliers = suppliers.filter((supplier) => supplier.active);
+  const [supplierId, setSupplierId] = useState(order?.supplier?.id ?? '');
+  const [warehouseId, setWarehouseId] = useState(order?.deliveryWarehouse?.id ?? '');
+  const [currency, setCurrency] = useState(order?.currency ?? (order ? '' : 'CNY'));
+  const [prices, setPrices] = useState<Record<string, { value: string; quoteContext?: string }>>({});
+  const availableSupplier = activeSuppliers.some((supplier) => supplier.id === supplierId);
+  const availableWarehouse = warehouses.some((warehouse) => warehouse.id === warehouseId);
+  const quoteContext = JSON.stringify([supplierId, currency]);
   const now = new Date();
   const localToday = new Date(now.getTime() - now.getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
-  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal procurement-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>生成正式采购单</h2><p>{request.requestNo} · {request.lineCount} 行 / {request.totalQuantity} 件</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label className="full">供应商<div className="select-with-action"><select name="supplierId" required defaultValue={activeSuppliers[0]?.id ?? ''}><option value="" disabled>请选择供应商</option>{activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.code} · {supplier.name}</option>)}</select><button type="button" onClick={openSupplier} disabled={busy}>＋ 新增</button></div></label><label className="full">收货仓库<div className="select-with-action"><select name="deliveryWarehouseId" required defaultValue={warehouses[0]?.id ?? ''}><option value="" disabled>请选择本单固定收货仓</option>{warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.code} · {warehouse.name}{warehouse.address ? ` · ${warehouse.address}` : ''}</option>)}</select><button type="button" onClick={openWarehouse} disabled={busy}>＋ 新增</button></div></label><label>预计交期<input name="expectedDeliveryAt" type="date" min={localToday} required /></label><label>采购币种<select name="currency" defaultValue="CNY" required><option value="CNY">CNY 人民币</option><option value="USD">USD 美元</option><option value="EUR">EUR 欧元</option><option value="GBP">GBP 英镑</option></select></label><label>付款条款<input name="paymentTerms" maxLength={500} placeholder="例如：30% 预付，尾款见单" /></label><label>贸易条款<input name="tradeTerms" maxLength={500} placeholder="例如：FOB 深圳" /></label><label className="full">采购备注<textarea name="note" rows={2} maxLength={500} placeholder="可填写包装、验货或交货要求" /></label></div><div className="purchase-order-lines"><div className="purchase-order-lines-head"><strong>采购明细</strong><span>每行单价必填，金额按所选币种保存</span></div>{request.lines.map((line) => <div className="purchase-order-line" key={line.id}><div><strong>{line.skuCode ?? line.rawSku ?? '未识别 SKU'}</strong><span>{line.skuName ?? '采购申请明细'}</span></div><b>{line.requestedQuantity} 件</b><label>采购单价<input name={`unitCost:${line.id}`} type="number" min="0" step="0.01" placeholder="0.00" inputMode="decimal" required /></label></div>)}</div>{!activeSuppliers.length && <div className="form-error">请先新增一个可用供应商。</div>}{!warehouses.length && <div className="form-error">请先新增并填写真实收货信息的 ERP 仓库。</div>}{error && <div className="form-error">{error}</div>}<div className="modal-safety"><span>正式下单规则</span>收货仓、交期、币种和全部单价必须完整 · 确认下单时会再次核对最新订单和库存 · 不会向 Shopify 写入</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || !activeSuppliers.length || !warehouses.length}>{busy ? '正在生成…' : '生成完整采购单草稿'}</button></div></form></div>;
+  const savedDeliveryDate = order?.expectedDeliveryAt?.slice(0, 10);
+  const earliestDeliveryDate = savedDeliveryDate && savedDeliveryDate < localToday ? savedDeliveryDate : localToday;
+  const currencies = [
+    ['CNY', '人民币'], ['USD', '美元'], ['EUR', '欧元'], ['GBP', '英镑'],
+  ];
+  if (order?.currency && !currencies.some(([code]) => code === order.currency)) {
+    currencies.push([order.currency, '']);
+  }
+  const lines = order
+    ? order.lines.map((line) => ({
+      requestLineId: line.purchaseRequestLineId,
+      skuId: line.skuId,
+      skuCode: line.skuCode,
+      skuName: line.skuName,
+      productDetails: line.productDetails,
+      quantity: line.orderedQuantity,
+      cost: line.unitCostMinor === null ? '' : (line.unitCostMinor / 100).toFixed(2),
+    }))
+    : request.lines.map((line) => ({
+      requestLineId: line.id,
+      skuId: line.skuId,
+      skuCode: line.skuCode ?? line.rawSku ?? '未识别 SKU',
+      skuName: line.skuName ?? '采购申请明细',
+      productDetails: line.productDetails,
+      quantity: line.requestedQuantity,
+      cost: '',
+    }));
+  return <ProcurementEntryModal titleId="purchase-order-editor-title" title={order ? '编辑采购单草稿' : '开采购单'}
+    description={order ? `${order.orderNo} · ${order.purchaseRequestNo}` : `${request.requestNo} · ${request.totalQuantity} 件`}
+    className="procurement-modal" busy={busy} error={error} submitLabel="保存草稿"
+    primarySubmit={canIssue ? { label: '确认下单', value: 'issue', enabled: true } : undefined}
+    onClose={onClose} onSubmit={onSubmit}>
+      <div className="form-grid">
+          <label className="full">供应商
+            <div className={openSupplier ? 'select-with-action' : undefined}>
+              <select name="supplierId" data-entry-focus value={availableSupplier ? supplierId : ''} onChange={(event) => setSupplierId(event.target.value)}>
+                <option value="">{supplierId && !availableSupplier ? '原供应商不可用，请重新选择' : '请选择供应商'}</option>
+                {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.code} · {supplier.name}</option>)}
+              </select>
+              {openSupplier && <button type="button" onClick={openSupplier} disabled={busy}>＋ 新增</button>}
+            </div>
+          </label>
+          <label className="full">收货仓库
+            <div className={openWarehouse ? 'select-with-action' : undefined}>
+              <select name="deliveryWarehouseId" value={availableWarehouse ? warehouseId : ''} onChange={(event) => setWarehouseId(event.target.value)}>
+                <option value="">{warehouseId && !availableWarehouse ? '原收货仓不可用，请重新选择' : '请选择本单固定收货仓'}</option>
+                {warehouses.map((item) => <option key={item.id} value={item.id}>{item.code} · {item.name}{item.address ? ` · ${item.address}` : ''}</option>)}
+              </select>
+              {openWarehouse && <button type="button" onClick={openWarehouse} disabled={busy}>＋ 新增</button>}
+            </div>
+          </label>
+        <label>预计交期<input name="expectedDeliveryAt" type="date" min={earliestDeliveryDate} defaultValue={savedDeliveryDate} /></label>
+        <label>采购币种
+          <select name="currency" value={currency} onChange={(event) => setCurrency(event.target.value)}>
+            <option value="">请选择币种</option>
+            {currencies.map(([code, label]) => <option key={code} value={code}>{label ? `${code} ${label}` : code}</option>)}
+          </select>
+        </label>
+      </div>
+      <div className="purchase-order-lines">
+        <div className="purchase-order-lines-head"><strong>采购明细</strong><span>数量沿用已批准申请 · 确认下单前填写单价</span></div>
+        {lines.map((line) => {
+          const price = prices[line.requestLineId];
+          const value = price && (!price.quoteContext || price.quoteContext === quoteContext) ? price.value : line.cost;
+          return <div className="purchase-order-line" key={line.requestLineId}>
+            <div><strong>{line.skuCode}</strong><span>{line.skuName}</span></div>
+            <b>{line.quantity} 件</b>
+            <div className="purchase-order-quote-cell">
+              <label>采购单价<input name={`unitCost:${line.requestLineId}`} type="number" min="0" step="0.01" value={value}
+                onChange={(event) => { const entered = event.target.value; setPrices((previous) => ({ ...previous, [line.requestLineId]: { value: entered } })); }}
+                placeholder="0.00" inputMode="decimal" /></label>
+              {availableSupplier && currency && <PurchaseQuoteApply key={quoteContext} skuId={line.skuId} supplierId={supplierId} quantity={line.quantity} currency={currency} disabled={busy}
+                onApply={(quote) => setPrices((previous) => ({ ...previous,
+                  [line.requestLineId]: { value: (quote.unitCostMinor / 100).toFixed(2), quoteContext },
+                }))} />}
+            </div>
+            <PurchaseProductFields prefix={`orderDetails:${line.requestLineId}:`} details={line.productDetails} defaultName={line.skuName} />
+          </div>;
+        })}
+      </div>
+      <details className="purchase-order-extra" open={Boolean(order?.paymentTerms || order?.tradeTerms || order?.note) || undefined}>
+        <summary>付款与交付条款（选填）</summary>
+        <div className="form-grid">
+          <label>付款条款<input name="paymentTerms" maxLength={500} defaultValue={order?.paymentTerms ?? ''} placeholder="例如：30% 预付，尾款见单" /></label>
+          <label>贸易条款<input name="tradeTerms" maxLength={500} defaultValue={order?.tradeTerms ?? ''} placeholder="例如：FOB 深圳" /></label>
+          <label className="full">采购备注<textarea name="note" rows={2} maxLength={500} defaultValue={order?.note ?? ''} placeholder="可填写包装、验货或交货要求" /></label>
+        </div>
+      </details>
+      {!activeSuppliers.length && <p className="purchase-order-next">暂无可用供应商，新增后可继续下单。</p>}
+      {!warehouses.length && <p className="purchase-order-next">暂无可用收货仓，新增后可继续下单。</p>}
+      {canIssue && <p className="purchase-order-next">确认下单后，可打印正式采购单，仓库可登记到货。</p>}
+  </ProcurementEntryModal>;
 }
 
 function PurchaseReceiptModal({ order, busy, error, onClose, onSubmit }: {
-  order: PurchaseOrder; busy: boolean; error: string;
+  order: ReceivableOrder; busy: boolean; error: string;
   onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
-  const receivableLines = order.lines.filter((line) => line.remainingQuantity > 0);
+  const quality = usePurchaseQuality(order.id);
+  const availableByLine = new Map(quality.state?.lines.map((line) => [line.purchaseOrderLineId, line.availableQty]));
+  const receivableLines = order.lines.flatMap((line) => {
+    const available = Math.min(line.remainingQuantity, availableByLine.get(line.id) ?? 0);
+    return available > 0 ? [{ ...line, available }] : [];
+  });
   const deliveryWarehouse = order.deliveryWarehouse;
   const now = new Date();
   const localDateTime = new Date(now.getTime() - now.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
-  return <div className="modal-backdrop" onMouseDown={onClose}><form className="modal procurement-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><h2>登记采购到货</h2><p>{order.orderNo} · {order.supplier.name}</p></div><button type="button" onClick={onClose} disabled={busy}>×</button></div><div className="form-grid"><label>本单固定收货仓<input value={deliveryWarehouse ? `${deliveryWarehouse.code} · ${deliveryWarehouse.name}` : '未设置，不允许入库'} readOnly />{deliveryWarehouse && <input name="warehouseId" type="hidden" value={deliveryWarehouse.id} />}</label><label>实际到货时间<input name="receivedAt" type="datetime-local" defaultValue={localDateTime} max={localDateTime} required /></label>{deliveryWarehouse && <div className="full planning-inline-warning"><strong>收货信息</strong> {deliveryWarehouse.address || '未填写完整地址'}{deliveryWarehouse.contactName ? ` · ${deliveryWarehouse.contactName}` : ''}{deliveryWarehouse.contactPhone ? ` · ${deliveryWarehouse.contactPhone}` : ''}</div>}<label className="full">到货备注<textarea name="note" rows={2} maxLength={500} placeholder="可填写送货单号、批次或异常说明" /></label></div><div className="purchase-order-lines"><div className="purchase-order-lines-head"><strong>本次实际到货</strong><span>可以分批登记，累计数量不能超过采购数量</span></div>{receivableLines.map((line) => <div className="purchase-order-line receipt-line" key={line.id}><div><strong>{line.skuCode}</strong><span>{line.skuName}</span></div><b>已到 {line.receivedQuantity} / 未到 {line.remainingQuantity}</b><label>本次到货<input name={`quantity:${line.id}`} type="number" min="0" max={line.remainingQuantity} step="1" defaultValue={line.remainingQuantity} inputMode="numeric" /></label></div>)}</div>{!deliveryWarehouse && <div className="form-error missing-master-data"><span>这是旧版不完整采购单，没有固定收货仓；系统不会猜测入库位置。</span></div>}{error && <div className="form-error">{error}</div>}<div className="modal-safety"><span>库存规则</span>只能入采购单指定仓 · 提交后写入不可变入库流水 · 网络失败后重试会复用同一幂等键，不会重复加库存</div><div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy || !deliveryWarehouse || !receivableLines.length}>{busy ? '正在入库…' : '确认本次到货并入库'}</button></div></form></div>;
+  return <div className="modal-backdrop" onMouseDown={onClose}>
+    <form className="modal procurement-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}>
+      <div className="modal-head"><div><h2>登记采购到货</h2><p>{order.orderNo} · {order.supplier?.name ?? '供应商未记录'}</p></div>
+        <button type="button" aria-label="关闭" onClick={onClose} disabled={busy}>×</button></div>
+      <div className="form-grid">
+        <label>本单固定收货仓<input value={deliveryWarehouse ? [deliveryWarehouse.code, deliveryWarehouse.name].filter(Boolean).join(' · ') || '待补充仓库名称' : '未设置，无法入库'} readOnly />
+          {deliveryWarehouse && <input name="warehouseId" type="hidden" value={deliveryWarehouse.id} />}</label>
+        <label>实际到货时间<input name="receivedAt" type="datetime-local" defaultValue={localDateTime} max={localDateTime} required /></label>
+        {deliveryWarehouse && <div className="full planning-inline-warning"><strong>收货信息</strong> {deliveryWarehouse.address || '未填写完整地址'}
+          {deliveryWarehouse.contactName ? ` · ${deliveryWarehouse.contactName}` : ''}{deliveryWarehouse.contactPhone ? ` · ${deliveryWarehouse.contactPhone}` : ''}</div>}
+        <label className="full">到货备注<textarea name="note" rows={2} maxLength={500} placeholder="可填写送货单号、批次或异常说明" /></label>
+      </div>
+      <div className="purchase-order-lines">
+        <div className="purchase-order-lines-head"><strong>本次实际到货</strong><span>{quality.state?.required ? '以质检放行数量为上限' : '可分批登记'}</span></div>
+        {quality.loading && <p className="nine-store-message" role="status">正在读取入库额度…</p>}
+        {quality.error && <div className="form-grid"><p className="form-error" role="alert">{quality.error}</p>
+          <button type="button" className="secondary-button" onClick={quality.refresh}>重新读取</button></div>}
+        {quality.state?.required && !receivableLines.length && <p className="nine-store-message">尚无可入库的合格件数。请先在采购单或待收货列表登记质检。</p>}
+        {receivableLines.map((line) => <div className="purchase-order-line receipt-line" key={`${line.id}:${line.available}`}>
+          <div><strong>{line.skuCode}</strong><span>{line.skuName}</span></div><b>可入 {line.available} / 未到 {line.remainingQuantity}</b>
+          <label>本次到货<input name={`quantity:${line.id}`} type="number" min="0" max={line.available} step="1" defaultValue={line.available} inputMode="numeric" /></label>
+        </div>)}
+      </div>
+      {error && <div className="form-error" role="alert">{error}</div>}
+      <div className="modal-actions"><button type="button" onClick={onClose} disabled={busy}>取消</button>
+        <button className="primary-button" type="submit" disabled={busy || quality.loading || Boolean(quality.error) || !deliveryWarehouse || !receivableLines.length}>
+          {busy ? '正在入库…' : '确认到货并入库'}</button></div>
+    </form>
+  </div>;
 }
 
 function PurchaseReceiptCorrectionModal({ receipt, corrections, historyReady, loading, busy, error, onRetry, onClose, onSubmit }: {
@@ -2273,11 +3253,21 @@ function InventoryStatus({ available }: { available: number }) {
   return <span className={`status-pill ${available === 0 ? 'danger' : available <= 10 ? '' : 'success'}`}>{label}</span>;
 }
 
-function AuthRequired() {
-  return <div className="content auth-state"><div className="auth-card"><div className="auth-mark">易</div><p>身份验证</p><h1>登录后进入易仓 ERP</h1><span>订单、库存和审计数据仅向已验证用户开放。</span><a className="primary-button auth-button" href="/signin-with-chatgpt?return_to=/">使用 ChatGPT 登录</a></div></div>;
+function AuthRequired({ cognitoLogin, feishuLogin }: { cognitoLogin: boolean; feishuLogin: boolean }) {
+  const loginPath = feishuLogin ? '/api/auth/feishu/login' : cognitoLogin ? '/api/auth/cognito/login' : '/signin-with-chatgpt?return_to=/';
+  const label = feishuLogin ? '使用飞书账号登录' : cognitoLogin ? '使用业务邮箱登录' : '使用 ChatGPT 登录';
+  return <div className="content auth-state">
+    <div className="auth-card">
+      <div className="auth-mark auth-accent" aria-hidden="true">易</div>
+      <h1>登录易仓 ERP</h1>
+      {feishuLogin && <p>首次登录后，由工作区管理员分配岗位权限。</p>}
+      <a className="primary-button auth-button" href={loginPath}>{label}</a>
+      {feishuLogin && cognitoLogin && <a className="secondary-button auth-button" href="/api/auth/cognito/login">业务邮箱登录</a>}
+    </div>
+  </div>;
 }
 
-function LoadingState({ message = '正在建立安全业务上下文…' }: { message?: string }) {
+function LoadingState({ message = '正在加载工作区…' }: { message?: string }) {
   return <div className="content loading-state"><span className="loader" /><p>{message}</p></div>;
 }
 
@@ -2586,7 +3576,7 @@ function normalizePurchaseWorkspace(body: PurchaseWorkspacePayload | PurchaseDem
       } : null),
       lines: Array.isArray(request.lines) ? request.lines.map((line) => ({
         ...line,
-        demandId: line.demandId ?? (line as PurchaseRequestLine & { purchaseDemandId?: string }).purchaseDemandId ?? '',
+        demandId: line.demandId ?? (line as PurchaseRequestLine & { purchaseDemandId?: string | null }).purchaseDemandId ?? null,
       })) : [],
       lineCount: request.lineCount ?? request.lines?.length ?? 0,
       totalQuantity: request.totalQuantity ?? request.lines?.reduce((sum, line) => sum + line.requestedQuantity, 0) ?? 0,
@@ -2596,13 +3586,13 @@ function normalizePurchaseWorkspace(body: PurchaseWorkspacePayload | PurchaseDem
     })) : [];
     const purchaseOrders = Array.isArray(body.purchaseOrders) ? body.purchaseOrders.map((order) => ({
       ...order,
-      supplier: {
+      supplier: order.supplier ? {
         ...order.supplier,
         contactName: order.supplier.contactName ?? null,
         contactPhone: order.supplier.contactPhone ?? null,
         contactEmail: order.supplier.contactEmail ?? null,
         address: order.supplier.address ?? null,
-      },
+      } : null,
       deliveryWarehouse: order.deliveryWarehouse ? {
         ...order.deliveryWarehouse,
         contactName: order.deliveryWarehouse.contactName ?? null,
@@ -2804,10 +3794,6 @@ function formatMoney(amountMinor: number, currency: string) {
   return new Intl.NumberFormat('zh-CN', { style: 'currency', currency }).format(amountMinor / 100);
 }
 
-function formatExactMoney(amount: string | null, currency: string | null) {
-  if (amount === null || currency === null) return '未知';
-  return `${currency} ${amount}`;
-}
 
 function formatTime(value: string) {
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value));

@@ -62,6 +62,17 @@ describe('Sites procurement MCP JSON-RPC', () => {
     });
   });
 
+  it('denies the multi-workspace freshness tool to ordinary platform operators', async () => {
+    const ensureDatabase = vi.fn();
+    const response = await toolCall('get_procurement_freshness', {}, {
+      DB: {} as D1Database, ERP_AUTOMATION_ALLOWED_EMAILS: 'owner@example.com',
+    }, 'amazon-operator@example.com', { ensureDatabase });
+    expect(await toolPayload(response)).toMatchObject({
+      result: { isError: true, structuredContent: { ok: false, code: 'AUTOMATION_CALLER_NOT_ALLOWED' } },
+    });
+    expect(ensureDatabase).not.toHaveBeenCalled();
+  });
+
   it('rejects any tool arguments instead of accepting tenant, URL or credentials', async () => {
     const ensureDatabase = vi.fn();
     const response = await toolCall(
@@ -198,7 +209,7 @@ describe('Sites procurement MCP tool behavior', () => {
     const response = await toolCall(
       'get_procurement_freshness',
       {},
-      { DB: {} as D1Database },
+      { DB: {} as D1Database, ERP_AUTOMATION_ALLOWED_EMAILS: 'viewer@example.com' },
       'viewer@example.com',
       dependencies,
     );

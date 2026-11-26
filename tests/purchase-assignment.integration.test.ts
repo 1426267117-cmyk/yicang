@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { Miniflare } from 'miniflare';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -332,25 +332,11 @@ function purchaseActor(id: string, email: string, displayName: string): UserCont
 }
 
 async function applyPurchaseMigrations(db: D1Database) {
-  for (const migration of [
-    '../drizzle/0000_wooden_deathstrike.sql',
-    '../drizzle/0001_premium_the_stranger.sql',
-    '../drizzle/0002_organic_titanium_man.sql',
-    '../drizzle/0003_fancy_jane_foster.sql',
-    '../drizzle/0004_illegal_black_panther.sql',
-    '../drizzle/0005_chilly_obadiah_stane.sql',
-    '../drizzle/0006_soft_wither.sql',
-    '../drizzle/0007_worried_stone_men.sql',
-    '../drizzle/0008_nifty_mimic.sql',
-    '../drizzle/0009_shocking_iron_lad.sql',
-    '../drizzle/0014_clever_silvermane.sql',
-    '../drizzle/0015_true_tigra.sql',
-    '../drizzle/0016_brief_doomsday.sql',
-  ]) {
-    const sql = readFileSync(new URL(migration, import.meta.url), 'utf8');
-    for (const statement of sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean)) {
-      await db.prepare(statement).run();
-    }
+  const directory = new URL('../drizzle/', import.meta.url);
+  for (const migration of readdirSync(directory).filter((name) => name.endsWith('.sql')).sort()) {
+    const sql = readFileSync(new URL(migration, directory), 'utf8');
+    const statements = sql.split('--> statement-breakpoint').map((item) => item.trim()).filter(Boolean);
+    await db.batch(statements.map((statement) => db.prepare(statement)));
   }
 }
 

@@ -10,13 +10,13 @@ import { shopifyOrderFixture } from './fixtures/shopify-order';
 
 const tenantId = 'tenant_sync_test';
 const config: ShopifyCredentialConfig = {
-  key: 'zimasya', displayName: 'ZIMASYA', domain: '346c85.myshopify.com',
-  expectedDomain: '346c85.myshopify.com', environmentPrefix: 'SHOPIFY_ZIMASYA',
-  acceptedDomains: ['346c85.myshopify.com'], authMode: 'oauth', credentialRef: 'env:SHOPIFY_ZIMASYA',
+  key: 'zimasya', displayName: 'ZIMASYA', domain: 'fixture-zimasya.myshopify.com',
+  expectedDomain: 'fixture-zimasya.myshopify.com', environmentPrefix: 'SHOPIFY_ZIMASYA',
+  acceptedDomains: ['fixture-zimasya.myshopify.com'], authMode: 'oauth', credentialRef: 'env:SHOPIFY_ZIMASYA',
   adminAccessToken: 'not-used', clientId: null, clientSecret: null,
 };
 const context: ShopifyShopContext = {
-  id: 'gid://shopify/Shop/1', name: 'ZIMASYA', domain: '346c85.myshopify.com',
+  id: 'gid://shopify/Shop/1', name: 'ZIMASYA', domain: 'fixture-zimasya.myshopify.com',
   timezone: 'America/Los_Angeles', timezoneOffset: '-0700', currency: 'USD',
   scopes: new Set(['read_orders', 'read_all_orders']),
 };
@@ -249,6 +249,30 @@ describe('Shopify 同步编排', () => {
     expect(await currentCount(db, 'platform_fulfillment_tracking')).toBe(0);
     expect(await count(db, 'platform_order_lines')).toBe(2);
     expect(await count(db, 'platform_fulfillments')).toBe(2);
+  });
+
+  it('回补较早的历史窗口后继续使用已经完成的最新水位', async () => {
+    const windows: Array<{ updatedFrom: string; updatedTo: string }> = [];
+    const connector = fakeConnector(new Map(), async (_after, { updatedFrom, updatedTo }) => {
+      windows.push({ updatedFrom, updatedTo });
+      return { nodes: [], hasNextPage: false, endCursor: null };
+    });
+    const sync = (from: string, to: string, startedAt: string) => runShopifyOrderSync({
+      config, connector, repository, now: fixedClock(startedAt),
+      request: { storeKey: 'zimasya', mode: 'backfill', from, to, maxPages: 10 },
+    });
+    await sync('2026-10-20T00:00:00Z', '2026-10-29T00:00:00Z', '2026-10-30T00:00:00Z');
+    const earlier = await sync('2026-10-10T00:00:00Z', '2026-10-19T00:00:00Z', '2026-10-30T01:00:00Z');
+    const store = await db.prepare(`SELECT id, last_successful_sync_at FROM platform_stores WHERE connector_key = 'zimasya'`)
+      .first<{ id: string; last_successful_sync_at: string }>();
+    expect(store?.last_successful_sync_at).toBe(earlier.completedAt);
+    expect(await repository.getSyncState(store!.id)).toMatchObject({ completedWatermark: '2026-10-29T00:00:00.000Z' });
+
+    await runShopifyOrderSync({
+      config, connector, repository, now: fixedClock('2026-10-30T02:00:00Z'),
+      request: { storeKey: 'zimasya', mode: 'incremental', maxPages: 10 },
+    });
+    expect(windows.at(-1)).toEqual({ updatedFrom: '2026-10-28T18:00:00.000Z', updatedTo: '2026-10-30T02:00:00.000Z' });
   });
 });
 
